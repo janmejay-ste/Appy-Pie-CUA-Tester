@@ -1,0 +1,19 @@
+name: "Logged-In Dashboard Experience"
+url: "https://www.appypieautomate.ai"
+requires_auth: true
+category: e2e
+instructions: |
+  1. Log in using the test account credentials
+  2. After successful login, navigate to the user dashboard / connects page
+  3. Verify the dashboard loads completely with:
+     - Sidebar or top navigation with sections (Connects, History, Apps, Account)
+     - User profile information or avatar visible
+     - Any existing connects/workflows listed (or empty state with "Create Connect" prompt)
+  4. Click through at least 3 different sidebar/navigation items to verify they load
+  5. Check that the "Create Connect" or "New Workflow" action is accessible
+  6. Verify the account/profile settings page is reachable
+  7. Check for any broken UI elements, missing images, or console errors
+  8. Test the logout flow: find and click logout, verify you return to the public homepage
+timeout: 180000
+expected_outcome: "Dashboard loads after login, navigation works, all sections accessible, logout returns to homepage"
+tags: ["dashboard", "auth", "navigation", "e2e", "automate"]

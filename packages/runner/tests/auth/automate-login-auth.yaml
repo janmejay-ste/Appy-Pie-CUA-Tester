@@ -1,0 +1,24 @@
+name: "Login Authentication Flow - Appy Pie Automate"
+url: "https://www.appypieautomate.ai"
+requires_auth: true
+category: e2e
+instructions: |
+  1. On the homepage, click the "Log In" button in the top navigation
+  2. Wait for the login form to load completely
+  3. Enter the test account email in the email input field
+  4. Enter the test account password in the password input field
+  5. Click the "Log In" or "Sign In" submit button
+  6. After login, verify the page redirects to the Connect dashboard by checking:
+     - The dashboard page loads with navigation elements visible (sidebar or top nav)
+     - A connect list or "Create Connect" prompt is visible
+     - User profile icon or account menu is visible in the top-right corner
+     - No authentication error messages are displayed
+  7. Verify the navigation shows authenticated state (e.g., profile icon, logout option, Create Connect button)
+timeout: 120000
+expected_outcome: "User logs in successfully, Connect dashboard loads with authenticated UI elements (profile icon, navigation, connect list), no error messages displayed"
+tags:
+  - login
+  - authentication
+  - auth
+  - e2e
+  - automate

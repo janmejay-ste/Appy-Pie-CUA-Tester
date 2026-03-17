@@ -1,0 +1,17 @@
+name: "AI Automation Builder Flow"
+url: "https://www.appypieautomate.ai"
+requires_auth: true
+category: e2e
+max_turns: 50
+instructions: |
+  1. From the homepage, locate the AI Automation feature in the top navigation and click on it
+  2. Verify the AI Automation page loads with a prompt input area
+  3. Enter the prompt: "When I receive a new email in Gmail, save the attachment to Google Drive"
+  4. Click the Generate button
+  5. After clicking Generate, the page will redirect to a login/signup page since authentication is required , it will redirect to the connect cloud builder page after successful login
+  6. Wait for the AI to process - verify that "Here's your AI Generated Agent:" section appears with the prompt text displayed
+  7. Verify the "Proceed with it" button is visible below the generated agent description
+  8. Do NOT click "Proceed with it" - just verify the AI generation result is displayed correctly
+timeout: 180000
+expected_outcome: "AI Automation page loads, accepts prompt input, Generate redirects to login, after login the AI generates an agent with 'Proceed with it' button visible"
+tags: ["ai-builder", "automation", "core-flow", "automate", "auth"]

@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n runner,dash -c blue,green \"pnpm --filter runner dev\" \"pnpm --filter dashboard dev\"",
+    "build": "pnpm --filter runner build && pnpm --filter dashboard build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp"
+    ]
+  }
+}

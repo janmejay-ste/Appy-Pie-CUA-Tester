@@ -1,0 +1,14 @@
+name: "Help & Documentation Accessibility"
+url: "https://www.appypieautomate.ai"
+category: sanity
+instructions: |
+  1. From the homepage, look for Help, Support, or Documentation links (usually in footer or nav)
+  2. Click on the help/support link
+  3. Verify the help page loads with searchable content
+  4. If there is a search bar, type "how to create a connect" and check results
+  5. Verify at least one help article is clickable and loads properly
+  6. Check if there is a contact support option (chat widget, email, or support form)
+  7. Navigate back to the homepage
+timeout: 120000
+expected_outcome: "Help center is accessible, searchable, and contains useful articles with working links"
+tags: ["help", "docs", "support", "automate"]

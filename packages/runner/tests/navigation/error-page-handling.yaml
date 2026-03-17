@@ -1,0 +1,13 @@
+name: "Error Page Handling (404)"
+url: "https://www.appypieautomate.ai/this-page-does-not-exist-12345"
+category: regression
+max_turns: 20
+instructions: |
+  1. Verify the page loads and shows a custom error page (may display 404, 410, or similar error code)
+  2. Confirm the error page is branded and user-friendly — not a raw server error or blank white page
+  3. Check for a "HOME" button or link to return to the homepage
+  4. Click the HOME button and verify it navigates back to the homepage correctly
+  5. Verify the homepage loads with the hero section and navigation bar visible
+timeout: 90000
+expected_outcome: "Invalid URL shows a branded error page with a HOME button that successfully navigates back to the homepage"
+tags: ["error", "404", "error-handling", "automate"]

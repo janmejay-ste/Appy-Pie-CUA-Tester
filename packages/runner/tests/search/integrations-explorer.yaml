@@ -1,0 +1,17 @@
+name: "Integrations Explorer"
+url: "https://www.appypieautomate.ai/integrations"
+category: regression
+instructions: |
+  1. Navigate to the integrations or explore page
+  2. Verify the page loads with a list or grid of available app integrations
+  3. Look for categories or filters (e.g., CRM, Marketing, Productivity, Communication)
+  4. Browse through at least 2-3 categories and verify integrations update
+  5. Click on a popular integration (e.g., Google Sheets, Slack, or HubSpot)
+  6. Verify the integration detail page loads showing:
+     - Available triggers and actions
+     - Pre-built workflow templates or connect examples
+     - A "Connect" or "Try it" CTA button
+  7. Note any broken images or layout issues
+timeout: 150000
+expected_outcome: "Integrations page loads, categories are browsable, clicking an integration shows its detail page with triggers/actions"
+tags: ["integrations", "explorer", "apps", "automate"]

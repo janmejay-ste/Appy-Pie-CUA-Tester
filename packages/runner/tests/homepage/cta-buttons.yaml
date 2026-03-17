@@ -1,0 +1,17 @@
+name: "CTA Buttons Functionality"
+url: "https://www.appypieautomate.ai"
+category: sanity
+max_turns: 25
+instructions: |
+  1. On the homepage, locate the primary CTA button in the hero section (e.g., "Start Free Trial", "Get Started Free", or "Start Automating")
+  2. Verify it is visible and clickable
+  3. Click the primary CTA button — verify it navigates to a signup or registration page (URL may change to a different domain like accounts.appypie.com)
+  4. The signup page is on a different domain, so use the browser back button to return to the homepage. If back button doesn't work, navigate directly to https://www.appypieautomate.ai
+  5. Verify the homepage has loaded again (hero section visible)
+  6. Click on "Pricing" in the top navigation bar
+  7. On the Pricing page, verify there are CTA buttons associated with the plans (e.g., "Standard", "Professional", "Business") and that they are visible and clickable
+  8. Click any one plan's CTA button and verify it navigates to a signup, login or checkout page
+  9. Confirm no CTA button is broken or leads to an error page
+timeout: 120000
+expected_outcome: "Homepage hero CTA navigates to signup/onboarding, Pricing page plan CTA navigates to signup/checkout, no broken buttons or error pages"
+tags: ["cta", "buttons", "conversion", "automate"]

@@ -1,0 +1,31 @@
+name: "Connect Setup (Authenticated)"
+url: "https://connectcloud.appypie.com/connects"
+requires_auth: true
+category: e2e
+max_turns: 50
+instructions: |
+  1. If on redirection login is required then login with provided credentials, else navigate to the Connect dashboard
+  2. Click on the "Create Connect" button. If a user guide or onboarding overlay appears, skip or dismiss it. Also close the Automate "Support Available" modal if it appears.
+  3. In the Trigger section:
+     - In the Search bar enter Google Sheets and select it from the app list
+     - Select trigger event: New Spreadsheet Row
+  4. For Google Sheets account:
+     - If a linked account is already shown, click on the continue button to proceed to the next step
+     - If no account is linked, click "Add an Account" to connect one
+  5. Select the spreadsheet
+     - Click on the dropdown and choose an existing spreadsheet from the options or use the search bar inside the dropdown to search for the spreadsheet and select the first available one
+     - Choose the worksheet from the dropdown options that appears after clicking the spreadsheet or use search bar inside the dropdown to search for the worksheet and select it
+  6. Click Continue & Run Test button to proceed with testing the trigger step
+     - Verify that the test runs successfully with a "Successfully found the record from your Google Sheets Account. If you want to view it, click view record" message or similar confirmation
+     - Click view record and verify that the correct record details from the selected spreadsheet and worksheet are displayed in the test result view
+  7. Do NOT proceed to add an Action — just verify the trigger setup and test was successful
+  8. Navigate back to the connects dashboard to confirm navigation works
+timeout: 180000
+expected_outcome: "Connect builder loads, Google Sheets trigger is configured with New Spreadsheet Row event, trigger test runs successfully showing spreadsheet data, navigation back to dashboard works"
+tags:
+  - connect-builder
+  - auth
+  - editor
+  - e2e
+  - google_sheets
+  - automate

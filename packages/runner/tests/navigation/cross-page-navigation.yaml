@@ -1,0 +1,21 @@
+name: "Cross-Page Navigation"
+url: "https://www.appypieautomate.ai"
+category: regression
+max_turns: 30
+instructions: |
+  1. From the homepage, click on "Pricing" in the top navigation bar
+  2. Verify the Pricing page loads — confirm pricing cards/plans are visible with correct content
+  3. Click the Appy Pie Automate logo (top-left) to navigate back to the homepage
+  4. Verify the homepage loads correctly (hero section visible)
+  5. From the homepage, click on "Integrations" in the top navigation bar
+  6. Verify the Integrations page loads with app listings or integration categories visible
+  7. Click the Appy Pie Automate logo (top-left) to navigate back to the homepage
+  8. Verify the homepage loads correctly again
+  9. From the homepage, click on "How it Works" or any other available link in the top navigation bar
+  10. Verify that page loads with relevant content
+  11. Click the Appy Pie Automate logo (top-left) to navigate back to the homepage
+  12. Confirm the homepage loads correctly after all navigation — hero section and top nav are intact
+wait: 2000
+timeout: 120000
+expected_outcome: "All navigated pages (Pricing, Integrations, and one more) load correctly with visible content, logo click reliably returns to homepage each time, no navigation errors"
+tags: ["navigation", "cross-page", "ux", "automate"]

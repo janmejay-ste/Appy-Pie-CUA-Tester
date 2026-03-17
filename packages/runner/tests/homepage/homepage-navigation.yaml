@@ -1,0 +1,13 @@
+name: "Homepage Navigation & CTA Visibility"
+url: "https://www.appypieautomate.ai"
+category: smoke
+instructions: |
+  1. Verify the homepage loads completely
+  2. Check that the main navigation bar is visible with links (Features, Explore, MCP Server, Pricing, Blog, Contact Sales, Sign Up, Log In)
+  3. Scroll down and verify major sections are present: hero section, popular integrations, how-it-works steps, footer
+  4. Check that the primary CTA button (e.g. "Get Started Free", "Try it Free", or "Start Automating") is visible above the fold
+  5. Click the primary CTA button and verify it navigates to a signup or account creation page
+  6. Go back to the homepage
+timeout: 120000
+expected_outcome: "Homepage loads with visible navigation, hero section, integrations, how-it-works, and footer are present, CTA button leads to signup page"
+tags: ["homepage", "navigation", "cta", "automate"]

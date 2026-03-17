@@ -1,0 +1,14 @@
+name: "Integration Search Functionality"
+url: "https://www.appypieautomate.ai"
+category: sanity
+instructions: |
+  1. Navigate to the Explore / App Directory page from the top navigation
+  2. In the search bar, type "Google Sheets"
+  3. Verify search results appear showing Google Sheets related integrations
+  4. Click on the first Google Sheets result and verify the integration page loads
+  5. Go back to the App Directory search page
+  6. Search for a nonsensical term "xyzqwerty123"
+  7. Verify the search handles zero results gracefully — it should show a "No Result Found!" message with a "Request your App" button
+timeout: 120000
+expected_outcome: "Search returns relevant results for Google Sheets, integration page loads, and invalid search shows No Result Found message with Request your App option"
+tags: ["search", "integrations", "ux", "automate"]

@@ -1,0 +1,16 @@
+name: "Footer Links Validation"
+url: "https://www.appypieautomate.ai"
+category: sanity
+max_turns: 20
+instructions: |
+  1. Scroll to the bottom of the homepage to make the footer visible
+  2. Verify the footer section is displayed with organized link groups
+  3. Click on "Terms Of Use" link in the footer and verify the Terms page loads with content
+  4. Navigate back to the homepage using the browser back button or the logo
+  5. Scroll to the footer again
+  6. Click on "Contact" or "About" link in the footer and verify that page loads correctly
+  7. Navigate back to the homepage
+  8. Scroll to the footer and confirm social media icons are visible — the expected icons are: Facebook (f), X, Pinterest (P), Blogger (B), LinkedIn (in), YouTube, and Instagram. Do not click them, just verify they are present
+timeout: 120000
+expected_outcome: "Footer is visible with organized links, Terms Of Use and one other footer link navigate correctly, social media icons (Facebook, X, Pinterest, Blogger, LinkedIn, YouTube, Instagram) are present"
+tags: ["footer", "legal", "links", "automate"]

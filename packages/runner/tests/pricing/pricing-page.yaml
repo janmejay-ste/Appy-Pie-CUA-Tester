@@ -1,0 +1,15 @@
+name: "Pricing Page Usability"
+url: "https://www.appypieautomate.ai/pricing"
+category: sanity
+instructions: |
+  1. Navigate to the pricing page
+  2. Verify pricing tiers/plans are displayed clearly (e.g., Free, Standard, Professional, Business)
+  3. Check that each plan shows: name, price, task limits, feature list, CTA button
+  4. Look for a toggle between monthly and annual pricing — if it exists, click it and verify prices update
+  5. Scroll through all plans and verify feature comparison is readable
+  6. Check if there is a FAQ section at the bottom
+  7. Click on one of the plan CTAs and verify it leads to signup/checkout
+  8. Go back to the pricing page
+timeout: 120000
+expected_outcome: "Pricing page displays clear plan tiers with prices, task limits, features, and working CTA buttons"
+tags: ["pricing", "plans", "conversion", "automate"]

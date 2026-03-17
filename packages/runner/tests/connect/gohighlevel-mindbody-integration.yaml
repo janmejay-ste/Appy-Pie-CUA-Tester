@@ -1,0 +1,44 @@
+name: "GoHighLevel to Mindbody Integration"
+url: "https://www.appypieautomate.ai"
+requires_auth: true
+category: e2e
+max_turns: 60
+instructions: |
+  1. On the homepage, look for the app integration search fields in the hero section
+     - If two app search fields with a "+" icon between them are available, use them:
+       - Type "GoHighLevel" in the first field, select it from suggestions
+       - Type "Mindbody" in the second field, select it from suggestions
+       - Click "Connect" to proceed
+     - If the hero section does not have two-app search fields, navigate to the Explore or App Directory section from the header menu, then search for "GoHighLevel" and find a Mindbody integration option
+  2. If redirected to a login page:
+     - Enter the provided email and password credentials
+     - Click the Login/Sign In button
+     - Wait for redirect to the connect editor
+  3. If already logged in, verify redirect to the connect editor page
+  4. On the connect editor page, verify the workflow loaded:
+     - GoHighLevel is shown as the Trigger application
+     - A trigger event is selected (e.g. "New Form Submission" or similar)
+     - Mindbody is shown as the Action application
+     - An action event is selected (e.g. "Create User" or similar)
+     - If events are not yet visible, click on the trigger/action sections to expand and confirm the selected events
+  5. Capture and note the trigger event name and action event name displayed
+  6. Verify the connect editor layout:
+     - Trigger section shows GoHighLevel branding/logo
+     - Action section shows Mindbody branding/logo
+     - An "Activate Connect" or "Continue" button is visible
+  7. For GoHighLevel account connection:
+     - If a linked account is already shown, note it and proceed
+     - If no account is linked, note that account linking is required
+  8. For Mindbody account connection:
+     - If a linked account is already shown, note it and proceed
+     - If no account is linked, note that account linking is required and capture the "Connect a MINDBODY Account" or "Add an Account" prompt
+  9. Report the final state: whether both apps are configured with events and accounts, or which step requires further action
+timeout: 360000
+expected_outcome: "The connect editor loads with GoHighLevel as trigger and Mindbody as action, both with default events pre-selected. The workflow editor layout shows both app brandings and account connection status."
+tags:
+  - integration
+  - gohighlevel
+  - mindbody
+  - connect_creation
+  - e2e
+  - automate

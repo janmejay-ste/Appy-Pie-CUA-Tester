@@ -1,0 +1,51 @@
+name: "Create Connect - Google Sheets to Gmail Draft"
+url: "https://connectcloud.appypie.com/connects"
+requires_auth: true
+category: e2e
+max_turns: 60
+instructions: |
+  1. If on redirection login is required then login with provided credentials, else navigate to the Connect dashboard
+  2. Click on the "Create Connect" button. If a user guide or onboarding overlay appears, skip or dismiss it. Also close the Automate "Support Available" modal if it appears.
+  3. In the Trigger section:
+     - In the Search bar enter Google Sheets and select it from the app list
+     - Select trigger event: New Spreadsheet Row
+  4. For Google Sheets account:
+     - If a linked account is already shown, click on the continue button to proceed to the next step
+     - If no account is linked, click "Add an Account" to connect one
+  5. Select the spreadsheet 
+     - Click on the dropdown and choose an existing spreadsheet from the options or use the search bar inside the dropdown to search for the spreadsheet and select the first available one
+     - Choose the worksheet from the dropdown options that appears after Clicking the spreadsheet or use search bar inside the dropdown to search for the worksheet and select it
+  6. Click Continue & Run Test button to proceed with testing the trigger step
+   - Verify that the test runs successfully with a "Successfully found the record from your Google Sheets Account. If you want to view it, click view record" message or similar confirmation
+   - Click view record and verify that the correct record details from the selected spreadsheet and worksheet are displayed in the test result view and click continue to move to action step
+  7. Click on "+" to add an Action app and In the Action section:
+     - Search for and select application: Gmail and select it
+     - Select action event: Create Draft
+  8. For Gmail account:
+     - If a linked account is already shown, click on the continue button to proceed to the next step
+     - If no account is linked, click "Add an Account" to connect one
+  9. Configure the draft fields:
+     - Map or enter a value for "To Email" — this field will only appear after clicking the Advance Mode button
+     - Click the input field and enter a value "Test" for "Subject" field
+     - Either use static data or map a value for the "Email Body" field
+      - For mapping a value, click on the field to open the mapping options, select from the dropdown or use the search bar, and then select a value from the list based on the trigger data
+         - For static data, click on the input field and enter a value like "This is a test email body"
+     - Click Continue & Run Test button to proceed with testing the action step
+  10. Check whether the Activate Connect button is active or not. If yes then enable the connect workflow by clicking on Activate Connect button
+       - If an "Upgrade Plan" popup or any pricing/plan upgrade modal appears, do NOT dismiss it — instead note the exact popup title, message text, and which plan it suggests, then report this as a blocking issue in your summary
+       - If no popup appears, verify that the connect workflow is activated successfully with a message like "Your Connect workflow is now active" or similar confirmation
+  11. Verify the workflow was created successfully:
+      - Workflow should appear in the connects list
+      - Connect status should appear as "ON" or "Active"
+      - Trigger application shows "Google Sheets" with event "New Spreadsheet Row"
+      - Action application shows "Gmail" with event "Create Draft"
+timeout: 300000
+expected_outcome: "A connect workflow is created successfully where Trigger is Google Sheets (New Spreadsheet Row) and Action is Gmail (Create Draft). The workflow appears in the connects list with an active/ON status."
+tags:
+  - workflow
+  - integration
+  - google_sheets
+  - gmail
+  - connect_creation
+  - e2e
+  - automate

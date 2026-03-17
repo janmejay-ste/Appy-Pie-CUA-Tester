@@ -1,0 +1,16 @@
+name: "Logo Home Navigation"
+url: "https://www.appypieautomate.ai"
+category: smoke
+instructions: |
+  1. Verify the Appy Pie Automate logo is visible in the header/navigation bar
+  2. Navigate to the Pricing page using the navigation menu
+  3. Verify the Pricing page loads and the URL changes
+  4. Click on the logo in the header to navigate back to the homepage
+  5. Verify the homepage loads correctly after clicking the logo
+  6. Navigate to the Integrations page
+  7. Click the logo again and verify it returns to the homepage
+  8. Navigate to any other internal page (e.g., Help, Blog, or Features)
+  9. Click the logo once more and confirm it always returns to the homepage
+timeout: 120000
+expected_outcome: "Logo is visible on all pages and clicking it consistently navigates back to the homepage from any page"
+tags: ["logo", "navigation", "homepage", "automate"]
