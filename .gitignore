@@ -1,10 +1,46 @@
+# Dependencies
 node_modules/
+
+# Build output
 .next/
 dist/
+*.tsbuildinfo
+
+# Runtime data (screenshots, videos, config)
 data/
+
+# Database files
 *.db
+*.sqlite
+
+# Environment & secrets
 .env
-.env.local
+.env.*
+!.env.example
+
+# Credentials & keys
+*.pem
+*.key
+*.cert
+config.json
+
+# Logs
 *.log
+npm-debug.log*
+
+# OS files
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Temp files
+*.tmp
+*.swp
+turn/
+
+# Claude/AI tool files
+.claude/

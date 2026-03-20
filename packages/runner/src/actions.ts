@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import type { ComputerAction } from './types.js';
+import type { ComputerAction, DOMElement, ModelAction, ActionResult } from './types.js';
 
 function normalizePlaywrightKey(key: string): string {
   const lookup = key.trim().toUpperCase().replace(/_/g, '');
@@ -103,5 +103,173 @@ export async function executeAction(page: Page, action: ComputerAction): Promise
     }
   } catch (err) {
     console.error(`[actions] Error executing ${action.type}:`, err);
+  }
+}
+
+// ── DOM-First: Execute action by element ID with 4-layer fallback ──
+
+async function clickElement(page: Page, el: DOMElement): Promise<void> {
+  // Layer 1: CSS selector
+  try {
+    const loc = page.locator(el.selector).first();
+    if (await loc.isVisible({ timeout: 2000 })) {
+      await loc.click({ timeout: 5000 });
+      return;
+    }
+  } catch { /* fallback */ }
+
+  // Layer 2: Text match
+  if (el.text) {
+    try {
+      const loc = el.role
+        ? page.getByRole(el.role as any, { name: el.text }).first()
+        : page.getByText(el.text, { exact: false }).first();
+      if (await loc.isVisible({ timeout: 1500 })) {
+        await loc.click({ timeout: 5000 });
+        return;
+      }
+    } catch { /* fallback */ }
+  }
+
+  // Layer 3: Role-based query
+  if (el.role) {
+    try {
+      const loc = page.locator(`[role="${el.role}"]`).first();
+      if (await loc.isVisible({ timeout: 1500 })) {
+        await loc.click({ timeout: 5000 });
+        return;
+      }
+    } catch { /* fallback */ }
+  }
+
+  // Layer 4: Coordinate click
+  const cx = el.rect.x + el.rect.width / 2;
+  const cy = el.rect.y + el.rect.height / 2;
+  await page.mouse.click(cx, cy);
+}
+
+async function focusAndType(page: Page, el: DOMElement, text: string): Promise<void> {
+  // Try selector first
+  try {
+    const loc = page.locator(el.selector).first();
+    if (await loc.isVisible({ timeout: 2000 })) {
+      await loc.click({ timeout: 3000 });
+      await page.keyboard.press('Control+a');
+      await page.keyboard.type(text);
+      return;
+    }
+  } catch { /* fallback */ }
+
+  // Coordinate fallback
+  const cx = el.rect.x + el.rect.width / 2;
+  const cy = el.rect.y + el.rect.height / 2;
+  await page.mouse.click(cx, cy);
+  await page.keyboard.press('Control+a');
+  await page.keyboard.type(text);
+}
+
+async function selectOption(page: Page, el: DOMElement, value: string): Promise<void> {
+  try {
+    const loc = page.locator(el.selector).first();
+    await loc.selectOption({ label: value });
+    return;
+  } catch { /* fallback — try by value */ }
+
+  try {
+    const loc = page.locator(el.selector).first();
+    await loc.selectOption(value);
+    return;
+  } catch { /* fallback — click and choose */ }
+
+  // Click the select then look for option text
+  await clickElement(page, el);
+  await new Promise(r => setTimeout(r, 300));
+  try {
+    await page.getByText(value, { exact: false }).first().click({ timeout: 3000 });
+  } catch {
+    throw new Error(`Could not select option "${value}" in ${el.selector}`);
+  }
+}
+
+export async function executeModelAction(
+  page: Page,
+  action: ModelAction,
+  elementMap: Map<string, DOMElement>,
+): Promise<ActionResult> {
+  // Validate target exists
+  if (action.target && !elementMap.has(action.target) && action.action !== 'scroll' && action.action !== 'wait' && action.action !== 'navigate') {
+    return { success: false, error: `Element ${action.target} not found in DOM`, description: `${action.action}: element ${action.target} not found` };
+  }
+
+  const el = action.target ? elementMap.get(action.target) : undefined;
+
+  try {
+    switch (action.action) {
+      case 'click': {
+        if (!el) return { success: false, error: 'No target element for click', description: 'click: no target' };
+        if (el.disabled) return { success: false, error: `Element ${action.target} is disabled`, description: `click ${action.target}: disabled` };
+        await clickElement(page, el);
+        return { success: true, description: `clicked ${action.target} "${el.text || el.tag}"` };
+      }
+
+      case 'type': {
+        if (!el) return { success: false, error: 'No target element for type', description: 'type: no target' };
+        const text = action.value ?? '';
+        await focusAndType(page, el, text);
+        return { success: true, description: `typed "${text.slice(0, 30)}" into ${action.target}` };
+      }
+
+      case 'select': {
+        if (!el) return { success: false, error: 'No target element for select', description: 'select: no target' };
+        const value = action.value ?? '';
+        await selectOption(page, el, value);
+        return { success: true, description: `selected "${value}" in ${action.target}` };
+      }
+
+      case 'scroll': {
+        if (el) {
+          // Scroll element into view
+          try {
+            await page.locator(el.selector).first().scrollIntoViewIfNeeded({ timeout: 3000 });
+          } catch {
+            await page.mouse.click(el.rect.x + el.rect.width / 2, el.rect.y + el.rect.height / 2);
+            await page.mouse.wheel(0, 300);
+          }
+          return { success: true, description: `scrolled to ${action.target}` };
+        }
+        // Generic scroll
+        const direction = action.value?.toLowerCase() === 'up' ? -400 : 400;
+        await page.mouse.wheel(0, direction);
+        return { success: true, description: `scrolled ${direction > 0 ? 'down' : 'up'}` };
+      }
+
+      case 'wait': {
+        const ms = parseInt(action.value || '1000') || 1000;
+        await new Promise(r => setTimeout(r, Math.min(ms, 5000)));
+        return { success: true, description: `waited ${ms}ms` };
+      }
+
+      case 'navigate': {
+        const url = action.value;
+        if (!url) return { success: false, error: 'No URL for navigate', description: 'navigate: no URL' };
+        await page.goto(url, { waitUntil: 'load', timeout: 15000 });
+        return { success: true, description: `navigated to ${url.slice(0, 60)}` };
+      }
+
+      case 'keypress': {
+        const key = normalizePlaywrightKey(action.value || 'Enter');
+        await page.keyboard.press(key);
+        return { success: true, description: `pressed ${key}` };
+      }
+
+      case 'done':
+        return { success: true, description: 'test completed' };
+
+      default:
+        return { success: false, error: `Unknown action: ${action.action}`, description: `unknown: ${action.action}` };
+    }
+  } catch (err) {
+    const msg = (err as Error).message;
+    return { success: false, error: msg, description: `${action.action} failed: ${msg.slice(0, 80)}` };
   }
 }

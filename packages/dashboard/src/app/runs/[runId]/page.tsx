@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useSSE } from '@/lib/use-sse';
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || '';
 
 interface Screenshot {
   id: string;
@@ -67,6 +67,7 @@ export default function RunDetailPage() {
   const [hasVideo, setHasVideo] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [rerunning, setRerunning] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [showTokens, setShowTokens] = useState(false);
 
   // SSE for live updates when the run is active
@@ -169,6 +170,31 @@ export default function RunDetailPage() {
           </span>
         </div>
         <div className="flex items-center gap-3">
+          {/* Refresh button */}
+          <button
+            onClick={async () => {
+              setRefreshing(true);
+              try {
+                const res = await fetch(`/api/runs/${runId}`);
+                if (res.ok) {
+                  setRun(await res.json());
+                }
+                const videoRes = await fetch(`/api/runs/${runId}/video`, { method: 'HEAD' });
+                setHasVideo(videoRes.ok);
+              } catch (err) {
+                console.error('Refresh failed:', err);
+              } finally {
+                setRefreshing(false);
+              }
+            }}
+            disabled={refreshing}
+            className={`px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded-lg transition-colors ${refreshing ? 'animate-spin' : ''}`}
+            title="Refresh data"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+          </button>
           {!isActive && run.status !== 'queued' && (
             <>
               <button
@@ -181,11 +207,9 @@ export default function RunDetailPage() {
                       body: JSON.stringify({ headless: true }),
                     });
                     const data = await res.json();
-                    // Navigate to the new run's detail page
                     if (data.testRunId) {
                       window.location.href = `/runs/${data.testRunId}`;
                     } else if (data.suiteRunId) {
-                      // Fallback: reload current page after a delay
                       window.location.href = '/';
                     }
                   } catch (err) {
@@ -198,6 +222,34 @@ export default function RunDetailPage() {
               >
                 {rerunning ? 'Starting...' : 'Re-Test'}
               </button>
+              {run.status === 'timeout' && (
+                <button
+                  onClick={async () => {
+                    const moreTurns = run.turn_count + 20;
+                    setRerunning(true);
+                    try {
+                      const res = await fetch(`${API}/api/tests/${run.test_id}/run`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ headless: true, maxTurnsOverride: moreTurns, resumeFromRunId: runId }),
+                      });
+                      const data = await res.json();
+                      if (data.testRunId) {
+                        window.location.href = `/runs/${data.testRunId}`;
+                      } else if (data.suiteRunId) {
+                        window.location.href = '/';
+                      }
+                    } catch (err) {
+                      console.error('Failed to retry:', err);
+                      setRerunning(false);
+                    }
+                  }}
+                  disabled={rerunning}
+                  className="px-5 py-2 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg text-sm transition-colors"
+                >
+                  {rerunning ? 'Starting...' : `Retry +20 Turns (${run.turn_count + 20})`}
+                </button>
+              )}
               <a
                 href={`${API}/api/runs/${runId}/report`}
                 download
@@ -445,9 +497,9 @@ export default function RunDetailPage() {
 
           {/* Error */}
           {run.error && (
-            <div className="bg-red-100 dark:bg-red-950/30 border border-red-300 dark:border-red-800/30 rounded-xl p-5">
-              <h3 className="text-sm font-semibold text-red-700 dark:text-red-400 mb-2">Error</h3>
-              <pre className="text-sm text-red-600 dark:text-red-300 whitespace-pre-wrap font-mono">{run.error}</pre>
+            <div className="bg-white dark:bg-gray-900 rounded-xl p-5 shadow-sm" style={{ border: '1px solid #fecaca', borderLeft: '4px solid #ef4444', backgroundColor: '#fef2f2' }}>
+              <h3 className="text-sm font-semibold text-red-600 dark:text-red-400 mb-2">Error</h3>
+              <pre className="text-sm text-red-700 dark:text-red-300 font-mono leading-relaxed" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', overflowWrap: 'anywhere' }}>{run.error}</pre>
             </div>
           )}
         </div>

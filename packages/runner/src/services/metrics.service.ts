@@ -1,0 +1,100 @@
+import { v4 as uuid } from 'uuid';
+import { MetricSnapshot } from '../db/models/MetricSnapshot.js';
+import { TestRun } from '../db/models/TestRun.js';
+import { getQueueMetrics } from '../queue/queue.js';
+
+// Alert thresholds (configurable via env)
+const ALERT_FAILURE_RATE = parseInt(process.env.ALERT_FAILURE_RATE || '30', 10);
+const ALERT_QUEUE_SIZE = parseInt(process.env.ALERT_QUEUE_SIZE || '20', 10);
+const ALERT_AVG_LATENCY_MS = parseInt(process.env.ALERT_AVG_LATENCY_MS || '300000', 10); // 5 min
+
+export async function captureMetricSnapshot() {
+  const queue = await getQueueMetrics();
+
+  // Compute stats from last 24 hours
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const recentRuns = await TestRun.find({
+    completedAt: { $gte: since },
+    status: { $nin: ['queued', 'running'] },
+  }).lean();
+
+  const totalRuns = recentRuns.length;
+  const failedRuns = recentRuns.filter(r => r.status === 'failed' || r.status === 'error').length;
+  const failureRate = totalRuns > 0 ? Math.round((failedRuns / totalRuns) * 100) : 0;
+
+  const durations = recentRuns.filter(r => r.durationMs).map(r => r.durationMs!);
+  const avgLatencyMs = durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
+
+  const totalTokensUsed = recentRuns.reduce((sum, r) => sum + (r.inputTokens || 0) + (r.outputTokens || 0), 0);
+
+  // Generate alerts
+  const alerts: string[] = [];
+  if (failureRate > ALERT_FAILURE_RATE) {
+    alerts.push(`HIGH_FAILURE_RATE: ${failureRate}% failure rate in last 24h (threshold: ${ALERT_FAILURE_RATE}%)`);
+  }
+  if (queue.waiting > ALERT_QUEUE_SIZE) {
+    alerts.push(`QUEUE_BACKLOG: ${queue.waiting} jobs waiting (threshold: ${ALERT_QUEUE_SIZE})`);
+  }
+  if (avgLatencyMs > ALERT_AVG_LATENCY_MS) {
+    alerts.push(`HIGH_LATENCY: avg ${Math.round(avgLatencyMs / 1000)}s per test (threshold: ${Math.round(ALERT_AVG_LATENCY_MS / 1000)}s)`);
+  }
+  if (queue.failed > 5) {
+    alerts.push(`QUEUE_FAILURES: ${queue.failed} failed jobs in queue`);
+  }
+
+  // Log alerts
+  if (alerts.length > 0) {
+    console.warn(`[metrics] ALERTS:\n  ${alerts.join('\n  ')}`);
+  }
+
+  // Save snapshot
+  const snapshot = await MetricSnapshot.create({
+    _id: uuid(),
+    timestamp: new Date(),
+    queueWaiting: queue.waiting,
+    queueActive: queue.active,
+    queueFailed: queue.failed,
+    totalRuns,
+    failureRate,
+    avgLatencyMs,
+    totalTokensUsed,
+    alerts,
+  });
+
+  return snapshot;
+}
+
+// Get time-series data for the last N hours
+export async function getMetricsTimeSeries(hours = 24) {
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+  return MetricSnapshot.find({ timestamp: { $gte: since } })
+    .sort({ timestamp: 1 })
+    .lean();
+}
+
+// Schedule metrics capture every 5 minutes
+let metricsInterval: ReturnType<typeof setInterval> | null = null;
+
+export function startMetricsScheduler() {
+  // Capture first snapshot after 30s (let system stabilize)
+  setTimeout(() => {
+    captureMetricSnapshot().catch(err =>
+      console.error('[metrics] Snapshot failed:', err.message)
+    );
+  }, 30000);
+
+  metricsInterval = setInterval(() => {
+    captureMetricSnapshot().catch(err =>
+      console.error('[metrics] Snapshot failed:', err.message)
+    );
+  }, 5 * 60 * 1000); // every 5 minutes
+
+  console.log('[metrics] Metrics scheduler started (every 5 min)');
+}
+
+export function stopMetricsScheduler() {
+  if (metricsInterval) {
+    clearInterval(metricsInterval);
+    metricsInterval = null;
+  }
+}

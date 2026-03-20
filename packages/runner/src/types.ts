@@ -106,3 +106,90 @@ export interface CUAResponse {
     total_tokens?: number;
   } | null;
 }
+
+// ── CUA Loop Shared Types ──────────────────────────────────────
+export interface TurnTokenUsage {
+  turn: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  apiLatencyMs: number;
+  cumulativeInput: number;
+  cumulativeOutput: number;
+  cumulativeReasoning: number;
+}
+
+export interface CUALoopCallbacks {
+  onTurnStart: (turn: number) => void;
+  onTurnComplete: (turn: number, apiLatencyMs: number, tokensSoFar?: { input: number; output: number; reasoning: number }) => void;
+  onTurnTokens: (turnTokens: TurnTokenUsage) => void;
+  onActionsExecuted: (turn: number, actions: ComputerAction[]) => void;
+  onScreenshot: (turn: number, screenshot: ScreenshotRecord) => void;
+}
+
+export interface PageState {
+  url: string;
+  title: string;
+  lastActions: string[];
+  storageStatePath?: string;
+}
+
+export interface CUALoopResult {
+  verdict: 'PASS' | 'FAIL' | 'TIMEOUT' | 'UNKNOWN';
+  modelMessage: string;
+  turns: number;
+  totalTokens: { input: number; output: number; reasoning: number };
+  pageState?: PageState;
+}
+
+// ── DOM-First CUA Types ────────────────────────────────────────
+export interface DOMElement {
+  id: string;           // e1, e2...
+  tag: string;          // button, input, a, select, textarea
+  type?: string;        // text, password, checkbox, submit
+  text?: string;        // visible text (max 80 chars)
+  placeholder?: string;
+  value?: string;       // current value for inputs
+  href?: string;        // for links (max 100 chars)
+  ariaLabel?: string;
+  role?: string;
+  disabled?: boolean;
+  checked?: boolean;
+  options?: string[];   // for select (max 10)
+  rect: { x: number; y: number; width: number; height: number };
+  selector: string;     // CSS selector for fallback
+}
+
+export interface DOMPageState {
+  url: string;
+  title: string;
+  elements: DOMElement[];
+  keyText: string;      // headings, labels, errors — NOT random innerText
+  formState?: Record<string, string>;
+  errors?: string[];    // visible validation errors
+}
+
+export interface ModelAction {
+  action: 'click' | 'type' | 'scroll' | 'select' | 'wait' | 'navigate' | 'keypress' | 'done';
+  target?: string;      // element ID (e1, e2...)
+  value?: string;       // text to type, option to select, URL, key
+  reason: string;       // why this action
+  confidence: number;   // 0.0 - 1.0
+  stepsCompleted?: string[];  // progress tracking
+  verdict?: 'PASS' | 'FAIL'; // only when action is 'done'
+  summary?: string;           // only when action is 'done'
+  issuesFound?: string[];     // only when action is 'done'
+}
+
+export interface ActionResult {
+  success: boolean;
+  error?: string;
+  description: string;  // human-readable description
+}
+
+export interface StructuredMemory {
+  page: string;
+  filled: string[];
+  pending: string[];
+  errors: string[];
+}

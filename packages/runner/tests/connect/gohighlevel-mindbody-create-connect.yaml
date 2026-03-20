@@ -1,0 +1,76 @@
+name: "Create Connect - GoHighLevel V2 to Mindbody Sale"
+url: "https://connectcloud.appypie.com/connects"
+requires_auth: true
+category: e2e
+max_turns: 60
+instructions: |
+  1. If on redirection login is required then login with provided credentials, else navigate to the Connect dashboard
+  2. Click on the "Create Connect" button. If a user guide or onboarding overlay appears, skip or dismiss it. Also close the Automate "Support Available" modal if it appears.
+  3. In the Trigger section:
+     - In the Search bar enter "GoHighLevel" and select "GoHighLevel V2" from the app list
+     - Select trigger event: New Opportunity
+  4. For GoHighLevel V2 account:
+     - If a linked account is already shown, click on the continue button to proceed to the next step
+     - If no account is linked, click "Add an Account" to connect one
+  5. Configure the trigger fields:
+     - If a "Select Location" or similar dropdown appears, select the first available location
+     - If a "Pipeline" dropdown appears, select the first available pipeline
+     - Fill any other required fields with the first available option
+  6. Click Continue & Run Test button to proceed with testing the trigger step
+     - Verify that the test runs successfully with a confirmation message
+     - Click view record to verify the opportunity data is displayed
+     - Click continue to move to the action step
+  7. Click on "+" to add an Action app and In the Action section:
+     - Search for and select application: "Mindbody" or "MINDBODY"
+     - Select action event: Create Sale
+  8. For Mindbody account:
+     - If a linked account is already shown, click continue to proceed
+     - If no account is linked, click "Add an Account" to connect one
+  9. Configure the Create Sale fields — IMPORTANT: The form is long, you MUST scroll down to see all fields. Follow this exact order:
+     a. Select Site List — select "appy pie sandbox" or the first available site from the dropdown
+     b. ClientId — map a dynamic value from GoHighLevel trigger output:
+        - Click on the field, open the mapping dropdown
+        - Select a value like contact email or contact id from the trigger data
+        - If the field shows "Please fill site_list,username,password before select client id", make sure site is selected first
+     c. SCROLL DOWN in the Action Details panel to reveal more fields below ClientId
+     d. Product — click "Add or Select", select the first available product (e.g. "laptoptesting" or any listed product)
+        - This is CRITICAL: it satisfies the required "Items" parameter. Without this the test WILL fail with "Items is a required parameter"
+     e. Quantity — enter "1"
+     f. Amount — enter "20" or any test numeric value
+     g. SCROLL DOWN again to see Location, Send Email, Payments Type fields
+     h. Location — select the first available location from dropdown (e.g. "appy pie sandbox - California City,New York")
+     i. Send Email — select "True" from the dropdown
+     j. Payments Type — click "Add or Select" and select "Cash" from the dropdown
+     k. Item Type — select "product" from the dropdown
+     l. SCROLL DOWN once more to check for any remaining required fields
+     m. Service, Package, Staff, Sale Date, Notes — skip all these optional fields
+  10. After all required fields are filled, click "Continue & Run Test" button
+  11. ERROR HANDLING — If the action test fails:
+      - Read the error message carefully. Common errors and how to fix them:
+        a. "Items is a required parameter" → go back and ensure Product, Service, or Package has a value selected via "Add or Select". If Product dropdown is empty, try Service or Package instead
+        b. "ClientId is a required parameter" → go back and map a value for the ClientId field from the trigger output dropdown
+        c. "LocationId is a required parameter" → go back and select a Location from the dropdown
+        d. "PaymentMethodId" or payment-related error → go back, find Payments Type field, click "Add or Select" and choose the first available option
+        e. Any other "X is a required parameter" error → scroll through the form, find the field named X, and fill it with the first available option from its dropdown or enter a test value
+        f. If a field requires a prerequisite (e.g. "Please fill site_list first"), ensure the prerequisite field is filled, then retry
+      - After fixing the missing field(s), click "Continue & Run Test" again
+      - Repeat this fix cycle up to 3 times. If the test still fails after 3 attempts, report all error messages in the summary
+  12. If the action test succeeds, check whether the Activate Connect button is active or not. If yes then enable the connect workflow by clicking on Activate Connect button
+       - If an "Upgrade Plan" popup or any pricing/plan upgrade modal appears, do NOT dismiss it — instead note the exact popup title, message text, and which plan it suggests, then report this as a blocking issue in your summary
+       - If no popup appears, verify that the connect workflow is activated successfully
+  13. Verify the workflow was created successfully:
+      - Workflow should appear in the connects list
+      - Connect status should appear as "ON" or "Active"
+      - Trigger application shows "GoHighLevel V2" with event "New Opportunity"
+      - Action application shows "MINDBODY" with event "Create Sale"
+timeout: 360000
+expected_outcome: "A connect workflow is created successfully where Trigger is GoHighLevel V2 (New Opportunity) and Action is Mindbody (Create Sale) with Product/Item selected and ClientId mapped from trigger output. The workflow appears in the connects list with an active/ON status."
+tags:
+  - workflow
+  - integration
+  - gohighlevel
+  - mindbody
+  - connect_creation
+  - e2e
+  - automate
+  - field_mapping

@@ -2,18 +2,38 @@
 
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || '';
 
 // ── Types ────────────────────────────────────────────────────────
 
 interface TestDefinition {
   id: string;
+  _id?: string;
   name: string;
   url: string;
+  instructions?: string;
+  expected_outcome?: string;
+  expectedOutcome?: string;
   tags?: string[];
   category?: 'smoke' | 'sanity' | 'regression' | 'e2e';
   timeout: number;
   requires_auth?: boolean;
+  requiresAuth?: boolean;
+  max_turns?: number;
+  maxTurns?: number;
+  page?: string;
+  version?: number;
+  isActive?: boolean;
+}
+
+interface SystemSettings {
+  _id: string;
+  maxConcurrency: number;
+  maxTurnsDefault: number;
+  maxTokensPerSession: number;
+  defaultTimeout: number;
+  defaultHeadless: boolean;
+  allowedDomains: string[];
 }
 
 interface SuiteRun {
@@ -48,7 +68,7 @@ interface TestAccount {
   passwordMasked: string;
 }
 
-type TabId = 'overview' | 'results' | 'failures' | 'logs' | 'config';
+type TabId = 'overview' | 'results' | 'failures' | 'logs' | 'tests' | 'config';
 
 function statusBadge(status: string) {
   switch (status) {
@@ -92,20 +112,40 @@ export default function DashboardPage() {
   // Logs state
   const [logEvents, setLogEvents] = useState<Array<{ type: string; message: string; timestamp: string }>>([]);
 
+  // Test Manager state
+  const [editingTest, setEditingTest] = useState<TestDefinition | null>(null);
+  const [showTestModal, setShowTestModal] = useState(false);
+  const [testForm, setTestForm] = useState({ name: '', url: '', instructions: '', expectedOutcome: '', category: 'sanity', tags: '', requiresAuth: false, maxTurns: 40, timeout: 120000, page: '' });
+  const [testSaving, setTestSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
+
+  // Settings state
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+
   // Modal state
   const [showResetModal, setShowResetModal] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ testId: string; testName: string } | null>(null);
+
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
+  };
 
   // ── Data loading ─────────────────────────────────────────────
 
   // Load initial data + detect active suites
   const loadData = useCallback(async () => {
     try {
-      const [testsRes, accountRes] = await Promise.all([
+      const [testsRes, accountRes, settingsRes] = await Promise.all([
         fetch(`${API}/api/tests`),
         fetch(`${API}/api/config/account`),
+        fetch(`${API}/api/settings`),
       ]);
       setTests(await testsRes.json());
       setAccount(await accountRes.json());
+      setSettings(await settingsRes.json());
     } catch (err) {
       console.error('Failed to load data:', err);
     }
@@ -312,8 +352,98 @@ export default function DashboardPage() {
     { id: 'results', label: 'Test Results' },
     { id: 'failures', label: 'Failures' },
     { id: 'logs', label: 'Logs' },
-    { id: 'config', label: 'Config' },
+    { id: 'tests', label: 'Test Manager' },
+    { id: 'config', label: 'Settings' },
   ];
+
+  // ── Test CRUD helpers ───────────────────────────────────────
+  const openCreateTest = () => {
+    setEditingTest(null);
+    setTestForm({ name: '', url: '', instructions: '', expectedOutcome: '', category: 'sanity', tags: '', requiresAuth: false, maxTurns: 40, timeout: 120000, page: '' });
+    setShowTestModal(true);
+  };
+
+  const openEditTest = (test: TestDefinition) => {
+    setEditingTest(test);
+    setTestForm({
+      name: test.name,
+      url: test.url,
+      instructions: test.instructions || test.expectedOutcome || '',
+      expectedOutcome: test.expected_outcome || test.expectedOutcome || '',
+      category: test.category || 'sanity',
+      tags: (test.tags || []).join(', '),
+      requiresAuth: test.requires_auth || test.requiresAuth || false,
+      maxTurns: test.max_turns || test.maxTurns || 40,
+      timeout: test.timeout || 120000,
+      page: test.page || '',
+    });
+    setShowTestModal(true);
+  };
+
+  const saveTest = async () => {
+    setTestSaving(true);
+    try {
+      const body = {
+        ...testForm,
+        tags: testForm.tags.split(',').map(t => t.trim()).filter(Boolean),
+      };
+      if (editingTest) {
+        await fetch(`${API}/api/tests/${editingTest.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      } else {
+        await fetch(`${API}/api/tests`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      }
+      setShowTestModal(false);
+      loadData();
+    } catch (err) {
+      console.error('Failed to save test:', err);
+    } finally {
+      setTestSaving(false);
+    }
+  };
+
+  const deleteTest = async (testId: string) => {
+    await fetch(`${API}/api/tests/${testId}`, { method: 'DELETE' });
+    loadData();
+  };
+
+  const importYaml = async () => {
+    setImporting(true);
+    try {
+      const res = await fetch(`${API}/api/tests/import-yaml`, { method: 'POST' });
+      const data = await res.json();
+      showToast(`Imported ${data.imported} tests, skipped ${data.skipped}`, 'success');
+      loadData();
+    } catch (err) {
+      console.error('Import failed:', err);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const saveSettings = async () => {
+    if (!settings) return;
+    setSettingsSaving(true);
+    try {
+      const res = await fetch(`${API}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settings),
+      });
+      setSettings(await res.json());
+    } catch (err) {
+      console.error('Failed to save settings:', err);
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -667,10 +797,10 @@ export default function DashboardPage() {
             </div>
           ) : (
             failedRuns.map(run => (
-              <div key={run.id} className="bg-gray-900 border border-red-200 dark:border-red-900/30 rounded-xl p-5">
+              <div key={run.id} className="bg-white dark:bg-gray-900 rounded-xl p-5 shadow-sm" style={{ border: '1px solid #e5e7eb', borderLeft: '4px solid #ef4444' }}>
                 <div className="flex items-start justify-between mb-3">
                   <div>
-                    <h3 className="text-gray-50 font-semibold text-sm">{run.test_name}</h3>
+                    <h3 className="text-gray-900 dark:text-gray-50 font-semibold text-sm">{run.test_name}</h3>
                     <span className={`text-xs px-2 py-0.5 rounded-full border mt-1 inline-block ${statusBadge(run.status)}`}>
                       {run.status}
                     </span>
@@ -683,17 +813,17 @@ export default function DashboardPage() {
 
                 {/* Error message */}
                 {run.error && (
-                  <div className="bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800/20 rounded-lg p-3 mb-3">
-                    <div className="text-xs text-red-600 dark:text-red-400 font-medium mb-1">Error</div>
-                    <pre className="text-xs text-red-500 dark:text-red-300 font-mono whitespace-pre-wrap">{run.error}</pre>
+                  <div className="rounded-r-lg p-3 mb-3" style={{ backgroundColor: '#fef2f2', borderLeft: '3px solid #f87171' }}>
+                    <div className="text-xs text-red-600 dark:text-red-400 font-semibold mb-1">Error</div>
+                    <pre className="text-xs text-red-700 dark:text-red-300 font-mono whitespace-pre-wrap leading-relaxed">{run.error}</pre>
                   </div>
                 )}
 
                 {/* Model verdict */}
                 {run.model_verdict && (
-                  <div className="bg-gray-800/50 rounded-lg p-3 mb-3">
-                    <div className="text-xs text-gray-500 font-medium mb-1">Model Verdict</div>
-                    <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
+                  <div className="bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-3 mb-3">
+                    <div className="text-xs text-gray-600 dark:text-gray-400 font-medium mb-1">Model Verdict</div>
+                    <pre className="text-xs text-gray-700 dark:text-gray-300 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
                       {run.model_verdict}
                     </pre>
                   </div>
@@ -756,9 +886,218 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* CONFIG TAB */}
+      {/* TEST MANAGER TAB */}
+      {activeTab === 'tests' && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-400">Test Definitions</h3>
+            <div className="flex gap-2">
+              <button
+                onClick={async () => {
+                  setImporting(true);
+                  try {
+                    const res = await fetch(`${API}/api/tests/sync-yaml`, { method: 'POST' });
+                    const data = await res.json();
+                    showToast(`Synced: ${data.created} new, ${data.updated} updated, ${data.unchanged} unchanged`, 'success');
+                    loadData();
+                  } catch (err) { console.error('Sync failed:', err); }
+                  finally { setImporting(false); }
+                }}
+                disabled={importing}
+                className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-md transition-colors"
+              >
+                {importing ? 'Syncing...' : 'Sync from YAML'}
+              </button>
+              <label className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-md transition-colors cursor-pointer">
+                Import YAML
+                <input
+                  type="file"
+                  accept=".yaml,.yml"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    setImporting(true);
+                    try {
+                      const text = await file.text();
+                      const res = await fetch(`${API}/api/tests/import-file`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ filename: file.name, content: text }),
+                      });
+                      const data = await res.json();
+                      if (data.error) { showToast(`Import failed: ${data.error}`, 'error'); }
+                      else { showToast(`Imported: ${data.name}`, 'success'); loadData(); }
+                    } catch (err) { console.error('Import failed:', err); }
+                    finally { setImporting(false); e.target.value = ''; }
+                  }}
+                />
+              </label>
+              <button
+                onClick={openCreateTest}
+                className="text-xs px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md transition-colors"
+              >
+                + Create Test
+              </button>
+            </div>
+          </div>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-800 text-gray-500 text-xs">
+                  <th className="text-left py-3 px-4 font-medium">Name</th>
+                  <th className="text-left py-3 px-4 font-medium">Category</th>
+                  <th className="text-left py-3 px-4 font-medium">URL</th>
+                  <th className="text-left py-3 px-4 font-medium">Page</th>
+                  <th className="text-left py-3 px-4 font-medium">Version</th>
+                  <th className="text-left py-3 px-4 font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tests.map(test => (
+                  <tr key={test.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+                    <td className="py-3 px-4 text-gray-50 font-medium">{test.name}</td>
+                    <td className="py-3 px-4">
+                      <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${
+                        test.category === 'smoke' ? 'bg-cyan-50 text-cyan-600 border-cyan-200 dark:bg-cyan-500/15 dark:text-cyan-400 dark:border-cyan-500/30' :
+                        test.category === 'sanity' ? 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-500/15 dark:text-violet-400 dark:border-violet-500/30' :
+                        test.category === 'regression' ? 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-500/15 dark:text-orange-400 dark:border-orange-500/30' :
+                        'bg-pink-50 text-pink-600 border-pink-200 dark:bg-pink-500/15 dark:text-pink-400 dark:border-pink-500/30'
+                      }`}>
+                        {(test.category || 'sanity').toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-gray-500 text-xs truncate max-w-[200px]">{test.url}</td>
+                    <td className="py-3 px-4 text-gray-400 text-xs">{test.page || '-'}</td>
+                    <td className="py-3 px-4 text-gray-400 text-xs">{test.version ?? '-'}</td>
+                    <td className="py-3 px-4">
+                      <div className="flex gap-2">
+                        <button onClick={() => openEditTest(test)} className="text-xs text-indigo-400 hover:text-indigo-300">Edit</button>
+                        <button onClick={() => setDeleteConfirm({ testId: test.id, testName: test.name })} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* TEST CREATE/EDIT MODAL */}
+      {showTestModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowTestModal(false)} />
+          <div className="relative bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-2xl mx-4 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <h3 className="text-lg font-semibold text-gray-50 mb-4">{editingTest ? 'Edit Test' : 'Create Test'}</h3>
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Name *</label>
+                  <input value={testForm.name} onChange={e => setTestForm(f => ({ ...f, name: e.target.value }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">URL *</label>
+                  <input value={testForm.url} onChange={e => setTestForm(f => ({ ...f, url: e.target.value }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Instructions *</label>
+                <textarea value={testForm.instructions} onChange={e => setTestForm(f => ({ ...f, instructions: e.target.value }))} rows={6} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500 font-mono" />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Expected Outcome *</label>
+                <textarea value={testForm.expectedOutcome} onChange={e => setTestForm(f => ({ ...f, expectedOutcome: e.target.value }))} rows={2} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+              </div>
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Category</label>
+                  <select value={testForm.category} onChange={e => setTestForm(f => ({ ...f, category: e.target.value }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500">
+                    <option value="smoke">Smoke</option>
+                    <option value="sanity">Sanity</option>
+                    <option value="regression">Regression</option>
+                    <option value="e2e">E2E</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Max Turns</label>
+                  <input type="number" value={testForm.maxTurns} onChange={e => setTestForm(f => ({ ...f, maxTurns: Number(e.target.value) }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Timeout (ms)</label>
+                  <input type="number" value={testForm.timeout} onChange={e => setTestForm(f => ({ ...f, timeout: Number(e.target.value) }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Tags (comma-separated)</label>
+                  <input value={testForm.tags} onChange={e => setTestForm(f => ({ ...f, tags: e.target.value }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" placeholder="homepage, navigation" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Page Group</label>
+                  <input value={testForm.page} onChange={e => setTestForm(f => ({ ...f, page: e.target.value }))} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" placeholder="homepage" />
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" checked={testForm.requiresAuth} onChange={e => setTestForm(f => ({ ...f, requiresAuth: e.target.checked }))} className="accent-indigo-500" />
+                Requires Authentication
+              </label>
+              <div className="flex gap-3 pt-2">
+                <button onClick={() => setShowTestModal(false)} className="flex-1 px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium rounded-lg text-sm transition-colors">Cancel</button>
+                <button onClick={saveTest} disabled={testSaving || !testForm.name || !testForm.url || !testForm.instructions} className="flex-1 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg text-sm transition-colors">
+                  {testSaving ? 'Saving...' : editingTest ? 'Update Test' : 'Create Test'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CONFIG/SETTINGS TAB */}
       {activeTab === 'config' && (
         <div className="space-y-6">
+          {/* System Settings */}
+          {settings && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+              <h3 className="font-semibold text-gray-50 text-sm mb-4">System Settings</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Max Concurrency</label>
+                  <input type="number" value={settings.maxConcurrency} onChange={e => setSettings(s => s ? { ...s, maxConcurrency: Number(e.target.value) } : s)} min={1} max={10} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Default Max Turns</label>
+                  <input type="number" value={settings.maxTurnsDefault} onChange={e => setSettings(s => s ? { ...s, maxTurnsDefault: Number(e.target.value) } : s)} min={1} max={100} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Max Tokens/Session</label>
+                  <input type="number" value={settings.maxTokensPerSession} onChange={e => setSettings(s => s ? { ...s, maxTokensPerSession: Number(e.target.value) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Default Timeout (ms)</label>
+                  <input type="number" value={settings.defaultTimeout} onChange={e => setSettings(s => s ? { ...s, defaultTimeout: Number(e.target.value) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Default Headless</label>
+                  <select value={settings.defaultHeadless ? 'true' : 'false'} onChange={e => setSettings(s => s ? { ...s, defaultHeadless: e.target.value === 'true' } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Allowed Domains</label>
+                  <input value={settings.allowedDomains.join(', ')} onChange={e => setSettings(s => s ? { ...s, allowedDomains: e.target.value.split(',').map(d => d.trim()).filter(Boolean) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                </div>
+              </div>
+              <div className="mt-4">
+                <button onClick={saveSettings} disabled={settingsSaving} className="text-xs px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-md">
+                  {settingsSaving ? 'Saving...' : 'Save Settings'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Test Account */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
             <div className="flex items-center justify-between mb-4">
@@ -771,7 +1110,7 @@ export default function DashboardPage() {
               </div>
               {!editingAccount && (
                 <button
-                  onClick={() => { if (account) { setEditEmail(account.email); setEditPassword(account.password); } setEditingAccount(true); }}
+                  onClick={() => { if (account) { setEditEmail(account.email); setEditPassword(''); } setEditingAccount(true); }}
                   className="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-md transition-colors"
                 >
                   Edit
@@ -824,11 +1163,8 @@ export default function DashboardPage() {
                   <span className="text-xs text-gray-500">Password</span>
                   <div className="flex items-center gap-2 mt-0.5">
                     <p className="text-sm text-gray-200 font-mono">
-                      {showPassword ? account.password : account.passwordMasked}
+                      {account.passwordMasked}
                     </p>
-                    <button onClick={() => setShowPassword(!showPassword)} className="text-xs text-gray-500 hover:text-gray-300">
-                      {showPassword ? 'Hide' : 'Show'}
-                    </button>
                   </div>
                 </div>
               </div>
@@ -889,7 +1225,7 @@ export default function DashboardPage() {
             <h3 className="text-lg font-semibold text-gray-50 text-center mb-2">Reset All Data</h3>
             {/* Description */}
             <p className="text-sm text-gray-400 text-center mb-6">
-              This will permanently delete all test results, screenshots, and replay videos. This action cannot be undone.
+              All test run data, screenshots, replay videos, and event logs will be permanently deleted. Test definitions and system settings will be preserved. This action cannot be undone.
             </p>
             {/* Actions */}
             <div className="flex gap-3">
@@ -920,6 +1256,68 @@ export default function DashboardPage() {
                 Reset Everything
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete Confirmation Modal ──────────────────────────── */}
+      {deleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setDeleteConfirm(null)} />
+          <div className="relative bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl">
+            <div className="flex items-center justify-center w-12 h-12 mx-auto mb-4 bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 rounded-full">
+              <svg className="w-6 h-6 text-red-500 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </div>
+            <h3 className="text-lg font-semibold text-gray-50 text-center mb-2">Delete Test</h3>
+            <p className="text-sm text-gray-400 text-center mb-6">
+              Are you sure you want to delete <strong className="text-gray-300">{deleteConfirm.testName}</strong>? This will deactivate the test definition.
+            </p>
+            <div className="flex gap-3">
+              <button onClick={() => setDeleteConfirm(null)} className="flex-1 px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium rounded-lg text-sm transition-colors">
+                Cancel
+              </button>
+              <button
+                onClick={() => { deleteTest(deleteConfirm.testId); setDeleteConfirm(null); }}
+                className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg text-sm transition-colors"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Toast Notification ──────────────────────────────────── */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom-4">
+          <div className={`flex items-center gap-3 px-5 py-3 rounded-xl shadow-2xl border ${
+            toast.type === 'success' ? 'bg-emerald-900/90 border-emerald-700 text-emerald-100' :
+            toast.type === 'error' ? 'bg-red-900/90 border-red-700 text-red-100' :
+            'bg-gray-900/90 border-gray-700 text-gray-100'
+          }`}>
+            {toast.type === 'success' && (
+              <svg className="w-5 h-5 text-emerald-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            )}
+            {toast.type === 'error' && (
+              <svg className="w-5 h-5 text-red-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            )}
+            {toast.type === 'info' && (
+              <svg className="w-5 h-5 text-blue-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            )}
+            <span className="text-sm font-medium">{toast.message}</span>
+            <button onClick={() => setToast(null)} className="ml-2 text-gray-400 hover:text-gray-200">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
         </div>
       )}

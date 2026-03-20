@@ -1,24 +1,259 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import path from 'path';
 import fs from 'fs';
-import { getDb } from './db.js';
+import { v4 as uuid } from 'uuid';
 import { getTestAccount, updateTestAccount, maskPassword } from './config.js';
-import { loadAllTests } from './test-loader.js';
-import { runSuite, runSingleTest, getActiveRunEmitter, abortRun, abortSuite } from './test-runner.js';
+import { loadAllTests, loadTestById } from './test-loader.js';
+import { testExecutionQueue, createSubscriber, type TestJobData } from './queue/queue.js';
+import { abortTestRun } from './queue/worker.js';
+import { TestRun } from './db/models/TestRun.js';
+import { Event } from './db/models/Event.js';
+import { TestDef } from './db/models/TestDef.js';
+import { Settings, getSettings } from './db/models/Settings.js';
+import { createTestSchema, updateTestSchema, settingsSchema } from './validation/test.validation.js';
+import * as sessionService from './services/session.service.js';
+import * as testService from './services/test.service.js';
 
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ── Auth middleware ─────────────────────────────────────────
+function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const apiKey = process.env.INTERNAL_API_KEY;
+  // Skip auth if no key is configured (dev mode)
+  if (!apiKey) return next();
+  const provided = req.headers['x-api-key'] as string;
+  if (!provided || provided !== apiKey) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// ── Allowed domains for CUA navigation ──────────────────────
+const ALLOWED_DOMAINS = (process.env.ALLOWED_DOMAINS || 'appypieautomate.ai,connectcloud.appypie.com,appypie.com').split(',');
+
 export function createServer(): express.Express {
   const app = express();
-  app.use(cors());
+
+  // Security headers
+  app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  }));
+
+  // CORS — restrict to dashboard origins
+  const allowedOrigins = (process.env.DASHBOARD_URL || 'http://localhost:3002').split(',');
+  app.use(cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (server-to-server, curl, etc.)
+      if (!origin || allowedOrigins.some(o => origin === o || origin.startsWith('http://localhost:') || origin.startsWith('http://10.'))) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
+    credentials: true,
+  }));
+
+  // Rate limiting — 100 requests per minute per IP
+  app.use('/api', rateLimit({
+    windowMs: 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }));
+
   app.use(express.json());
+
+  // Apply auth to all /api routes
+  app.use('/api', authMiddleware);
 
   // ── Health ─────────────────────────────────────────────────────
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  // ── Observability Metrics ────────────────────────────────────
+  app.get('/api/metrics', async (_req, res) => {
+    try {
+      const { getQueueMetrics } = await import('./queue/queue.js');
+      const queueMetrics = await getQueueMetrics();
+
+      // DB stats
+      const totalSessions = await (await import('./db/models/Session.js')).Session.countDocuments();
+      const totalRuns = await TestRun.countDocuments();
+      const runsByStatus = await TestRun.aggregate([
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]);
+
+      // Token totals
+      const tokenTotals = await TestRun.aggregate([
+        { $group: {
+          _id: null,
+          totalInput: { $sum: '$inputTokens' },
+          totalOutput: { $sum: '$outputTokens' },
+          totalReasoning: { $sum: '$reasoningTokens' },
+        }},
+      ]);
+
+      // Average latency (from completed runs)
+      const avgLatency = await TestRun.aggregate([
+        { $match: { durationMs: { $ne: null } } },
+        { $group: { _id: null, avgMs: { $avg: '$durationMs' }, maxMs: { $max: '$durationMs' }, minMs: { $min: '$durationMs' } } },
+      ]);
+
+      // Failure rate
+      const totalCompleted = runsByStatus.reduce((sum, r) => sum + (r._id !== 'queued' && r._id !== 'running' ? r.count : 0), 0);
+      const totalFailed = runsByStatus.reduce((sum, r) => sum + (r._id === 'failed' || r._id === 'error' ? r.count : 0), 0);
+      const failureRate = totalCompleted > 0 ? Math.round((totalFailed / totalCompleted) * 100) : 0;
+
+      // Per-test metrics: failure rate + avg duration per test
+      const perTestMetrics = await TestRun.aggregate([
+        { $match: { status: { $nin: ['queued', 'running'] } } },
+        { $group: {
+          _id: '$testId',
+          testName: { $first: '$testName' },
+          totalRuns: { $sum: 1 },
+          passed: { $sum: { $cond: [{ $eq: ['$status', 'passed'] }, 1, 0] } },
+          failed: { $sum: { $cond: [{ $in: ['$status', ['failed', 'error']] }, 1, 0] } },
+          timeouts: { $sum: { $cond: [{ $eq: ['$status', 'timeout'] }, 1, 0] } },
+          avgDurationMs: { $avg: '$durationMs' },
+          totalTokens: { $sum: { $add: ['$inputTokens', '$outputTokens'] } },
+          lastRun: { $max: '$startedAt' },
+        }},
+        { $addFields: {
+          failureRate: { $cond: [{ $gt: ['$totalRuns', 0] }, { $round: [{ $multiply: [{ $divide: ['$failed', '$totalRuns'] }, 100] }, 1] }, 0] },
+        }},
+        { $sort: { failureRate: -1 } },
+      ]);
+
+      res.json({
+        queue: queueMetrics,
+        database: {
+          sessions: totalSessions,
+          totalRuns,
+          runsByStatus: Object.fromEntries(runsByStatus.map(r => [r._id, r.count])),
+        },
+        tokens: tokenTotals[0] ?? { totalInput: 0, totalOutput: 0, totalReasoning: 0 },
+        latency: avgLatency[0] ?? { avgMs: 0, maxMs: 0, minMs: 0 },
+        failureRate: `${failureRate}%`,
+        perTest: perTestMetrics,
+        uptime: process.uptime(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Metrics time-series ──────────────────────────────────────
+  app.get('/api/metrics/history', async (req, res) => {
+    try {
+      const hours = Number(req.query.hours) || 24;
+      const { getMetricsTimeSeries } = await import('./services/metrics.service.js');
+      const data = await getMetricsTimeSeries(hours);
+      res.json(data);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Cleanup old data ──────────────────────────────────────────
+  app.post('/api/cleanup', async (req, res) => {
+    try {
+      const { retentionDays = 7 } = req.body ?? {};
+      const { cleanupOldRuns } = await import('./services/cleanup.service.js');
+      const result = await cleanupOldRuns(retentionDays);
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── DLQ: list failed jobs with grouping ────────────────────────
+  app.get('/api/dlq', async (_req, res) => {
+    try {
+      const { deadLetterQueue: dlq } = await import('./queue/queue.js');
+      const jobs = await dlq.getWaiting(0, 100);
+      const items = jobs.map(j => {
+        const d = j.data as any;
+        const error = d.error || '';
+        const errorType = error.includes('ECONNREFUSED') || error.includes('ETIMEDOUT') ? 'infra'
+          : error.includes('CUA API') || error.includes('Safety check') ? 'api'
+          : error.includes('aborted') ? 'aborted'
+          : 'unknown';
+        return {
+          id: j.id,
+          testId: d.testId,
+          testName: d.testName,
+          sessionId: d.sessionId,
+          testRunId: d.testRunId,
+          failedAt: d.failedAt,
+          error,
+          errorType,
+          attempts: d.attempts,
+        };
+      });
+
+      // Group by error type
+      const grouped: Record<string, typeof items> = {};
+      for (const item of items) {
+        if (!grouped[item.errorType]) grouped[item.errorType] = [];
+        grouped[item.errorType].push(item);
+      }
+
+      res.json({ total: items.length, grouped, items });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── DLQ: requeue a failed job (max 3 total attempts) ────────────
+  app.post('/api/dlq/:jobId/requeue', async (req, res) => {
+    try {
+      const MAX_TOTAL_ATTEMPTS = 3;
+      const { deadLetterQueue: dlq, testExecutionQueue: queue } = await import('./queue/queue.js');
+      const job = await dlq.getJob(req.params.jobId);
+      if (!job) return res.status(404).json({ error: 'Job not found in DLQ' });
+
+      const jobData = job.data as any;
+      const totalAttempts = (jobData.totalAttempts ?? jobData.attempts ?? 1) + 1;
+
+      if (totalAttempts > MAX_TOTAL_ATTEMPTS) {
+        return res.status(400).json({
+          error: `Max retry limit reached (${MAX_TOTAL_ATTEMPTS} total attempts). This job cannot be requeued.`,
+          testName: jobData.testName,
+          totalAttempts: totalAttempts - 1,
+        });
+      }
+
+      // Clean DLQ metadata, track total attempts
+      delete jobData.failedAt;
+      delete jobData.error;
+      delete jobData.attempts;
+      jobData.totalAttempts = totalAttempts;
+
+      await queue.add(`retry-${jobData.testId}`, jobData);
+      await job.remove();
+
+      res.json({ success: true, message: `Requeued job for test: ${jobData.testName} (attempt ${totalAttempts}/${MAX_TOTAL_ATTEMPTS})` });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── DLQ: clear all ──────────────────────────────────────────────
+  app.delete('/api/dlq', async (_req, res) => {
+    try {
+      const { deadLetterQueue: dlq } = await import('./queue/queue.js');
+      await dlq.obliterate({ force: true });
+      res.json({ success: true, message: 'DLQ cleared' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // ── Test Account Config ──────────────────────────────────────
@@ -27,7 +262,6 @@ export function createServer(): express.Express {
     res.json({
       email: account.email,
       passwordMasked: maskPassword(account.password),
-      password: account.password,
     });
   });
 
@@ -40,22 +274,298 @@ export function createServer(): express.Express {
     res.json({
       email: updated.email,
       passwordMasked: maskPassword(updated.password),
-      password: updated.password,
     });
   });
 
-  // ── Test Definitions ──────────────────────────────────────────
-  app.get('/api/tests', (_req, res) => {
-    const tests = loadAllTests();
-    res.json(tests);
+  // ── Test Definitions (DB-first, YAML fallback) ──────────────
+  app.get('/api/tests', async (_req, res) => {
+    const dbTests = await TestDef.find({ isActive: true }).sort({ name: 1 });
+    if (dbTests.length > 0) {
+      return res.json(dbTests.map(t => t.toJSON()));
+    }
+    // Fallback to YAML if DB is empty
+    const yamlTests = loadAllTests();
+    res.json(yamlTests);
+  });
+
+  // ── Create test ──────────────────────────────────────────────
+  app.post('/api/tests', async (req, res) => {
+    try {
+      const parsed = createTestSchema.parse(req.body);
+      const id = parsed.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+      const existing = await TestDef.findById(id);
+      if (existing && existing.isActive) {
+        return res.status(409).json({ error: `Test with id "${id}" already exists` });
+      }
+      const test = await TestDef.create({ _id: id, ...parsed });
+      res.status(201).json(test.toJSON());
+    } catch (err: any) {
+      if (err.name === 'ZodError') {
+        return res.status(400).json({ error: 'Validation failed', details: err.errors });
+      }
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Update test ──────────────────────────────────────────────
+  app.put('/api/tests/:id', async (req, res) => {
+    try {
+      const parsed = updateTestSchema.parse(req.body);
+      const test = await TestDef.findById(req.params.id);
+      if (!test || !test.isActive) {
+        return res.status(404).json({ error: 'Test not found' });
+      }
+      // Increment version on edit
+      await TestDef.updateOne(
+        { _id: req.params.id },
+        { $set: parsed, $inc: { version: 1 } },
+      );
+      const updated = await TestDef.findById(req.params.id);
+      res.json(updated!.toJSON());
+    } catch (err: any) {
+      if (err.name === 'ZodError') {
+        return res.status(400).json({ error: 'Validation failed', details: err.errors });
+      }
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Delete test (soft delete) ────────────────────────────────
+  app.delete('/api/tests/:id', async (req, res) => {
+    const test = await TestDef.findById(req.params.id);
+    if (!test) return res.status(404).json({ error: 'Test not found' });
+    await TestDef.updateOne({ _id: req.params.id }, { $set: { isActive: false } });
+    res.json({ success: true, message: `Test "${test.name}" deactivated` });
+  });
+
+  // ── Import tests from YAML → DB (creates new, skips existing) ─
+  app.post('/api/tests/import-yaml', async (_req, res) => {
+    try {
+      const yamlTests = loadAllTests();
+      let imported = 0;
+      let skipped = 0;
+      for (const t of yamlTests) {
+        const existing = await TestDef.findById(t.id);
+        if (existing) { skipped++; continue; }
+        await TestDef.create({
+          _id: t.id,
+          name: t.name,
+          url: t.url,
+          instructions: t.instructions,
+          expectedOutcome: t.expected_outcome,
+          category: t.category ?? 'sanity',
+          tags: t.tags ?? [],
+          requiresAuth: t.requires_auth ?? false,
+          maxTurns: t.max_turns ?? 40,
+          timeout: t.timeout ?? 120000,
+          viewport: t.viewport ?? { width: 1440, height: 900 },
+          page: t.page ?? '',
+        });
+        imported++;
+      }
+      res.json({ success: true, imported, skipped, total: yamlTests.length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Sync YAML → DB (updates existing + creates new) ──────────
+  app.post('/api/tests/sync-yaml', async (_req, res) => {
+    try {
+      const yamlTests = loadAllTests();
+      let created = 0;
+      let updated = 0;
+      let unchanged = 0;
+      for (const t of yamlTests) {
+        const data = {
+          name: t.name,
+          url: t.url,
+          instructions: t.instructions,
+          expectedOutcome: t.expected_outcome,
+          category: t.category ?? 'sanity',
+          tags: t.tags ?? [],
+          requiresAuth: t.requires_auth ?? false,
+          maxTurns: t.max_turns ?? 40,
+          timeout: t.timeout ?? 120000,
+          viewport: t.viewport ?? { width: 1440, height: 900 },
+          page: t.page ?? '',
+        };
+        const existing = await TestDef.findById(t.id);
+        if (!existing) {
+          await TestDef.create({ _id: t.id, ...data });
+          created++;
+        } else {
+          // Check if content changed
+          const changed = existing.instructions !== data.instructions ||
+            existing.expectedOutcome !== data.expectedOutcome ||
+            existing.name !== data.name ||
+            existing.url !== data.url;
+          if (changed) {
+            await TestDef.updateOne({ _id: t.id }, { $set: data, $inc: { version: 1 } });
+            updated++;
+          } else {
+            unchanged++;
+          }
+        }
+      }
+      res.json({ success: true, created, updated, unchanged, total: yamlTests.length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Import YAML file upload → DB ────────────────────────────
+  app.post('/api/tests/import-file', async (req, res) => {
+    try {
+      const { filename, content } = req.body ?? {};
+      if (!filename || !content) {
+        return res.status(400).json({ error: 'filename and content are required' });
+      }
+      const { parse: parseYaml } = await import('yaml');
+      const parsed = parseYaml(content);
+      if (!parsed?.name || !parsed?.url || !parsed?.instructions) {
+        return res.status(400).json({ error: 'YAML must have name, url, and instructions fields' });
+      }
+      const id = parsed.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') ||
+        filename.replace(/\.(yaml|yml)$/, '');
+
+      const data = {
+        name: parsed.name,
+        url: parsed.url,
+        instructions: parsed.instructions,
+        expectedOutcome: parsed.expected_outcome ?? '',
+        category: parsed.category ?? 'sanity',
+        tags: parsed.tags ?? [],
+        requiresAuth: parsed.requires_auth ?? false,
+        maxTurns: parsed.max_turns ?? 40,
+        timeout: parsed.timeout ?? 120000,
+        viewport: parsed.viewport ?? { width: 1440, height: 900 },
+        page: parsed.page ?? '',
+      };
+
+      const existing = await TestDef.findById(id);
+      if (existing) {
+        await TestDef.updateOne({ _id: id }, { $set: { ...data, isActive: true }, $inc: { version: 1 } });
+        const updated = await TestDef.findById(id);
+        res.json({ ...updated!.toJSON(), action: 'updated' });
+      } else {
+        const created = await TestDef.create({ _id: id, ...data });
+        res.status(201).json({ ...created.toJSON(), action: 'created' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── System Settings ──────────────────────────────────────────
+  app.get('/api/settings', async (_req, res) => {
+    const settings = await getSettings();
+    res.json(settings);
+  });
+
+  app.put('/api/settings', async (req, res) => {
+    try {
+      const parsed = settingsSchema.parse(req.body);
+      await Settings.updateOne({ _id: 'global' }, { $set: parsed }, { upsert: true });
+      const updated = await getSettings();
+      res.json(updated);
+    } catch (err: any) {
+      if (err.name === 'ZodError') {
+        return res.status(400).json({ error: 'Validation failed', details: err.errors });
+      }
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // ── Run full suite ────────────────────────────────────────────
   app.post('/api/suites', async (req, res) => {
     try {
-      const { testIds, parallel, headless = true } = req.body ?? {};
-      const result = await runSuite(testIds, parallel, headless);
-      res.status(202).json(result);
+      // Backpressure — reject if queue is overloaded
+      const MAX_QUEUE_SIZE = 50;
+      const { getQueueMetrics } = await import('./queue/queue.js');
+      const metrics = await getQueueMetrics();
+      if (metrics.waiting + metrics.active > MAX_QUEUE_SIZE) {
+        return res.status(429).json({
+          error: `Queue is full (${metrics.waiting} waiting, ${metrics.active} active). Try again later.`,
+        });
+      }
+
+      const { testIds, headless = true, skipDupeCheck = false } = req.body ?? {};
+
+      // Deduplication — reject if any test already has an active run
+      if (!skipDupeCheck) {
+        const activeRuns = await TestRun.find({
+          status: { $in: ['queued', 'running'] },
+        }).lean();
+        const activeTestIds = new Set(activeRuns.map(r => r.testId));
+        const requestedIds = testIds ?? (await TestDef.find({ isActive: true }).lean()).map((t: any) => t._id);
+        const dupes = requestedIds.filter((id: string) => activeTestIds.has(id));
+        if (dupes.length > 0) {
+          return res.status(409).json({
+            error: `${dupes.length} test(s) already running/queued: ${dupes.slice(0, 5).join(', ')}`,
+            duplicates: dupes,
+          });
+        }
+      }
+
+      // Load tests from DB first, fallback to YAML
+      let allTests: any[];
+      const dbTests = await TestDef.find({ isActive: true }).sort({ name: 1 }).lean();
+      if (dbTests.length > 0) {
+        allTests = dbTests.map(t => ({
+          id: t._id,
+          name: t.name,
+          url: t.url,
+          instructions: t.instructions,
+          expected_outcome: t.expectedOutcome,
+          category: t.category,
+          tags: t.tags,
+          requires_auth: t.requiresAuth,
+          max_turns: t.maxTurns,
+          timeout: t.timeout,
+          viewport: t.viewport,
+        }));
+      } else {
+        allTests = loadAllTests();
+      }
+
+      const tests = testIds
+        ? allTests.filter((t: any) => testIds.includes(t.id))
+        : allTests;
+
+      if (tests.length === 0) return res.status(400).json({ error: 'No tests to run' });
+
+      // Load system settings for defaults
+      const sysSettings = await getSettings();
+
+      // Create session
+      const session = await sessionService.createSession(tests.length);
+
+      // Create test runs and queue jobs
+      for (const testDef of tests) {
+        const testRun = await testService.createTestRun(session._id, testDef.id, testDef.name);
+
+        const jobData: TestJobData = {
+          sessionId: session._id,
+          testRunId: testRun._id,
+          testId: testDef.id,
+          testName: testDef.name,
+          testUrl: testDef.url,
+          testInstructions: testDef.instructions,
+          expectedOutcome: testDef.expected_outcome,
+          headless,
+          requiresAuth: testDef.requires_auth ?? false,
+          maxTurns: testDef.max_turns || sysSettings.maxTurnsDefault,
+          timeout: testDef.timeout || sysSettings.defaultTimeout,
+          viewport: testDef.viewport,
+        };
+        // Priority: smoke=1 (highest), e2e=2, regression=3, sanity=4 (lowest)
+        const priorityMap: Record<string, number> = { smoke: 1, e2e: 2, regression: 3, sanity: 4 };
+        const priority = priorityMap[testDef.category ?? 'sanity'] ?? 4;
+        await testExecutionQueue.add(`test-${testDef.id}`, jobData, { priority });
+      }
+
+      res.status(202).json({ suiteRunId: session._id });
     } catch (err: any) {
       res.status(400).json({ error: err.message });
     }
@@ -64,158 +574,237 @@ export function createServer(): express.Express {
   // ── Run single test ───────────────────────────────────────────
   app.post('/api/tests/:testId/run', async (req, res) => {
     try {
-      const { headless = true } = req.body ?? {};
-      const result = await runSingleTest(req.params.testId, headless);
-      res.status(202).json(result);
+      const { headless = true, maxTurnsOverride, resumeFromRunId } = req.body ?? {};
+
+      // Load from DB first, fallback to YAML
+      let testDef: any;
+      const dbTest = await TestDef.findOne({ _id: req.params.testId, isActive: true }).lean();
+      if (dbTest) {
+        testDef = {
+          id: dbTest._id,
+          name: dbTest.name,
+          url: dbTest.url,
+          instructions: dbTest.instructions,
+          expected_outcome: dbTest.expectedOutcome,
+          category: dbTest.category,
+          tags: dbTest.tags,
+          requires_auth: dbTest.requiresAuth,
+          max_turns: dbTest.maxTurns,
+          timeout: dbTest.timeout,
+          viewport: dbTest.viewport,
+        };
+      } else {
+        testDef = loadTestById(req.params.testId);
+      }
+      if (!testDef) return res.status(404).json({ error: `Test not found: ${req.params.testId}` });
+
+      // Load system settings for defaults
+      const sysSettings = await getSettings();
+
+      // Create session with 1 test
+      const session = await sessionService.createSession(1);
+      const testRun = await testService.createTestRun(session._id, testDef.id, testDef.name);
+
+      const jobData: TestJobData = {
+        sessionId: session._id,
+        testRunId: testRun._id,
+        testId: testDef.id,
+        testName: testDef.name,
+        testUrl: testDef.url,
+        testInstructions: testDef.instructions,
+        expectedOutcome: testDef.expected_outcome,
+        headless,
+        requiresAuth: testDef.requires_auth ?? false,
+        maxTurns: maxTurnsOverride ?? (testDef.max_turns || sysSettings.maxTurnsDefault),
+        timeout: testDef.timeout || sysSettings.defaultTimeout,
+        viewport: testDef.viewport,
+      } as any;
+
+      // If resuming from a timed-out run, attach page state + context
+      if (resumeFromRunId) {
+        const prevRun = await TestRun.findById(resumeFromRunId).lean() as any;
+        if (prevRun) {
+          // Use captured pageState if available, fallback to last Step
+          let lastUrl = prevRun.pageState?.url || '';
+          let lastTitle = prevRun.pageState?.title || '';
+
+          if (!lastUrl) {
+            const { Step } = await import('./db/models/Step.js');
+            const lastStep = await Step.findOne({ testRunId: resumeFromRunId })
+              .sort({ turnNumber: -1 }).lean();
+            lastUrl = lastStep?.pageUrl || 'unknown';
+            lastTitle = lastStep?.pageTitle || '';
+          }
+
+          const verdict = prevRun.modelVerdict || '';
+
+          let context = `Previous run used ${prevRun.turnCount} turns over ${Math.round((prevRun.durationMs || 0) / 1000)}s before timing out.\n`;
+          context += `Last page URL: ${lastUrl}\n`;
+          if (lastTitle) context += `Last page title: ${lastTitle}\n`;
+          if (verdict && !verdict.includes('Reached maximum turn limit')) {
+            context += `\nModel's summary of what was accomplished:\n${verdict}`;
+          }
+
+          jobData.resumeFromUrl = lastUrl;
+          jobData.resumeContext = context;
+
+          // Pass storage state path for auth restoration
+          if (prevRun.pageState?.storageStatePath) {
+            jobData.resumeStorageStatePath = prevRun.pageState.storageStatePath;
+          }
+        }
+      }
+
+      const priorityMap: Record<string, number> = { smoke: 1, e2e: 2, regression: 3, sanity: 4 };
+      const priority = priorityMap[testDef.category ?? 'sanity'] ?? 4;
+      await testExecutionQueue.add(`test-${testDef.id}`, jobData, { priority });
+
+      res.status(202).json({ suiteRunId: session._id, testRunId: testRun._id });
     } catch (err: any) {
       res.status(400).json({ error: err.message });
     }
   });
 
   // ── Abort a running test ─────────────────────────────────────
-  app.post('/api/runs/:runId/abort', (req, res) => {
-    const aborted = abortRun(req.params.runId);
-    if (aborted) {
-      res.json({ success: true, message: 'Run abort signal sent' });
-    } else {
-      res.status(404).json({ success: false, message: 'No active run found with that ID' });
-    }
+  app.post('/api/runs/:runId/abort', (_req, res) => {
+    abortTestRun(_req.params.runId);
+    res.json({ success: true, message: 'Run abort signal sent' });
   });
 
-  // ── Abort all running tests in a suite ──────────────────────
-  app.post('/api/suites/:suiteId/abort', (req, res) => {
-    const count = abortSuite(req.params.suiteId);
-    res.json({ success: true, abortedCount: count });
+  // ── Abort all running tests in a suite/session ──────────────
+  app.post('/api/suites/:suiteId/abort', async (req, res) => {
+    const runs = await TestRun.find({
+      sessionId: req.params.suiteId,
+      status: { $in: ['running', 'queued'] },
+    }).lean();
+
+    let aborted = 0;
+    for (const run of runs) {
+      abortTestRun(run._id);
+      aborted++;
+    }
+    res.json({ success: true, abortedCount: aborted });
   });
 
   // ── List suite runs (history) ─────────────────────────────────
-  app.get('/api/suites', (req, res) => {
+  app.get('/api/suites', async (req, res) => {
     const limit = Number(req.query.limit) || 20;
-    const db = getDb();
-    const suites = db.prepare(
-      'SELECT * FROM suite_runs ORDER BY started_at DESC LIMIT ?',
-    ).all(limit);
-    res.json(suites);
+    const sessions = await sessionService.listSessions(limit);
+    res.json(sessions.map(s => s.toJSON()));
   });
 
-  // ── Get suite detail ──────────────────────────────────────────
-  app.get('/api/suites/:suiteId', (req, res) => {
-    const db = getDb();
-    const suite = db.prepare('SELECT * FROM suite_runs WHERE id = ?').get(req.params.suiteId);
-    if (!suite) return res.status(404).json({ error: 'Suite not found' });
-    const testRuns = db.prepare(
-      'SELECT * FROM test_runs WHERE suite_run_id = ? ORDER BY started_at',
-    ).all(req.params.suiteId);
-    res.json({ ...(suite as object), testRuns });
+  // ── Get suite/session detail ──────────────────────────────────
+  app.get('/api/suites/:suiteId', async (req, res) => {
+    const data = await sessionService.getSession(req.params.suiteId);
+    if (!data) return res.status(404).json({ error: 'Suite not found' });
+    // Transform session for backward compat
+    const session = await (await import('./db/models/Session.js')).Session.findById(req.params.suiteId);
+    res.json({ ...session!.toJSON(), testRuns: data.testRuns });
   });
 
   // ── Get latest run per test (aggregated across all suites) ────
   // IMPORTANT: must be before /api/runs/:runId to avoid :runId matching "latest"
-  app.get('/api/runs/latest', (_req, res) => {
-    const db = getDb();
-    const runs = db.prepare(`
-      SELECT t1.* FROM test_runs t1
-      INNER JOIN (
-        SELECT test_id, MAX(started_at) as max_started
-        FROM test_runs
-        GROUP BY test_id
-      ) t2 ON t1.test_id = t2.test_id AND t1.started_at = t2.max_started
-      ORDER BY t1.started_at DESC
-    `).all();
+  app.get('/api/runs/latest', async (_req, res) => {
+    const runs = await testService.getLatestRuns();
     res.json(runs);
   });
 
   // ── Get test run detail ───────────────────────────────────────
-  app.get('/api/runs/:runId', (req, res) => {
-    const db = getDb();
-    const run = db.prepare('SELECT * FROM test_runs WHERE id = ?').get(req.params.runId);
-    if (!run) return res.status(404).json({ error: 'Run not found' });
-    const screenshots = db.prepare(
-      'SELECT * FROM screenshots WHERE test_run_id = ? ORDER BY turn_number',
-    ).all(req.params.runId);
-    const events = db.prepare(
-      'SELECT * FROM run_events WHERE test_run_id = ? ORDER BY sequence',
-    ).all(req.params.runId);
-    const turnTokens = db.prepare(
-      'SELECT * FROM turn_tokens WHERE test_run_id = ? ORDER BY turn_number',
-    ).all(req.params.runId);
-    res.json({ ...(run as object), screenshots, events, turnTokens });
+  app.get('/api/runs/:runId', async (req, res) => {
+    const detail = await testService.getTestRunDetail(req.params.runId);
+    if (!detail) return res.status(404).json({ error: 'Run not found' });
+    res.json(detail);
   });
 
-  // ── Serve screenshot files ────────────────────────────────────
-  app.get('/api/runs/:runId/screenshots/:filename', (req, res) => {
-    const db = getDb();
-    const run = db.prepare('SELECT test_id FROM test_runs WHERE id = ?').get(req.params.runId) as { test_id: string } | undefined;
+  // ── Serve screenshot files (path traversal protected) ────────
+  app.get('/api/runs/:runId/screenshots/:filename', async (req, res) => {
+    const run = await TestRun.findById(req.params.runId).lean();
     if (!run) return res.status(404).json({ error: 'Run not found' });
 
-    // Try new path structure first (testId/runId), fallback to legacy (runId only)
-    let filePath = path.resolve('data', 'screenshots', run.test_id, req.params.runId, req.params.filename);
+    // Reject path traversal attempts
+    const filename = path.basename(req.params.filename);
+    if (!filename.endsWith('.png')) return res.status(400).json({ error: 'Invalid file type' });
+
+    const baseDir = path.resolve('data', 'screenshots');
+    let filePath = path.resolve(baseDir, run.testId, req.params.runId, filename);
+    if (!filePath.startsWith(baseDir)) return res.status(403).json({ error: 'Forbidden' });
+
     if (!fs.existsSync(filePath)) {
-      filePath = path.resolve('data', 'screenshots', req.params.runId, req.params.filename);
+      filePath = path.resolve(baseDir, req.params.runId, filename);
+      if (!filePath.startsWith(baseDir)) return res.status(403).json({ error: 'Forbidden' });
     }
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
     res.sendFile(filePath);
   });
 
-  // ── Serve test run video ────────────────────────────────────────
-  app.get('/api/runs/:runId/video', (req, res) => {
-    const db = getDb();
-    const run = db.prepare('SELECT test_id FROM test_runs WHERE id = ?').get(req.params.runId) as { test_id: string } | undefined;
+  // ── Serve test run video (path traversal protected) ───────────
+  app.get('/api/runs/:runId/video', async (req, res) => {
+    const run = await TestRun.findById(req.params.runId).lean();
     if (!run) return res.status(404).json({ error: 'Run not found' });
 
-    const videoPath = path.resolve('data', 'screenshots', run.test_id, req.params.runId, 'replay.mp4');
+    const baseDir = path.resolve('data', 'screenshots');
+    const videoPath = path.resolve(baseDir, run.testId, req.params.runId, 'replay.mp4');
+    if (!videoPath.startsWith(baseDir)) return res.status(403).json({ error: 'Forbidden' });
     if (!fs.existsSync(videoPath)) return res.status(404).json({ error: 'Video not found' });
     res.sendFile(videoPath);
   });
 
-  // ── SSE: live events for a running test ───────────────────────
-  app.get('/api/runs/:runId/events', (req, res) => {
+  // ── SSE: live events for a running test (via Redis pub/sub) ───
+  // Supports Last-Event-ID for reconnection replay
+  app.get('/api/runs/:runId/events', async (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
     });
 
-    // Send existing events first
-    const db = getDb();
-    const existingEvents = db.prepare(
-      'SELECT * FROM run_events WHERE test_run_id = ? ORDER BY sequence',
-    ).all(req.params.runId);
+    // Support reconnection — only send events after lastEventId
+    const lastEventId = req.headers['last-event-id'] as string | undefined;
+    const lastSeq = lastEventId ? parseInt(lastEventId, 10) : 0;
+
+    // Send existing events (all or only after lastSeq for reconnection)
+    const query: any = { testRunId: req.params.runId };
+    if (lastSeq > 0) query.sequence = { $gt: lastSeq };
+    const existingEvents = await Event.find(query).sort({ sequence: 1 });
     for (const event of existingEvents) {
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      const json = event.toJSON();
+      res.write(`id: ${json.sequence}\ndata: ${JSON.stringify(json)}\n\n`);
     }
 
-    // Subscribe to new events
-    const emitter = getActiveRunEmitter(req.params.runId);
-    if (emitter) {
-      const handler = (event: unknown) => {
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
-      };
-      emitter.on('event', handler);
-      req.on('close', () => emitter.off('event', handler));
-    } else {
-      // Run is not active — send a done signal and close
+    // Check if run is still active
+    const run = await TestRun.findById(req.params.runId).lean();
+    if (!run || run.completedAt) {
       res.write(`data: ${JSON.stringify({ type: 'stream_end', message: 'Run is not active' })}\n\n`);
+      return;
     }
+
+    // Subscribe to Redis pub/sub for live events
+    const subscriber = createSubscriber();
+    const channel = `events:${req.params.runId}`;
+    await subscriber.subscribe(channel);
+
+    subscriber.on('message', (_ch: string, message: string) => {
+      res.write(`data: ${message}\n\n`);
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed.type === 'run_completed' || parsed.type === 'run_failed') {
+          res.write(`data: ${JSON.stringify({ type: 'stream_end' })}\n\n`);
+          subscriber.unsubscribe(channel).catch(() => {});
+          subscriber.disconnect();
+        }
+      } catch { /* ignore parse errors */ }
+    });
+
+    req.on('close', () => {
+      subscriber.unsubscribe(channel).catch(() => {});
+      subscriber.disconnect();
+    });
   });
 
-  // ── Reset all data (clear DB + delete screenshots) ──────────
-  app.post('/api/reset', (_req, res) => {
+  // ── Reset all data (clear MongoDB + delete screenshots) ──────
+  app.post('/api/reset', async (_req, res) => {
     try {
-      const db = getDb();
-      db.prepare('DELETE FROM turn_tokens').run();
-      db.prepare('DELETE FROM run_events').run();
-      db.prepare('DELETE FROM screenshots').run();
-      db.prepare('DELETE FROM test_runs').run();
-      db.prepare('DELETE FROM suite_runs').run();
-
-      // Delete all screenshot files
-      const screenshotsDir = path.resolve('data', 'screenshots');
-      if (fs.existsSync(screenshotsDir)) {
-        fs.rmSync(screenshotsDir, { recursive: true, force: true });
-        fs.mkdirSync(screenshotsDir, { recursive: true });
-      }
-
+      await sessionService.resetAll();
       res.json({ success: true, message: 'All test data and screenshots have been reset' });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -223,18 +812,16 @@ export function createServer(): express.Express {
   });
 
   // ── Generate HTML report for a single test run ─────────────────
-  app.get('/api/runs/:runId/report', (req, res) => {
-    const db = getDb();
-    const run = db.prepare('SELECT * FROM test_runs WHERE id = ?').get(req.params.runId) as Record<string, any> | undefined;
-    if (!run) return res.status(404).json({ error: 'Run not found' });
+  app.get('/api/runs/:runId/report', async (req, res) => {
+    const detail = await testService.getTestRunDetail(req.params.runId);
+    if (!detail) return res.status(404).json({ error: 'Run not found' });
 
-    const screenshots = db.prepare(
-      'SELECT * FROM screenshots WHERE test_run_id = ? ORDER BY turn_number',
-    ).all(req.params.runId) as Array<Record<string, any>>;
+    const run = detail as any;
+    const screenshots = detail.screenshots as Array<Record<string, any>>;
 
     // Embed screenshots as base64
     const screenshotImages = screenshots.map((ss: Record<string, any>) => {
-      const fname = ss.file_path.replace(/\\/g, '/').split('/').pop();
+      const fname = ss.file_path?.replace(/\\/g, '/').split('/').pop();
       let filePath = path.resolve('data', 'screenshots', run.test_id, req.params.runId, fname);
       if (!fs.existsSync(filePath)) {
         filePath = path.resolve('data', 'screenshots', req.params.runId, fname);
@@ -348,14 +935,15 @@ export function createServer(): express.Express {
   });
 
   // ── Generate HTML report for a suite run ──────────────────────
-  app.get('/api/suites/:suiteId/report', (req, res) => {
-    const db = getDb();
-    const suite = db.prepare('SELECT * FROM suite_runs WHERE id = ?').get(req.params.suiteId) as Record<string, any> | undefined;
-    if (!suite) return res.status(404).json({ error: 'Suite not found' });
+  app.get('/api/suites/:suiteId/report', async (req, res) => {
+    const data = await sessionService.getSession(req.params.suiteId);
+    if (!data) return res.status(404).json({ error: 'Suite not found' });
 
-    const testRuns = db.prepare(
-      'SELECT * FROM test_runs WHERE suite_run_id = ? ORDER BY started_at',
-    ).all(req.params.suiteId) as Array<Record<string, any>>;
+    const session = await (await import('./db/models/Session.js')).Session.findById(req.params.suiteId);
+    if (!session) return res.status(404).json({ error: 'Suite not found' });
+
+    const suite = session.toJSON() as Record<string, any>;
+    const testRuns = data.testRuns as Array<Record<string, any>>;
 
     const passRate = suite.total > 0 ? Math.round((suite.passed / suite.total) * 100) : 0;
     const startedAt = suite.started_at ? new Date(suite.started_at).toLocaleString() : 'N/A';
@@ -444,26 +1032,14 @@ export function createServer(): express.Express {
   });
 
   // ── Get all test runs for a suite (polling alternative) ───────
-  app.get('/api/suites/:suiteId/runs', (req, res) => {
-    const db = getDb();
-    const runs = db.prepare(
-      'SELECT * FROM test_runs WHERE suite_run_id = ? ORDER BY started_at',
-    ).all(req.params.suiteId);
-    res.json(runs);
+  app.get('/api/suites/:suiteId/runs', async (req, res) => {
+    const runs = await TestRun.find({ sessionId: req.params.suiteId }).sort({ startedAt: 1 });
+    res.json(runs.map(r => r.toJSON()));
   });
 
   // ── Generate aggregated HTML report (matches dashboard view) ───
-  app.get('/api/report/latest', (_req, res) => {
-    const db = getDb();
-    const testRuns = db.prepare(`
-      SELECT t1.* FROM test_runs t1
-      INNER JOIN (
-        SELECT test_id, MAX(started_at) as max_started
-        FROM test_runs
-        GROUP BY test_id
-      ) t2 ON t1.test_id = t2.test_id AND t1.started_at = t2.max_started
-      ORDER BY t1.test_name
-    `).all() as Array<Record<string, any>>;
+  app.get('/api/report/latest', async (_req, res) => {
+    const testRuns = await testService.getLatestRuns();
 
     if (testRuns.length === 0) return res.status(404).json({ error: 'No test data available' });
 
