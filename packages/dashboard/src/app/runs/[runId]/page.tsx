@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import { useSSE } from '@/lib/use-sse';
 
@@ -61,6 +61,8 @@ export default function RunDetailPage() {
   const runId = params.runId as string;
   const [run, setRun] = useState<RunDetail | null>(null);
   const [selectedScreenshot, setSelectedScreenshot] = useState<number>(0);
+  const [prevScreenshotCount, setPrevScreenshotCount] = useState(0);
+  const thumbnailStripRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [aborting, setAborting] = useState(false);
   const [viewMode, setViewMode] = useState<'screenshots' | 'video'>('screenshots');
@@ -125,6 +127,24 @@ export default function RunDetailPage() {
     }, 3000);
     return () => clearInterval(interval);
   }, [isActive, runId]);
+
+  // Auto-scroll thumbnail strip to latest screenshot when new one arrives
+  const screenshotCount = run?.screenshots?.length ?? 0;
+  useEffect(() => {
+    if (screenshotCount > prevScreenshotCount && screenshotCount > 0) {
+      // New screenshot — auto-select it and scroll strip to end
+      setSelectedScreenshot(screenshotCount - 1);
+      setPrevScreenshotCount(screenshotCount);
+      setTimeout(() => {
+        if (thumbnailStripRef.current) {
+          thumbnailStripRef.current.scrollTo({
+            left: thumbnailStripRef.current.scrollWidth,
+            behavior: 'smooth',
+          });
+        }
+      }, 100);
+    }
+  }, [screenshotCount, prevScreenshotCount]);
 
   if (loading) return <div className="text-gray-500 text-center py-20">Loading...</div>;
   if (!run) return <div className="text-gray-500 text-center py-20">Run not found</div>;
@@ -453,7 +473,7 @@ export default function RunDetailPage() {
 
           {/* Thumbnail strip */}
           {screenshots.length > 0 && (
-            <div className="flex gap-2 overflow-x-auto pb-2">
+            <div ref={thumbnailStripRef} className="flex gap-2 overflow-x-auto pb-2">
               {screenshots.map((ss, i) => {
                 const fname = ss.file_path.split(/[\\\/]/).pop();
                 const cat = getScreenshotCategory(i, screenshots.length);

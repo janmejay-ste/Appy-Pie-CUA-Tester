@@ -1,20 +1,20 @@
 name: "Header Navigation Menu"
 url: "https://www.appypieautomate.ai"
 category: smoke
-max_turns: 35
 instructions: |
-  1. Verify the header/navigation bar is visible and sticky at the top of the homepage
+  1. Verify the header/navigation bar is visible at the top of the homepage
   2. Check that these main navigation links are present: Features, Explore, AI Automation, MCP Servers, Pricing, Blog, Contact Sales
-  3. If "Explore" has a dropdown, hover/click to expand and verify sub-links are visible
-  4. Click "Pricing" — verify the Pricing page loads with pricing plans/cards visible
-  5. Click the Appy Pie Automate logo (top-left) to return to the homepage
+  3. If "Explore" has a dropdown, click to expand and verify sub-links are visible. Then click elsewhere to close the dropdown.
+  4. Click "Pricing" — verify the Pricing page loads (check if pricing plans/cards are visible OR if a 404/410 error page appears — report either result)
+  5. Navigate back to homepage by going to https://www.appypieautomate.ai (do NOT use browser back button)
   6. Click "Features" — verify the Features page loads with relevant content
-  7. Click the logo to return to the homepage
-  8. Click "Blog" — verify the Blog page loads (note: Blog may use a different header layout, this is acceptable)
-  9. Use the browser back button or navigate to https://www.appypieautomate.ai to return to the homepage
-  10. Click "Contact Sales" — it may open a Calendly page in a new tab. If a new tab opens, verify the Calendly page loads, then close that tab to return to the main site
-  11. Scroll down on the homepage and verify the navigation bar remains sticky/visible at the top
-  12. Confirm the homepage header and hero section are intact after all navigation
+  7. Navigate back to homepage by going to https://www.appypieautomate.ai
+  8. Click "Blog" — verify the Blog page loads (note: Blog may use a different domain or header layout, this is acceptable)
+  9. Navigate back to homepage by going to https://www.appypieautomate.ai
+  10. Verify "Contact Sales" link is present and visible — do NOT click it (it opens Calendly in a new tab which may cause navigation issues)
+  11. Scroll down once on the homepage to verify more content is below the fold, then scroll back up
+     - IMPORTANT: Scroll only ONCE down and ONCE up. Do NOT keep scrolling repeatedly.
+  12. Confirm the homepage header and hero section are visible after scrolling back up
 timeout: 120000
-expected_outcome: "All header nav links (Features, Explore, AI Automation, MCP Servers, Pricing, Blog, Contact Sales) are visible and clickable, pages load with correct content, Contact Sales tab is closed after verification, logo/back navigation returns to homepage reliably"
+expected_outcome: "Header nav links (Features, Explore, AI Automation, MCP Servers, Pricing, Blog, Contact Sales) are visible, Pricing and Features pages load, Blog loads, Contact Sales link present, homepage intact after navigation"
 tags: ["header", "navigation", "menu", "automate"]

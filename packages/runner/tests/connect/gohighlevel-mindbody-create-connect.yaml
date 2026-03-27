@@ -2,16 +2,29 @@ name: "Create Connect - GoHighLevel V2 to Mindbody Sale"
 url: "https://connectcloud.appypie.com/connects"
 requires_auth: true
 category: e2e
-max_turns: 60
 instructions: |
   1. If on redirection login is required then login with provided credentials, else navigate to the Connect dashboard
-  2. Click on the "Create Connect" button. If a user guide or onboarding overlay appears, skip or dismiss it. Also close the Automate "Support Available" modal if it appears.
+  2. If the /connects page shows an empty state with no existing connects (e.g., "No connects found", empty list, or only a "Create Connect" prompt), that is acceptable — proceed directly to Create Connect.
+     Click on the "Create Connect" button. If a user guide or onboarding overlay appears, skip or dismiss it. Also close the Automate "Support Available" modal if it appears.
   3. In the Trigger section:
-     - In the Search bar enter "GoHighLevel" and select "GoHighLevel V2" from the app list
-     - Select trigger event: New Opportunity
+     - Click on the search/input field in the Trigger app selection area
+     - Type "GoHighLevel" in the search field — do NOT press Enter if needed then press Enter. The search is live and results appear as you type
+     - Wait 1-2 seconds for search results to appear as a dropdown/list below the search field
+     - Look for "GoHighLevel V2" in the dropdown results and CLICK on it to select it
+     - If no results appear after typing, try clearing the field and typing again slowly
+     - After selecting GoHighLevel V2, a "Select Trigger Event" dropdown or section will appear
+     - Click on the "Select Trigger Event" dropdown/button to open it
+     - Wait for the event list to appear — it may take 1-2 seconds to load
+     - Look for "New Opportunity" in the list — the events are displayed as checkboxes with labels
+     - CLICK on the text/label "New Opportunity" (not the checkbox itself) to select it
+     - After clicking, verify the event is selected (checkbox should be checked or highlighted)
+     - Then click the "Continue" button at the bottom of the event list panel
+     - IMPORTANT: After clicking Continue, verify you are STILL on the editor page (URL should contain /customeditor/). If you got redirected back to /connects, it means the event was not properly selected — navigate back to the editor and try again
   4. For GoHighLevel V2 account:
+     - After selecting the trigger event, the account connection section should appear
      - If a linked account is already shown, click on the continue button to proceed to the next step
      - If no account is linked, click "Add an Account" to connect one
+     - IMPORTANT: Do NOT click any button that takes you back to /connects — stay on the editor page
   5. Configure the trigger fields:
      - If a "Select Location" or similar dropdown appears, select the first available location
      - If a "Pipeline" dropdown appears, select the first available pipeline
@@ -63,6 +76,7 @@ instructions: |
       - Connect status should appear as "ON" or "Active"
       - Trigger application shows "GoHighLevel V2" with event "New Opportunity"
       - Action application shows "MINDBODY" with event "Create Sale"
+  NOTE: If any page shows a 503 error or empty state, wait 3 seconds and retry once. If a 503 error occurs during trigger/action testing, wait and retry. Empty states (no existing data) are acceptable — proceed with the test flow.
 timeout: 360000
 expected_outcome: "A connect workflow is created successfully where Trigger is GoHighLevel V2 (New Opportunity) and Action is Mindbody (Create Sale) with Product/Item selected and ClientId mapped from trigger output. The workflow appears in the connects list with an active/ON status."
 tags:

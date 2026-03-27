@@ -15,7 +15,7 @@ export interface ISettings {
 const SettingsSchema = new Schema({
   _id: { type: String, default: 'global' },
   maxConcurrency: { type: Number, default: 2 },
-  maxTurnsDefault: { type: Number, default: 40 },
+  maxTurnsDefault: { type: Number, default: 500 },
   maxTokensPerSession: { type: Number, default: 200000 },
   defaultTimeout: { type: Number, default: 120000 },
   defaultHeadless: { type: Boolean, default: true },

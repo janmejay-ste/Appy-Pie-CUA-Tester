@@ -29,6 +29,9 @@ CRITICAL RULES:
 - If an action doesn't produce the expected result, try a DIFFERENT approach — do NOT repeat the same action
 - If you are stuck on a page, try: (1) scrolling, (2) clicking elsewhere, (3) using keyboard navigation, (4) navigating back
 - Stay on task — if you navigate to an unrelated page, return to the test flow immediately
+- NEVER click expand/fullscreen/maximize buttons (diagonal arrows ↗↙ icon) on side panels or right panels — they break the layout and make the page unusable
+- NEVER click the WhatsApp chat widget (green circle at bottom-right)
+- LOGIN FLOW: Click email field → type email → click email field again or press TAB → password field appears → type password → click LOGIN. Never click "Forgot password" or "Sign in with Google"
 
 GOAL VERIFICATION:
 - Before giving your final verdict, verify each step of the test objective was actually achieved
@@ -64,6 +67,41 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 async function captureScreenshotBase64(page: Page): Promise<string> {
+  // Hide distracting UI + block expand/fullscreen clicks programmatically
+  await page.evaluate(`(() => {
+    // CSS: hide expand buttons and WhatsApp widget
+    var style = document.getElementById('__cua_hide_style');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = '__cua_hide_style';
+      style.textContent = [
+        '[class*="whatsapp"], [class*="wa-widget"], [id*="whatsapp"] { display: none !important; }',
+      ].join('\\n');
+      document.head.appendChild(style);
+    }
+
+    // Remove expand/fullscreen buttons from DOM entirely
+    var expandBtns = document.querySelectorAll('[class*="expand"], [class*="fullscreen"], [class*="maximize"], [class*="full-screen"]');
+    expandBtns.forEach(function(btn) {
+      if (btn.tagName === 'BUTTON' || btn.tagName === 'A' || btn.tagName === 'SPAN' || btn.tagName === 'DIV') {
+        var rect = btn.getBoundingClientRect();
+        if (rect.width < 60 && rect.height < 60) {
+          btn.remove();
+        }
+      }
+    });
+
+    // Also remove the specific Appy Pie panel resize icons (SVG with diagonal arrows)
+    document.querySelectorAll('.halfcolume svg, section svg').forEach(function(svg) {
+      var rect = svg.getBoundingClientRect();
+      if (rect.width < 30 && rect.height < 30 && rect.width > 10) {
+        var parent = svg.parentElement;
+        if (parent && (parent.tagName === 'BUTTON' || parent.tagName === 'A' || parent.tagName === 'SPAN')) {
+          parent.remove();
+        }
+      }
+    });
+  })()`).catch(() => {});
   const buffer = await page.screenshot({ type: 'png' });
   return `data:image/png;base64,${buffer.toString('base64')}`;
 }
@@ -224,6 +262,9 @@ export async function runCUALoop(
   let prompt = '';
   if (testAccount) {
     prompt += `TEST ACCOUNT CREDENTIALS (use these to log in when the test instructions require authentication):\nEmail: ${testAccount.email}\nPassword: ${testAccount.password}\n\n`;
+    console.log(`[cua-vision] Credentials INCLUDED in prompt (email: ${testAccount.email})`);
+  } else {
+    console.log(`[cua-vision] No credentials — test does not require auth`);
   }
   prompt += `TEST INSTRUCTIONS:\n${testInstructions}\n\nEXPECTED OUTCOME:\n${expectedOutcome}`;
   let nextInput: unknown = [
@@ -252,6 +293,24 @@ export async function runCUALoop(
     // ── Call the CUA model ──────────────────────────────────────
     const apiStart = Date.now();
     let response: CUAResponse;
+
+    // Debug: log what we're sending to the vision model
+    const inputSummary = Array.isArray(nextInput)
+      ? (nextInput as any[]).map((item: any) => {
+          if (item.role) {
+            const parts = Array.isArray(item.content) ? item.content : [item.content];
+            return parts.map((p: any) => {
+              if (typeof p === 'string') return `text(${p.length} chars)`;
+              if (p.type === 'input_text') return `text(${p.text?.length ?? 0} chars)`;
+              if (p.type === 'input_image') return 'image';
+              return p.type || 'unknown';
+            }).join(', ');
+          }
+          return item.type || 'continuation';
+        }).join(' | ')
+      : 'continuation';
+    console.log(`[cua-vision-debug] T${turn} → model | ${inputSummary} | prevId: ${previousResponseId ? 'yes' : 'no'}`);
+
     try {
       response = await openai.responses.create({
         model: MODEL,
@@ -262,7 +321,7 @@ export async function runCUALoop(
         parallel_tool_calls: false,
         truncation: 'auto',
         previous_response_id: previousResponseId,
-      } as any) as unknown as CUAResponse;
+      } as any, { signal: abortSignal } as any) as unknown as CUAResponse;
     } catch (err: any) {
       // If aborted during API call, return gracefully
       if (abortSignal?.aborted) {
@@ -273,6 +332,7 @@ export async function runCUALoop(
           totalTokens,
         };
       }
+      console.error(`[cua-vision-debug] T${turn} API ERROR:`, err.message || err);
       throw err;
     }
     const apiLatency = Date.now() - apiStart;
@@ -296,6 +356,10 @@ export async function runCUALoop(
     totalTokens.input += turnInput;
     totalTokens.output += turnOutput;
     totalTokens.reasoning += turnReasoning;
+
+    // Debug: log vision model response
+    const outputTypes = response.output?.map((o: any) => o.type).join(', ') || 'none';
+    console.log(`[cua-vision-debug] T${turn} ← model | ${apiLatency}ms | in=${turnInput} out=${turnOutput} reason=${turnReasoning} | outputs: [${outputTypes}]`);
 
     // Validate
     if (response.error?.message) throw new Error(`CUA API error: ${response.error.message}`);
@@ -635,7 +699,7 @@ export async function runCUALoop(
 
   return {
     verdict: 'TIMEOUT',
-    modelMessage: `Reached maximum turn limit (${maxTurns}) without completing the test.`,
+    modelMessage: `Reached maximum turn limit (${maxTurns}) without completing the test. Want to continue then increase maxturns!`,
     turns: maxTurns,
     totalTokens,
     pageState: timeoutPageState,

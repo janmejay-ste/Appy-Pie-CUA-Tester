@@ -8,7 +8,7 @@ export const createTestSchema = z.object({
   category: z.enum(['smoke', 'sanity', 'regression', 'e2e']).default('sanity'),
   tags: z.array(z.string()).default([]),
   requiresAuth: z.boolean().default(false),
-  maxTurns: z.number().min(1).max(100).default(40),
+  maxTurns: z.number().min(1).max(1000).default(500),
   timeout: z.number().min(10000).max(600000).default(120000),
   viewport: z.object({
     width: z.number().min(320).max(3840),

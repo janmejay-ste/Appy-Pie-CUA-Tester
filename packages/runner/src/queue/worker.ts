@@ -5,7 +5,7 @@ import path from 'path';
 import { v4 as uuid } from 'uuid';
 import IORedis from 'ioredis';
 import { connectMongo } from '../db/mongo.js';
-import { deadLetterQueue, type TestJobData } from './queue.js';
+import { deadLetterQueue, testExecutionQueue, type TestJobData } from './queue.js';
 import { runCUALoop } from '../cua-loop.js';
 import { launchBrowser } from '../browser.js';
 import { getTestAccount } from '../config.js';
@@ -190,7 +190,10 @@ async function processTestJob(job: Job<TestJobData>) {
 
     const testAccount = requiresAuth ? getTestAccount() : undefined;
     if (testAccount) {
+      console.log(`[worker] Credentials loaded for run ${testRunId}: email=${testAccount.email}, password=${'*'.repeat(testAccount.password.length - 2) + testAccount.password.slice(-2)}`);
       await emitEvent('auth_info', `Test requires auth — using account: ${testAccount.email}`);
+    } else {
+      console.log(`[worker] No credentials for run ${testRunId} (requiresAuth=${requiresAuth})`);
     }
 
     // Build instructions — for resume, tell model to continue from where it stopped
@@ -268,7 +271,7 @@ ${testInstructions}`;
           const summary = actions.map(a => a.type).join(', ');
           emitEvent('actions_executed', `Turn ${turn}: executed [${summary}]`);
         },
-        onScreenshot: (turn, screenshot) => {
+        onScreenshot: (turn, screenshot, actionMeta) => {
           testService.persistStep({
             _id: screenshot.id,
             testRunId,
@@ -277,6 +280,19 @@ ${testInstructions}`;
             capturedAt: new Date(screenshot.captured_at),
             pageUrl: screenshot.page_url,
             pageTitle: screenshot.page_title,
+            // Action metadata from CUA loop
+            ...(actionMeta ? {
+              action: actionMeta.action,
+              result: actionMeta.result,
+              validation: actionMeta.validation,
+              effective: actionMeta.effective,
+              retryStrategy: actionMeta.retryStrategy,
+              memory: actionMeta.memory,
+              nextGoal: actionMeta.nextGoal,
+              domFingerprint: actionMeta.domFingerprint,
+              confidence: actionMeta.confidence,
+              visionUsed: actionMeta.visionUsed,
+            } : {}),
           });
           emitEvent('screenshot_captured', `Screenshot captured (turn ${turn})`);
         },
@@ -286,13 +302,15 @@ ${testInstructions}`;
       maxTurns,
       (await (await import('../db/models/Settings.js')).getSettings()).maxTokensPerSession,
       testUrl,
-      (await (await import('../db/models/Settings.js')).getSettings()).cuaMode || 'dom',
+      (job.data as any).cuaMode || (await (await import('../db/models/Settings.js')).getSettings()).cuaMode || 'dom',
     );
 
     // Determine final status
     const completedAt = new Date();
     const durationMs = completedAt.getTime() - startedAt.getTime();
-    const status = result.verdict === 'PASS' ? 'passed'
+    const wasAborted = abortController.signal.aborted;
+    const status = wasAborted ? 'aborted'
+      : result.verdict === 'PASS' ? 'passed'
       : result.verdict === 'FAIL' ? 'failed'
       : result.verdict === 'TIMEOUT' ? 'timeout'
       : 'error';
@@ -346,6 +364,20 @@ ${testInstructions}`;
     const completedAt = new Date();
     const durationMs = completedAt.getTime() - startedAt.getTime();
     const errorMsg = err.message ?? String(err);
+
+    // ── Handle abort separately — NEVER retry aborted runs ──
+    if (abortController.signal.aborted) {
+      console.log(`[worker] Run ${testRunId} was aborted by user`);
+      await testService.updateTestRunStatus(testRunId, {
+        status: 'aborted',
+        completedAt,
+        durationMs,
+        error: 'Aborted by user',
+      });
+      await emitEvent('run_failed', 'Test aborted by user');
+      const { UnrecoverableError } = await import('bullmq');
+      throw new UnrecoverableError('Aborted by user');
+    }
 
     // Classify the error — comprehensive infra detection
     const INFRA_PATTERNS = [
@@ -433,6 +465,15 @@ export async function startWorker() {
   // Recover any runs stuck in 'running' from a previous crash
   await recoverStuckRuns();
 
+  // Clean stale failed jobs from queue on startup
+  try {
+    const failedJobs = await testExecutionQueue.getJobs(['failed']);
+    if (failedJobs.length > 0) {
+      for (const job of failedJobs) await job.remove();
+      console.log(`[worker] Cleaned ${failedJobs.length} stale failed job(s) from queue`);
+    }
+  } catch {}
+
   const worker = new Worker('test-execution', processTestJob, {
     connection: { host: '127.0.0.1', port: 6379, maxRetriesPerRequest: null },
     concurrency: 2,
@@ -470,10 +511,12 @@ export async function startWorker() {
 export function abortTestRun(testRunId: string) {
   const controller = activeAbortControllers.get(testRunId);
   if (controller) {
+    console.log(`[worker] Aborting run ${testRunId} (local controller found)`);
     controller.abort();
     return true;
   }
   // If not in this process, publish abort via Redis
+  console.log(`[worker] Aborting run ${testRunId} (publishing via Redis)`);
   getPublisher().publish(`abort:${testRunId}`, '1');
   return true;
 }

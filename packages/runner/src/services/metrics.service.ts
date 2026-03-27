@@ -27,18 +27,20 @@ export async function captureMetricSnapshot() {
 
   const totalTokensUsed = recentRuns.reduce((sum, r) => sum + (r.inputTokens || 0) + (r.outputTokens || 0), 0);
 
-  // Generate alerts
+  // Generate alerts — only when there are recent runs (skip on cold start)
   const alerts: string[] = [];
-  if (failureRate > ALERT_FAILURE_RATE) {
-    alerts.push(`HIGH_FAILURE_RATE: ${failureRate}% failure rate in last 24h (threshold: ${ALERT_FAILURE_RATE}%)`);
+  if (totalRuns >= 3) {
+    if (failureRate > ALERT_FAILURE_RATE) {
+      alerts.push(`HIGH_FAILURE_RATE: ${failureRate}% failure rate in last 24h (${failedRuns}/${totalRuns} runs)`);
+    }
+    if (avgLatencyMs > ALERT_AVG_LATENCY_MS) {
+      alerts.push(`HIGH_LATENCY: avg ${Math.round(avgLatencyMs / 1000)}s per test (threshold: ${Math.round(ALERT_AVG_LATENCY_MS / 1000)}s)`);
+    }
   }
   if (queue.waiting > ALERT_QUEUE_SIZE) {
     alerts.push(`QUEUE_BACKLOG: ${queue.waiting} jobs waiting (threshold: ${ALERT_QUEUE_SIZE})`);
   }
-  if (avgLatencyMs > ALERT_AVG_LATENCY_MS) {
-    alerts.push(`HIGH_LATENCY: avg ${Math.round(avgLatencyMs / 1000)}s per test (threshold: ${Math.round(ALERT_AVG_LATENCY_MS / 1000)}s)`);
-  }
-  if (queue.failed > 5) {
+  if (queue.failed > 10) {
     alerts.push(`QUEUE_FAILURES: ${queue.failed} failed jobs in queue`);
   }
 

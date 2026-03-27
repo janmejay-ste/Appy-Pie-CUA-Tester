@@ -1,6 +1,6 @@
-# AppyPie CUA Tester — System Design Document v4
+# AppyPie CUA Tester — System Design Document v7
 
-> Production-capable AI-powered QA testing platform with MongoDB, BullMQ, session-based execution, test CRUD, system settings, resume/retry with screenshot merging, and network sharing via ngrok.
+> Production-grade AI-powered QA testing platform with position-independent element identity, adaptive fallback strategy, memory-enforced action engine with intent tracking, predictive vision triggers, adapter-based execution, MongoDB, BullMQ, session-based execution, test CRUD, system settings, resume/retry, and network sharing via ngrok.
 
 ---
 
@@ -76,14 +76,64 @@
 |------------|----------------------------------------------------------------------|
 | **Session**    | Groups multiple test runs. Created per "Run Tests" click.        |
 | **TestRun**    | One execution of a test definition. States: queued → running → passed/failed/error/timeout |
-| **Step**       | One CUA turn — screenshot + token usage + page URL. Merges old screenshots + turn_tokens. |
+| **Step**       | One CUA turn — action + validation + screenshot + tokens + agent memory. Full debugging data. |
 | **Event**      | Timestamped log entry. Published to Redis pub/sub for SSE.       |
 | **TestDef**    | Test definition stored in MongoDB (with versioning + soft delete). YAML fallback. |
 | **Settings**   | Global singleton config (concurrency, maxTurns, etc.).           |
 
 ---
 
-## 3. CUA Loop — Dual-Mode AI Engine
+## 3. CUA Execution Architecture (v5)
+
+### 3.0 Execution Stack
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CUA Orchestrator (cua-loop.ts)                                  │
+│  Stateless loop, no history accumulation, memory overwrite       │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  Action Engine (adapter/action-engine.ts)                 │    │
+│  │                                                           │    │
+│  │  Responsibilities:                                        │    │
+│  │  • 4-layer fallback: selector → text → role → coordinates │    │
+│  │  • before-state → execute → after-state → validate        │    │
+│  │  • success vs effective distinction                       │    │
+│  │  • Intent validation (expected outcome matching)          │    │
+│  │  • Retry strategy recommendation                         │    │
+│  │  • Element existence check post-action                   │    │
+│  └────────────────────────┬─────────────────────────────────┘    │
+│                           │                                       │
+│  ┌────────────────────────▼─────────────────────────────────┐    │
+│  │  Execution Adapter (adapter/playwright-adapter.ts)        │    │
+│  │                                                           │    │
+│  │  RAW execution only — NO fallback logic, NO decisions:    │    │
+│  │  • clickBySelector(sel) | clickByText(text, role?)        │    │
+│  │  • clickByCoordinates(x, y)                               │    │
+│  │  • typeBySelector(sel, text) | typeByCoordinates(x,y,text)│    │
+│  │  • selectBySelector(sel, val)                             │    │
+│  │  • scroll | navigate | keypress | wait                    │    │
+│  │                                                           │    │
+│  │  DOM Indexing (re-indexed every turn):                    │    │
+│  │  • Priority scoring: inputs(30) > buttons(20) > links(10)│    │
+│  │  • Stable elementId: MD5 hash of tag+text+id+name+pos    │    │
+│  │  • 30-element cap, viewport + 300px                       │    │
+│  └────────────────────────┬─────────────────────────────────┘    │
+│                           │                                       │
+│  ┌────────────────────────▼─────────────────────────────────┐    │
+│  │  Playwright Browser (Chromium)                            │    │
+│  │  CUA NEVER calls Playwright directly                      │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Critical rules:**
+1. CUA loop NEVER touches Playwright directly — everything through adapter
+2. Adapter does RAW execution only — NO fallback, NO decisions
+3. Action Engine owns ALL fallback logic and validation
+4. Element IDs are stable hashes — survive DOM re-ordering across turns
+
+### 3.1 Dual-Mode Engine
 
 The CUA loop supports two execution modes, switchable via Settings:
 
@@ -128,20 +178,60 @@ Instant rollback: change setting        (no code changes)
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-#### DOM Extraction (`dom-extractor.ts`)
+#### DOM Indexing (PlaywrightAdapter — re-indexed every turn)
 ```
-page.evaluate() extracts:
-  • Interactive elements: inputs, buttons, links, selects, ARIA roles
-  • Hard cap: 25 elements (ranked: inputs > buttons > CTAs > links)
-  • Filter: visible, enabled, non-zero size, in/near viewport
-  • Per element: tag, type, text, value, placeholder, rect, selector
-  • Key text: headings (h1-h3), labels, errors — max 200 chars
-  • Form state: { e2: "john@email.com", e5: "Professional" }
+PlaywrightAdapter.getState() runs page.evaluate() each turn:
+
+  1. Collects ALL interactive elements:
+     input, textarea, select, button, a[href], [role="button"],
+     [role="tab"], [role="link"], [contenteditable], [onclick], [data-testid]
+
+  2. Priority scoring (higher = extracted first):
+     inputs/textarea/select = 30
+     buttons/[role="button"] = 20
+     links (a[href])        = 10
+     other interactable      = 5
+     Then sorted by Y position (top-to-bottom)
+
+  3. Filters: visible, enabled, non-zero size, within viewport (+300px)
+
+  4. Dynamic cap: 30 elements (viewport < 800px) or 45 elements (larger viewports)
+
+  5. Stable Element Identity (elementId — position-independent):
+     elementId = MD5(tag + id + name + data-testid + aria-label + text[0:20])
+     → 8-char hex hash
+     → Position (x, y) is NOT included — survives scroll, reflow, responsive changes
+     → Same element = same ID across turns even if DOM order or layout changes
+     → Model targets elements by hash (e.g. "a1b2c3d4"), NOT by index
+
+  6. Per element (IndexedElement):
+     { index: 0,
+       elementId: "a1b2c3d4",     ← stable identity
+       tag, type, text, value, placeholder,
+       attributes: { id, name, data-testid, aria-label, href, class },
+       boundingBox: { x, y, w, h },
+       isInteractable, isVisible,
+       _cssSelector }             ← for action engine fallback
+
+  7. Target Resolution (in Action Engine):
+     resolveTarget("a1b2c3d4", elements):
+       1. Exact match by elementId     ← primary
+       2. Fallback: index match (e0)   ← backward compat
+       3. Fuzzy: nearest by text+pos   ← last resort
+
+  8. Metadata:
+     • keyText: headings (h1-h3), labels, error messages — max 10
+     • formValues: { "a1b2c3d4": "john@email.com" }  ← keyed by elementId
+     • domFingerprint: MD5 of element signatures + URL
+     • hasOverlay: detects modal/dialog/popup
+     • hasCanvas: detects canvas/WebGL (triggers predictive vision)
+     • duplicateTextCount: elements with identical text (ambiguous for DOM mode)
+     • errorMessages: visible validation errors
 ```
 
-#### Model Prompt (stateless — no history accumulation)
+#### Model Prompt (stateless — NO history, NO previous_response_id)
 ```
-Each turn sends ONE self-contained message (no previous_response_id):
+Each turn sends ONE self-contained message:
 
   CREDENTIALS: email=... password=...
   GOAL: {test instructions}
@@ -150,57 +240,139 @@ Each turn sends ONE self-contained message (no previous_response_id):
   CURRENT PAGE STATE:
   URL: https://www.appypieautomate.ai/pricing
   Title: Pricing Plans
+  NOTE: Modal/overlay detected  (if applicable)
 
-  Elements:
-  e1: <button> "Try Now" [450,560]
-  e2: <input type="text" placeholder="Email"> value="" [400,300]
-  e3: <select> "Plan" options=["Free","Pro","Business"] value="Free" [400,400]
+  Elements:                              ← stable elementId, NOT index
+  a1b2c3d4: <button> "Try Now" [450,560]
+  e5f6a7b8: <input type="text" placeholder="Email"> value="" [400,300]
+  c9d0e1f2: <select> "Plan" value="Free" [400,400]
 
-  Key text: Choose the plan that's right for you | Standard | Professional
-  Form: e2="" e3="Free"
+  Key text: Choose the plan | Standard | Professional
+  Form: e5f6a7b8="" c9d0e1f2="Free"
+  ERRORS: Field is required  (if any)
 
-  LAST ACTION: clicked e1 "Try Now" → success
+  LAST ACTION: clicked a1b2c3d4 "Try Now"
+  LAST RESULT: success=true effective=true urlChanged=false domChanged=true
+               valueChanged=false intentMatch=true
+  WARNING: Action succeeded but had NO visible effect.  (if effective=false)
+  ERROR AFTER ACTION: Email is required  (if validation error appeared)
+  RETRY HINT: change_target  (if retry needed)
+  MEMORY: Clicked signup CTA, page updated with modal
+  NEXT GOAL: Fill email field
   PROGRESS: Verified pricing page loads, Checked plan cards
-  STATE: page="Pricing" filled=[] pending=["click CTA"] errors=[]
   TURN: 6/40
+  NETWORK ERRORS: 500 /api/connect (if any)
 ```
 
-#### Model Response (structured JSON only)
+#### Model Response (structured JSON — strict, no free text)
 ```json
 {
   "action": "click",
-  "target": "e1",
+  "target": "a1b2c3d4",
   "value": "",
   "reason": "Click Try Now to verify signup redirect",
+  "expected": "navigate_to_signup",
   "confidence": 0.9,
+  "memory": "Clicked CTA, signup page loaded",
+  "next_goal": "Fill email field",
   "stepsCompleted": ["Verified pricing page", "Checked plan cards"]
 }
 ```
 
-#### Action Execution (4-Layer Fallback)
+#### Action Engine (before → execute → after → validate → recommend)
 ```
-Element ID → Playwright execution:
-  1. CSS selector   (fastest: #id, [name], [data-testid])
-  2. Text match      (page.getByText() / page.getByRole())
-  3. Role-based      ([role="button"], [role="tab"])
-  4. Coordinates     (page.mouse.click(rect.x + w/2, rect.y + h/2))
+executeValidatedAction(adapter, step, currentState):
 
-If all 4 fail → return { success: false, error: "Element not found" }
+  1. RESOLVE: element = resolveTarget(step.target, currentState.elements)
+     └─ Match by stable elementId hash
+     └─ Fallback: index-based (e0, e1)
+
+  2. BEFORE: state already available from currentState (no extra call)
+
+  3. EXECUTE with adaptive fallback (order depends on element attributes):
+     Adaptive strategy selection:
+       hasDataTestId/id/name → selector first
+       hasUniqueText         → text match first
+       hasRole only          → role-based first
+       nothing               → coordinates
+
+     Layer 1: data-testid / #id / [name] selector (if stable attrs exist)
+     Layer 2: Text match with role hint (getByRole + text)
+     Layer 3: CSS selector fallback (if no stable attrs)
+     Layer 4: Coordinates (mouse.click at center of boundingBox)
+
+  4. AFTER: state = adapter.getState() (fresh re-index)
+
+  5. VALIDATE:
+     urlChanged:        before.url !== after.url
+     domChanged:        before.domFingerprint !== after.domFingerprint
+     valueChanged:      before.formValues[targetId] !== after.formValues[targetId]
+     errorAppeared:     new errors in after.errorMessages
+     elementStillExists: target elementId found in after.elements
+     intentMatch:       if step.expected is set, check against outcome:
+       "navigate_*"  → urlChanged OR domChanged (supports SPA navigation)
+       "submit|form" → urlChanged OR domChanged
+       "value|fill"  → valueChanged must be true
+       "modal|dialog|popup|open" → domChanged (overlay/modal detection)
+       "update|change|ajax"      → domChanged OR valueChanged
+       "close|dismiss"           → domChanged
+
+  6. EFFECTIVE FLAG:
+     effective = urlChanged || domChanged || valueChanged || errorAppeared
+     If success=true BUT effective=false:
+       → description += "[no effect]"
+       → model gets WARNING in next prompt
+
+  7. RETRY STRATEGY (recommendation to model):
+     !success + element missing → "rescan_dom"
+     !success + element exists  → "change_target"
+     success + !effective       → "change_target"
+     errorAppeared              → "fix_input"
+     element disappeared        → "rescan_dom"
+     else                       → "none"
+
+  Result:
+  { success, effective, error, description, retryStrategy,
+    validation: { urlChanged, domChanged, valueChanged, errorAppeared,
+                  errorMessage, elementStillExists, intentMatch },
+    durationMs }
+```
+
+#### Memory Enforcement (pre-execution guard)
+```
+Before executing any type/fill action:
+  1. Check if formValues[target] already contains the intended value
+  2. If yes → skip action, return { success: true, effective: false }
+  3. Log: "Memory enforcement: field already filled"
+
+Prevents:
+  • Re-filling fields the agent already completed
+  • Wasting turns on redundant input actions
+  • Token waste from unnecessary model calls
+
+Prompt-level enforcement:
+  • MANDATORY RETRY hint (not just a suggestion)
+  • WARNING on ineffective actions: "You MUST try a different element"
 ```
 
 #### Stuck Detection & Vision Fallback
 ```
-isStuck triggers when ANY of:
-  • Same DOM fingerprint ≥ 2 consecutive turns
+REACTIVE triggers (isStuck) — fires when ANY of:
+  • Same domFingerprint ≥ 2 consecutive turns
   • Same action signature repeated ≥ 2 times
-  • Last 2 actions both failed
+  • Last 2 actions both failed (consecutiveFailures ≥ 2)
   • Model confidence < 0.4
-  • DOM has < 5 interactive elements (overlay/canvas)
+  • DOM has < 3 interactive elements
+
+PREDICTIVE triggers (early detection) — fires before stuck:
+  • Canvas/WebGL element detected (hasCanvas = true)
+  • >3 duplicate text elements (ambiguous for DOM-only mode)
+  • These trigger vision BEFORE the model wastes turns
 
 Vision fallback:
   • Budget: min(3, ceil(maxTurns × 0.2)) turns — adaptive
   • Sends compressed JPEG (quality 50, ~5K tokens) + DOM text
-  • Returns to DOM-only when: DOM changes or action succeeds
+  • Returns to DOM-only when: domFingerprint changes or action succeeds
   • Hard abort: stuck for (STUCK_THRESHOLD + VISION_BUDGET + 2) turns
 ```
 
@@ -296,7 +468,7 @@ Action repeats:
 // Indexes: {sessionId:1}, {testId:1, startedAt:-1}
 ```
 
-### `steps` (merges screenshots + token tracking)
+### `steps` (action + validation + screenshot + tokens + agent memory)
 ```javascript
 {
   _id: "uuid",
@@ -306,16 +478,61 @@ Action repeats:
   capturedAt: ISODate,
   pageUrl: "https://...",
   pageTitle: "Page Title",
-  inputTokens: 4200,           // per-turn token usage
+
+  // Action data — WHAT the agent did
+  action: {
+    type: "click",             // click|type|select|scroll|navigate|keypress|wait|done
+    target: "e5",              // element ID from DOM index
+    value: ""                  // text typed, URL navigated, key pressed
+  },
+
+  // Result — DID it work?
+  result: {
+    success: true,
+    error: null,               // error message if failed
+    description: 'clicked e5 "Submit" → success'
+  },
+
+  // Validation — WHAT changed? (before vs after comparison)
+  validation: {
+    urlChanged: false,         // URL changed after action
+    domChanged: true,          // DOM fingerprint changed
+    valueChanged: false,       // form input value changed
+    errorAppeared: false,      // new validation error appeared
+    errorMessage: null,        // the error text
+    elementStillExists: true,  // target element survived the action
+    intentMatch: true          // did action achieve expected outcome?
+  },
+
+  // Execution metadata
+  effective: true,             // something actually changed (success != effective)
+  retryStrategy: "none",       // none|change_target|fix_input|rescan_dom|scroll
+
+  // Agent state — WHY and WHAT'S NEXT
+  memory: "Filled all form fields, clicked submit",
+  nextGoal: "Verify success message",
+  domFingerprint: "a3f8b2c1d4e5",  // MD5 hash of DOM structure
+  confidence: 0.9,             // model's confidence in action
+  visionUsed: false,           // was JPEG screenshot sent this turn?
+
+  // Token data (unchanged)
+  inputTokens: 2800,
   outputTokens: 85,
-  reasoningTokens: 22,
-  apiLatencyMs: 7095,
-  cumulativeInput: 12843,      // running totals
-  cumulativeOutput: 171,
-  cumulativeReasoning: 44
+  reasoningTokens: 12,
+  apiLatencyMs: 1500,
+  cumulativeInput: 8400,
+  cumulativeOutput: 255,
+  cumulativeReasoning: 36
 }
 // Indexes: {testRunId:1}, {testRunId:1, turnNumber:1}
 ```
+
+**Why this matters:** You can now answer:
+- "Why did it fail?" → `result.error` + `validation.errorMessage`
+- "Did the click actually work?" → `validation.domChanged` + `validation.urlChanged`
+- "What was the agent thinking?" → `memory` + `nextGoal`
+- "Is it stuck?" → consecutive same `domFingerprint`
+- "Which turns were expensive?" → `visionUsed: true` turns
 
 ### `events`
 ```javascript
@@ -862,10 +1079,20 @@ appypie-cua-tester/
 │   ├── src/
 │   │   ├── index.ts                # Entry: MongoDB → Worker → Express (0.0.0.0)
 │   │   ├── server.ts               # 25 API endpoints + security middleware
-│   │   ├── cua-loop.ts             # DOM-first AI loop + mode dispatch
+│   │   ├── cua-loop.ts             # DOM-first AI loop + mode dispatch (adapter-based)
 │   │   ├── cua-loop-vision.ts     # Vision mode (screenshot-based, legacy)
-│   │   ├── dom-extractor.ts       # DOM extraction + formatting + fingerprint
-│   │   ├── actions.ts              # Playwright actions + executeModelAction (4-layer)
+│   │   ├── adapter/               # Execution Adapter Layer (v6)
+│   │   │   ├── types.ts           # ExecutionAdapter, BrowserState, ActionStep, IndexedElement
+│   │   │   │                      #   + stable elementId, effective flag, intent tracking
+│   │   │   ├── playwright-adapter.ts  # PlaywrightAdapter (raw execution only, NO fallback)
+│   │   │   │                      #   + priority DOM scoring, stable hash identity
+│   │   │   ├── action-engine.ts   # executeValidatedAction:
+│   │   │   │                      #   + 4-layer fallback (selector→text→role→coords)
+│   │   │   │                      #   + before→execute→after→validate
+│   │   │   │                      #   + success vs effective, intent match, retry strategy
+│   │   │   └── index.ts           # Re-exports
+│   │   ├── dom-extractor.ts       # Legacy DOM extraction (kept for vision mode compat)
+│   │   ├── actions.ts              # Legacy actions (kept for vision mode compat)
 │   │   ├── browser.ts              # Chromium launch config
 │   │   ├── config.ts               # Account config (config.json)
 │   │   ├── test-loader.ts          # YAML recursive loader (fallback)
@@ -962,8 +1189,9 @@ NEXT_PUBLIC_API_URL=                 # empty = use Next.js rewrite proxy
 | Tokens per test (40 turns)| 80k–140k           | 500k–600k            |
 | Cost per test*           | $0.05–$0.15         | $0.30–$0.90          |
 | Inter-action delay       | 150ms               | 120ms                |
-| DOM extraction time      | ~50ms               | N/A                  |
+| DOM extraction + hash    | ~60ms               | N/A                  |
 | Screenshot capture       | <100ms (disk only)  | <100ms (disk + API)  |
+| Action validation time   | ~200ms              | ~200ms               |
 | Total test duration      | 15–200 seconds      | 30–360 seconds       |
 | Screenshots per test     | 3–60 PNG (~100KB)   | 3–60 PNG (~100KB)    |
 | Dashboard poll interval  | 2 seconds           | 2 seconds            |
@@ -972,3 +1200,18 @@ NEXT_PUBLIC_API_URL=                 # empty = use Next.js rewrite proxy
 | MongoDB write latency    | <5ms (local)        | <5ms (local)         |
 | Redis pub/sub latency    | <1ms (local)        | <1ms (local)         |
 | *at $1.5/1M input tokens |                     |                      |
+
+### Action Execution Quality Signals (v6)
+
+| Signal | Source | What it tells you |
+|--------|--------|-------------------|
+| `success` | Playwright execution | Did the browser action complete without error? |
+| `effective` | before/after comparison | Did anything actually change? |
+| `urlChanged` | URL comparison | Did navigation occur? |
+| `domChanged` | fingerprint comparison | Did page structure change? |
+| `valueChanged` | form value comparison | Did input value update? |
+| `errorAppeared` | error element detection | Did a validation error show up? |
+| `elementStillExists` | DOM re-scan | Is the target element still on page? |
+| `intentMatch` | expected vs outcome | Did the action achieve what model expected? |
+| `retryStrategy` | failure analysis | What should model try differently? |
+| `confidence` | model self-assessment | How sure is the model about this action? |

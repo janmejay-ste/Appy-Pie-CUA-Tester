@@ -8,6 +8,31 @@ export interface IStep {
   capturedAt: Date;
   pageUrl: string | null;
   pageTitle: string | null;
+  // Action data
+  action?: {
+    type: string;
+    target?: string;
+    value?: string;
+  };
+  result?: {
+    success: boolean;
+    error?: string;
+    description?: string;
+  };
+  validation?: {
+    urlChanged: boolean;
+    domChanged: boolean;
+    valueChanged: boolean;
+    errorAppeared: boolean;
+    errorMessage?: string;
+  };
+  // Agent state
+  memory?: string;
+  nextGoal?: string;
+  domFingerprint?: string;
+  confidence?: number;
+  visionUsed?: boolean;
+  // Token data
   inputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
@@ -25,6 +50,31 @@ const StepSchema = new Schema({
   capturedAt: { type: Date, required: true },
   pageUrl: { type: String, default: null },
   pageTitle: { type: String, default: null },
+  // Action data
+  action: {
+    type: { type: String },
+    target: { type: String },
+    value: { type: String },
+  },
+  result: {
+    success: { type: Boolean },
+    error: { type: String },
+    description: { type: String },
+  },
+  validation: {
+    urlChanged: { type: Boolean },
+    domChanged: { type: Boolean },
+    valueChanged: { type: Boolean },
+    errorAppeared: { type: Boolean },
+    errorMessage: { type: String },
+  },
+  // Agent state
+  memory: { type: String },
+  nextGoal: { type: String },
+  domFingerprint: { type: String },
+  confidence: { type: Number },
+  visionUsed: { type: Boolean, default: false },
+  // Token data
   inputTokens: { type: Number, default: 0 },
   outputTokens: { type: Number, default: 0 },
   reasoningTokens: { type: Number, default: 0 },

@@ -81,6 +81,16 @@ function statusBadge(status: string) {
   }
 }
 
+function categoryBadgeClass(cat: string) {
+  switch (cat) {
+    case 'smoke': return 'bg-cyan-50 text-cyan-600 border-cyan-200 dark:bg-cyan-500/15 dark:text-cyan-400 dark:border-cyan-500/30';
+    case 'sanity': return 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-500/15 dark:text-violet-400 dark:border-violet-500/30';
+    case 'regression': return 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-500/15 dark:text-orange-400 dark:border-orange-500/30';
+    case 'e2e': return 'bg-pink-50 text-pink-600 border-pink-200 dark:bg-pink-500/15 dark:text-pink-400 dark:border-pink-500/30';
+    default: return 'bg-gray-100 text-gray-600 border-gray-200 dark:bg-gray-500/15 dark:text-gray-400 dark:border-gray-500/30';
+  }
+}
+
 // ── Main Page ────────────────────────────────────────────────────
 
 export default function DashboardPage() {
@@ -92,6 +102,24 @@ export default function DashboardPage() {
   const activeSuiteIdRef = useRef<string | null>(null);
   useEffect(() => { activeSuiteIdRef.current = activeSuiteId; }, [activeSuiteId]);
 
+  // Live elapsed timer
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const runStartRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (running) {
+      if (!runStartRef.current) {
+        // Use suite start time if available, else now
+        runStartRef.current = latestSuite?.started_at ? new Date(latestSuite.started_at).getTime() : Date.now();
+      }
+      const timer = setInterval(() => {
+        setElapsedMs(Date.now() - (runStartRef.current || Date.now()));
+      }, 1000);
+      return () => clearInterval(timer);
+    } else {
+      runStartRef.current = null;
+    }
+  }, [running, latestSuite?.started_at]);
+
 
 
   // UI state
@@ -100,6 +128,18 @@ export default function DashboardPage() {
   const [searchFilter, setSearchFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [categoryFilter, setCategoryFilter] = useState('all');
+
+  // NEW UI state
+  const [selectedTests, setSelectedTests] = useState<Set<string>>(new Set());
+  const [runDropdownOpen, setRunDropdownOpen] = useState(false);
+  const [testMenuOpen, setTestMenuOpen] = useState<string | null>(null);
+  const [tagFilter, setTagFilter] = useState('all');
+  const [activeFilter, setActiveFilter] = useState('all');
+  const [parallelRuns, setParallelRuns] = useState(1);
+  const [retryFailed, setRetryFailed] = useState(0);
+  const [retryEnabled, setRetryEnabled] = useState(false);
+  const [nameSortDir, setNameSortDir] = useState<'asc' | 'desc' | null>(null);
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
 
   // Config / account state
   const [account, setAccount] = useState<TestAccount | null>(null);
@@ -132,6 +172,22 @@ export default function DashboardPage() {
     setToast({ message, type });
     setTimeout(() => setToast(null), 4000);
   };
+
+  // Close dropdowns on outside click
+  const runDropdownRef = useRef<HTMLDivElement>(null);
+  const testMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (runDropdownRef.current && !runDropdownRef.current.contains(e.target as Node)) {
+        setRunDropdownOpen(false);
+      }
+      if (testMenuRef.current && !testMenuRef.current.contains(e.target as Node)) {
+        setTestMenuOpen(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   // ── Data loading ─────────────────────────────────────────────
 
@@ -249,8 +305,20 @@ export default function DashboardPage() {
       );
     }
 
+    // Apply tag filter
+    if (tagFilter !== 'all') {
+      filtered = filtered.filter(t => t.tags?.includes(tagFilter));
+    }
+
+    // Apply active filter
+    if (activeFilter === 'active') {
+      filtered = filtered.filter(t => t.isActive !== false);
+    } else if (activeFilter === 'inactive') {
+      filtered = filtered.filter(t => t.isActive === false);
+    }
+
     // Return undefined only if no filters are active (run all)
-    if (categoryFilter === 'all' && !searchFilter) return undefined;
+    if (categoryFilter === 'all' && !searchFilter && tagFilter === 'all' && activeFilter === 'all') return undefined;
     return filtered.map(t => t.id);
   };
 
@@ -277,18 +345,164 @@ export default function DashboardPage() {
     const data = await res.json();
     setActiveSuiteId(data.suiteRunId);
     setTimeout(loadData, 500);
+    // Auto-navigate to the run details page
+    if (data.testRunId) {
+      window.location.href = `/runs/${data.testRunId}`;
+    }
   };
 
   const stopTests = async () => {
-    if (!activeSuiteId) return;
     try {
-      await fetch(`${API}/api/suites/${activeSuiteId}/abort`, { method: 'POST' });
+      if (activeSuiteId) {
+        await fetch(`${API}/api/suites/${activeSuiteId}/abort`, { method: 'POST' });
+      } else {
+        // No suite ID — abort all running test runs individually
+        const runningRuns = testRuns.filter(r => r.status === 'running');
+        for (const run of runningRuns) {
+          await fetch(`${API}/api/runs/${run.id}/abort`, { method: 'POST' });
+        }
+      }
       setRunning(false);
       setActiveSuiteId(null);
+      showToast('Tests stopped', 'info');
       setTimeout(loadData, 1000);
     } catch (err) {
       console.error('Failed to abort:', err);
     }
+  };
+
+  // NEW: Run selected tests only
+  const runSelectedTests = async () => {
+    if (selectedTests.size === 0) return;
+    setRunning(true);
+    setRunDropdownOpen(false);
+    const res = await fetch(`${API}/api/suites`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ headless, testIds: Array.from(selectedTests) }),
+    });
+    const data = await res.json();
+    setActiveSuiteId(data.suiteRunId);
+    setTimeout(loadData, 500);
+  };
+
+  // NEW: Run filtered tests only
+  const runFilteredTests = async () => {
+    setRunning(true);
+    setRunDropdownOpen(false);
+    const filteredIds = getFilteredTestIds();
+    const res = await fetch(`${API}/api/suites`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ headless, testIds: filteredIds }),
+    });
+    const data = await res.json();
+    setActiveSuiteId(data.suiteRunId);
+    setTimeout(loadData, 500);
+  };
+
+  // NEW: Run tests by category
+  const runCategoryTests = async (category: string) => {
+    const categoryTestIds = tests.filter(t => t.category === category).map(t => t.id);
+    if (categoryTestIds.length === 0) return;
+    setRunning(true);
+    setRunDropdownOpen(false);
+    const res = await fetch(`${API}/api/suites`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ headless, testIds: categoryTestIds }),
+    });
+    const data = await res.json();
+    setActiveSuiteId(data.suiteRunId);
+    setTimeout(loadData, 500);
+  };
+
+  // NEW: Duplicate test
+  const duplicateTest = async (testId: string) => {
+    setTestMenuOpen(null);
+    const test = tests.find(t => t.id === testId);
+    if (!test) return;
+    try {
+      const body = {
+        name: `${test.name} (copy)`,
+        url: test.url,
+        instructions: test.instructions || test.expectedOutcome || '',
+        expectedOutcome: test.expected_outcome || test.expectedOutcome || '',
+        category: test.category || 'sanity',
+        tags: test.tags || [],
+        requiresAuth: test.requires_auth || test.requiresAuth || false,
+        maxTurns: test.max_turns || test.maxTurns || 40,
+        timeout: test.timeout || 120000,
+        page: test.page || '',
+      };
+      await fetch(`${API}/api/tests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      showToast('Test duplicated', 'success');
+      loadData();
+    } catch (err) {
+      console.error('Failed to duplicate test:', err);
+      showToast('Failed to duplicate test', 'error');
+    }
+  };
+
+  // NEW: Export test as YAML
+  const exportTest = (testId: string) => {
+    setTestMenuOpen(null);
+    const test = tests.find(t => t.id === testId);
+    if (!test) return;
+    const yamlContent = [
+      `name: "${test.name}"`,
+      `url: "${test.url}"`,
+      test.instructions ? `instructions: "${test.instructions}"` : null,
+      test.expected_outcome || test.expectedOutcome ? `expected_outcome: "${test.expected_outcome || test.expectedOutcome}"` : null,
+      `category: ${test.category || 'sanity'}`,
+      test.tags && test.tags.length > 0 ? `tags:\n${test.tags.map(t => `  - ${t}`).join('\n')}` : null,
+      `timeout: ${test.timeout}`,
+      `requires_auth: ${test.requires_auth || test.requiresAuth || false}`,
+      test.max_turns || test.maxTurns ? `max_turns: ${test.max_turns || test.maxTurns}` : null,
+      test.page ? `page: "${test.page}"` : null,
+    ].filter(Boolean).join('\n');
+    const blob = new Blob([yamlContent], { type: 'application/x-yaml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${test.name.replace(/\s+/g, '_').toLowerCase()}.yaml`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // NEW: Toggle test active status
+  const toggleTestActive = async (testId: string) => {
+    const test = tests.find(t => t.id === testId);
+    if (!test) return;
+    try {
+      await fetch(`${API}/api/tests/${testId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isActive: !(test.isActive !== false) }),
+      });
+      loadData();
+    } catch (err) {
+      console.error('Failed to toggle test active:', err);
+    }
+  };
+
+  // NEW: Export selected tests
+  const exportSelectedTests = () => {
+    selectedTests.forEach(id => exportTest(id));
+  };
+
+  // NEW: Delete selected tests
+  const deleteSelectedTests = async () => {
+    for (const id of selectedTests) {
+      await fetch(`${API}/api/tests/${id}`, { method: 'DELETE' });
+    }
+    setSelectedTests(new Set());
+    loadData();
+    showToast(`Deleted ${selectedTests.size} tests`, 'success');
   };
 
   const saveAccount = async () => {
@@ -327,6 +541,31 @@ export default function DashboardPage() {
   }, [testRuns]);
   const passRate = aggregatedStats.passRate;
 
+  // Live token consumption
+  const totalTokens = useMemo(() => {
+    const input = testRuns.reduce((sum, r) => sum + (r.input_tokens || 0), 0);
+    const output = testRuns.reduce((sum, r) => sum + (r.output_tokens || 0), 0);
+    const reasoning = testRuns.reduce((sum, r) => sum + (r.reasoning_tokens || 0), 0);
+    const total = input + output;
+    return { input, output, reasoning, total };
+  }, [testRuns]);
+
+  const formatTokens = (n: number) => {
+    if (n === 0) return '0';
+    if (n < 1000) return String(n);
+    if (n < 1000000) return `${(n / 1000).toFixed(1)}k`;
+    return `${(n / 1000000).toFixed(2)}M`;
+  };
+
+  // Total duration — live elapsed when running, completed duration when done
+  const totalDuration = useMemo(() => {
+    const ms = running ? elapsedMs : testRuns.reduce((sum, r) => sum + (r.duration_ms || 0), 0);
+    if (ms === 0) return '0s';
+    const mins = Math.floor(ms / 60000);
+    const secs = Math.round((ms % 60000) / 1000);
+    return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  }, [testRuns, running, elapsedMs]);
+
   // Unique tags for filter dropdown
   const allTags = useMemo(() => {
     const tagSet = new Set<string>();
@@ -343,13 +582,65 @@ export default function DashboardPage() {
     });
   }, [testRuns, statusFilter, searchFilter]);
 
-  const runStatus = running ? 'Running' : latestSuite?.completed_at ? 'Completed' : 'Idle';
+  // Tests filtered for Test Manager table
+  const filteredTests = useMemo(() => {
+    let result = [...tests];
+
+    if (categoryFilter !== 'all') {
+      result = result.filter(t => t.category === categoryFilter);
+    }
+    if (searchFilter) {
+      const q = searchFilter.toLowerCase();
+      result = result.filter(t =>
+        t.name.toLowerCase().includes(q) ||
+        t.tags?.some(tag => tag.toLowerCase().includes(q)) ||
+        t.category?.toLowerCase().includes(q) ||
+        t.url.toLowerCase().includes(q)
+      );
+    }
+    if (tagFilter !== 'all') {
+      result = result.filter(t => t.tags?.includes(tagFilter));
+    }
+    if (activeFilter === 'active') {
+      result = result.filter(t => t.isActive !== false);
+    } else if (activeFilter === 'inactive') {
+      result = result.filter(t => t.isActive === false);
+    }
+    if (nameSortDir) {
+      result.sort((a, b) => nameSortDir === 'asc' ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name));
+    }
+    return result;
+  }, [tests, categoryFilter, searchFilter, tagFilter, activeFilter, nameSortDir]);
+
+  // Running progress — completed tests / total tests
+  const completedTestCount = testRuns.filter(r => r.status !== 'running' && r.status !== 'queued').length;
+  const totalTestCount = latestSuite?.total || tests.length;
+  const runProgress = running && totalTestCount > 0 ? Math.round((completedTestCount / totalTestCount) * 100) : 0;
+  const runStatus = running ? `Running` : latestSuite?.completed_at ? 'Completed' : 'Idle';
+
+  // Selection helpers
+  const allVisibleSelected = filteredTests.length > 0 && filteredTests.every(t => selectedTests.has(t.id));
+  const toggleSelectAll = () => {
+    if (allVisibleSelected) {
+      setSelectedTests(new Set());
+    } else {
+      setSelectedTests(new Set(filteredTests.map(t => t.id)));
+    }
+  };
+  const toggleSelectTest = (id: string) => {
+    setSelectedTests(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   // ── Tabs ─────────────────────────────────────────────────────
 
   const tabs: { id: TabId; label: string }[] = [
     { id: 'overview', label: 'Overview' },
-    { id: 'results', label: 'Test Results' },
+    { id: 'results', label: 'Results' },
     { id: 'failures', label: 'Failures' },
     { id: 'logs', label: 'Logs' },
     { id: 'tests', label: 'Test Manager' },
@@ -445,163 +736,246 @@ export default function DashboardPage() {
     }
   };
 
+  const selectClasses = "px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500 cursor-pointer appearance-none";
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* ── Header Bar ──────────────────────────────────────────── */}
-      <div className="space-y-4">
-        {/* Top row: Title + Actions */}
-        <div className="flex items-center justify-between flex-wrap gap-4">
-          <div className="flex items-center gap-3">
-            <h2 className="text-2xl font-bold text-gray-50">QA Dashboard</h2>
-            {running && <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />}
-          </div>
-          <div className="flex items-center gap-3 flex-wrap">
-            {/* Headless toggle */}
-            <label className="flex items-center gap-2 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 cursor-pointer hover:bg-gray-700 transition-colors">
-              <input
-                type="checkbox"
-                checked={headless}
-                onChange={e => setHeadless(e.target.checked)}
-                disabled={running}
-                className="accent-indigo-500"
-              />
-              Headless
-            </label>
-
-            {/* Run Tests */}
-            <button
-              onClick={runAllTests}
-              disabled={running}
-              className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg text-sm transition-colors"
-            >
-              {running ? 'Running...' : 'Run Tests'}
-            </button>
-
-            {/* Stop Test */}
-            {running && (
-              <button
-                onClick={stopTests}
-                className="px-5 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg text-sm transition-colors"
-              >
-                Stop Test
-              </button>
-            )}
-
-            {/* Export Report */}
-            {testRuns.length > 0 && !running && (
-              <a
-                href={`${API}/api/report/latest`}
-                download
-                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm transition-colors"
-              >
-                Export Report
-              </a>
-            )}
-
-            {/* Reset */}
-            <button
-              onClick={() => setShowResetModal(true)}
-              className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm transition-colors"
-            >
-              Reset
-            </button>
-          </div>
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-3">
+          <h2 className="text-2xl font-bold text-gray-50">QA Dashboard</h2>
+          {running && <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />}
         </div>
-
-        {/* Search bar + Category chips */}
-        <div className="flex items-center gap-4 flex-wrap">
-          {/* Global search */}
-          <div className="relative flex-1 min-w-[250px] max-w-md">
-            <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
+        <div className="flex items-center gap-3 flex-wrap">
+          {/* Headless checkbox */}
+          <label className="flex items-center gap-2 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 cursor-pointer hover:bg-gray-700 transition-colors">
             <input
-              type="text"
-              placeholder="Search tests, categories, tags..."
-              value={searchFilter}
-              onChange={e => setSearchFilter(e.target.value)}
-              className="w-full pl-10 pr-8 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors"
+              type="checkbox"
+              checked={headless}
+              onChange={e => setHeadless(e.target.checked)}
+              disabled={running}
+              className="accent-indigo-500"
             />
-            {searchFilter && (
+            Headless
+          </label>
+
+          {/* Run Tests button with dropdown */}
+          <div className="relative" ref={runDropdownRef}>
+            <div className="flex">
               <button
-                onClick={() => setSearchFilter('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                onClick={runAllTests}
+                disabled={running}
+                className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-l-lg text-sm transition-colors"
+              >
+                {running ? 'Running...' : 'Run Tests'}
+              </button>
+              <button
+                onClick={() => setRunDropdownOpen(!runDropdownOpen)}
+                disabled={running}
+                className="px-2 py-2 bg-indigo-700 hover:bg-indigo-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-r-lg text-sm transition-colors border-l border-indigo-500"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                 </svg>
               </button>
+            </div>
+            {runDropdownOpen && (
+              <div className="absolute right-0 mt-1 w-64 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl z-50 py-1 overflow-hidden">
+                <button
+                  onClick={() => { runAllTests(); setRunDropdownOpen(false); }}
+                  className="w-full text-left px-4 py-2.5 text-sm text-gray-200 hover:bg-gray-700 transition-colors"
+                >
+                  Run All Tests
+                </button>
+                <button
+                  onClick={() => { if (categoryFilter !== 'all') runCategoryTests(categoryFilter); }}
+                  disabled={categoryFilter === 'all'}
+                  className="w-full text-left px-4 py-2.5 text-sm text-gray-200 hover:bg-gray-700 disabled:text-gray-600 disabled:cursor-not-allowed transition-colors"
+                >
+                  Run by Category{categoryFilter !== 'all' && ` (${categoryFilter})`}
+                </button>
+                <button
+                  onClick={() => { runSelectedTests(); }}
+                  disabled={selectedTests.size === 0}
+                  className="w-full text-left px-4 py-2.5 text-sm text-gray-200 hover:bg-gray-700 disabled:text-gray-600 disabled:cursor-not-allowed transition-colors"
+                >
+                  Run Selected Tests{selectedTests.size > 0 && ` (${selectedTests.size})`}
+                </button>
+                <div className="border-t border-gray-700 my-1" />
+                <div className="px-4 py-2 flex items-center justify-between">
+                  <span className="text-xs text-gray-400">Headless</span>
+                  <button
+                    onClick={() => setHeadless(!headless)}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${headless ? 'bg-indigo-600' : 'bg-gray-600'}`}
+                  >
+                    <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${headless ? 'translate-x-4' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+                <div className="px-4 py-2 flex items-center justify-between">
+                  <span className="text-xs text-gray-400">Parallel Runs</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setParallelRuns(Math.max(1, parallelRuns - 1))}
+                      className="w-5 h-5 flex items-center justify-center bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300"
+                    >-</button>
+                    <span className="text-xs text-gray-300 w-6 text-center">{parallelRuns}/3</span>
+                    <button
+                      onClick={() => setParallelRuns(Math.min(3, parallelRuns + 1))}
+                      className="w-5 h-5 flex items-center justify-center bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300"
+                    >+</button>
+                  </div>
+                </div>
+                <div className="px-4 py-2 flex items-center justify-between">
+                  <span className="text-xs text-gray-400">Retry Failed: {retryFailed}</span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={5}
+                      value={retryFailed}
+                      onChange={e => setRetryFailed(Number(e.target.value))}
+                      className="w-10 h-5 bg-gray-700 border border-gray-600 rounded text-xs text-gray-300 text-center focus:outline-none"
+                    />
+                    <button
+                      onClick={() => setRetryEnabled(!retryEnabled)}
+                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${retryEnabled ? 'bg-indigo-600' : 'bg-gray-600'}`}
+                    >
+                      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${retryEnabled ? 'translate-x-4' : 'translate-x-1'}`} />
+                    </button>
+                  </div>
+                </div>
+              </div>
             )}
           </div>
 
-          {/* Category chip filters */}
-          <div className="flex items-center gap-2">
-            {(['all', 'smoke', 'sanity', 'regression', 'e2e'] as const).map(cat => {
-              const count = cat === 'all' ? tests.length : tests.filter(t => t.category === cat).length;
-              const isActive = categoryFilter === cat;
-              const chipColors = {
-                all: isActive ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-gray-800 text-gray-400 border-gray-700',
-                smoke: isActive ? 'bg-cyan-600 text-white border-cyan-500' : 'bg-gray-800 text-cyan-400 border-gray-700',
-                sanity: isActive ? 'bg-violet-600 text-white border-violet-500' : 'bg-gray-800 text-violet-400 border-gray-700',
-                regression: isActive ? 'bg-orange-600 text-white border-orange-500' : 'bg-gray-800 text-orange-400 border-gray-700',
-                e2e: isActive ? 'bg-pink-600 text-white border-pink-500' : 'bg-gray-800 text-pink-400 border-gray-700',
-              };
-              return (
-                <button
-                  key={cat}
-                  onClick={() => setCategoryFilter(cat)}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-colors hover:opacity-90 ${chipColors[cat]}`}
-                >
-                  {cat === 'all' ? 'All' : cat.charAt(0).toUpperCase() + cat.slice(1)}
-                  <span className="ml-1.5 opacity-70">{count}</span>
-                </button>
-              );
-            })}
-          </div>
+          {/* Stop Test */}
+          {running && (
+            <button
+              onClick={stopTests}
+              className="px-5 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg text-sm transition-colors"
+            >
+              Stop Test
+            </button>
+          )}
+
+          {/* Export Report */}
+          {testRuns.length > 0 && !running && (
+            <a
+              href={`${API}/api/report/latest`}
+              download
+              className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm transition-colors"
+            >
+              Export Report
+            </a>
+          )}
+
+          {/* Reset */}
+          <button
+            onClick={() => setShowResetModal(true)}
+            className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm transition-colors"
+          >
+            Reset
+          </button>
         </div>
       </div>
 
-      {/* ── Stats Cards (4-column) ──────────────────────────────── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {/* Passed */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="text-xs text-gray-500 mb-1">Passed</div>
-          <div className="text-3xl font-bold text-emerald-400">{aggregatedStats.passed}</div>
-          <div className="text-xs text-gray-500 mt-1">{passRate}% of {aggregatedStats.total}</div>
+      {/* ── Filter Bar ──────────────────────────────────────────── */}
+      <div className="flex items-center gap-3 flex-wrap">
+        {/* Global search */}
+        <div className="relative flex-1 min-w-[200px] max-w-sm">
+          <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <input
+            type="text"
+            placeholder="Search tests..."
+            value={searchFilter}
+            onChange={e => setSearchFilter(e.target.value)}
+            className="w-full pl-10 pr-8 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors"
+          />
+          {searchFilter && (
+            <button
+              onClick={() => setSearchFilter('')}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          )}
         </div>
 
-        {/* Failed */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="text-xs text-gray-500 mb-1">Failed</div>
-          <div className="text-3xl font-bold text-red-400">{aggregatedStats.failed}</div>
-          <div className="text-xs text-gray-500 mt-1 truncate">
-            {failedRuns.slice(0, 2).map(r => r.test_name.split(' ')[0]).join(', ') || '--'}
-          </div>
-        </div>
+        {/* Category dropdown */}
+        <select
+          value={categoryFilter}
+          onChange={e => setCategoryFilter(e.target.value)}
+          className={selectClasses}
+        >
+          <option value="all">All Categories</option>
+          <option value="smoke">Smoke</option>
+          <option value="sanity">Sanity</option>
+          <option value="regression">Regression</option>
+          <option value="e2e">E2E</option>
+        </select>
 
-        {/* Errors + Timeouts */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="text-xs text-gray-500 mb-1">Errors / Timeouts</div>
-          <div className="text-3xl font-bold text-orange-400">
-            {aggregatedStats.errors + aggregatedStats.timeouts}
-          </div>
-          <div className="text-xs text-gray-500 mt-1">{aggregatedStats.total} total</div>
-        </div>
+        {/* Status dropdown */}
+        <select
+          value={statusFilter}
+          onChange={e => setStatusFilter(e.target.value)}
+          className={selectClasses}
+        >
+          <option value="all">All Statuses</option>
+          <option value="passed">Passed</option>
+          <option value="failed">Failed</option>
+          <option value="error">Error</option>
+          <option value="running">Running</option>
+          <option value="not_run">Not Run</option>
+        </select>
+      </div>
 
-        {/* Run Status */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="text-xs text-gray-500 mb-1">Run Status</div>
-          <div className="flex items-center gap-2 mt-1">
-            <span className={`w-2 h-2 rounded-full ${
-              running ? 'bg-blue-400 animate-pulse' : latestSuite?.completed_at ? 'bg-emerald-400' : 'bg-gray-500'
-            }`} />
-            <span className="text-sm font-medium text-gray-50">{runStatus}</span>
-          </div>
-          <div className="text-xs text-gray-500 mt-1">
-            {latestSuite?.completed_at
-              ? new Date(latestSuite.completed_at).toLocaleTimeString()
-              : '--'}
-          </div>
+      {/* ── Summary Bar (inline) ──────────────────────────────── */}
+      <div className="flex items-center gap-6 px-4 py-2.5 bg-gray-900 border border-gray-800 rounded-lg">
+        <div className="flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-emerald-400" />
+          <span className="text-sm text-gray-400">Passed:</span>
+          <span className="text-sm font-semibold text-emerald-400">{aggregatedStats.passed}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-red-400" />
+          <span className="text-sm text-gray-400">Failed:</span>
+          <span className="text-sm font-semibold text-red-400">{aggregatedStats.failed}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-orange-400" />
+          <span className="text-sm text-gray-400">Errors:</span>
+          <span className="text-sm font-semibold text-orange-400">{aggregatedStats.errors + aggregatedStats.timeouts}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <span className="text-sm text-gray-400">Duration:</span>
+          <span className="text-sm font-semibold text-gray-200">{totalDuration}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+          <span className="text-sm text-gray-400">Tokens:</span>
+          <span className="text-sm font-semibold text-gray-200">{formatTokens(totalTokens.total)}</span>
+          {totalTokens.total > 0 && (
+            <span className="text-xs text-gray-500">({formatTokens(totalTokens.input)} in / {formatTokens(totalTokens.output)} out)</span>
+          )}
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <span className={`w-2 h-2 rounded-full ${running ? 'bg-blue-400 animate-pulse' : latestSuite?.completed_at ? 'bg-emerald-400' : 'bg-gray-500'}`} />
+          <span className="text-sm text-gray-400">{runStatus}</span>
+          <span className="text-xs text-gray-600">
+            {running
+              ? `(${runProgress}% — ${completedTestCount}/${totalTestCount})`
+              : `(${passRate}% pass rate)`
+            }
+          </span>
         </div>
       </div>
 
@@ -632,81 +1006,207 @@ export default function DashboardPage() {
       {/* ── Tab Content ─────────────────────────────────────────── */}
 
       {/* OVERVIEW TAB */}
-      {activeTab === 'overview' && (
-        <div className="space-y-6">
-          {/* Test Cards Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {tests.map(test => {
-              const run = getTestRunForTest(test.id);
-              if (categoryFilter !== 'all' && test.category !== categoryFilter) return null;
-              if (searchFilter) {
-                const q = searchFilter.toLowerCase();
-                const matches = test.name.toLowerCase().includes(q) ||
-                  test.tags?.some(tag => tag.toLowerCase().includes(q)) ||
-                  test.category?.toLowerCase().includes(q) ||
-                  test.url.toLowerCase().includes(q);
-                if (!matches) return null;
-              }
-              return (
-                <div key={test.id} className="bg-gray-900 border border-gray-800 rounded-xl p-5 hover:border-gray-700 transition-colors">
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <h3 className="font-semibold text-gray-50 text-sm truncate">{test.name}</h3>
-                      {test.category && (
-                        <span className={`flex-shrink-0 text-xs px-1.5 py-0.5 rounded border font-medium ${
-                          test.category === 'smoke' ? 'bg-cyan-50 text-cyan-600 border-cyan-200 dark:bg-cyan-500/15 dark:text-cyan-400 dark:border-cyan-500/30' :
-                          test.category === 'sanity' ? 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-500/15 dark:text-violet-400 dark:border-violet-500/30' :
-                          test.category === 'regression' ? 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-500/15 dark:text-orange-400 dark:border-orange-500/30' :
-                          'bg-pink-50 text-pink-600 border-pink-200 dark:bg-pink-500/15 dark:text-pink-400 dark:border-pink-500/30'
-                        }`}>
-                          {test.category.toUpperCase()}
+      {activeTab === 'overview' && (() => {
+        // Filter tests for overview
+        const overviewTests = tests.filter(test => {
+          if (categoryFilter !== 'all' && test.category !== categoryFilter) return false;
+          if (searchFilter) {
+            const q = searchFilter.toLowerCase();
+            const matches = test.name.toLowerCase().includes(q) ||
+              test.category?.toLowerCase().includes(q) ||
+              test.url.toLowerCase().includes(q);
+            if (!matches) return false;
+          }
+          // Status filter based on latest run
+          if (statusFilter !== 'all') {
+            const run = getTestRunForTest(test.id);
+            if (statusFilter === 'not_run') {
+              if (run) return false;
+            } else {
+              if (!run || run.status !== statusFilter) return false;
+            }
+          }
+          return true;
+        });
+
+        // Group by category
+        const categories = ['smoke', 'sanity', 'regression', 'e2e'] as const;
+        const grouped = categories
+          .map(cat => ({
+            category: cat,
+            tests: overviewTests.filter(t => (t.category || 'sanity') === cat),
+          }))
+          .filter(g => g.tests.length > 0);
+
+        const toggleCategory = (cat: string) => {
+          setCollapsedCategories(prev => {
+            const next = new Set(prev);
+            if (next.has(cat)) next.delete(cat);
+            else next.add(cat);
+            return next;
+          });
+        };
+
+        const statusDot = (status: string) => {
+          switch (status) {
+            case 'passed': return 'bg-emerald-400';
+            case 'failed': return 'bg-red-400';
+            case 'error': return 'bg-orange-400';
+            case 'running': return 'bg-blue-400 animate-pulse';
+            case 'queued': return 'bg-amber-400 animate-pulse';
+            case 'timeout': return 'bg-yellow-400';
+            default: return 'bg-gray-400';
+          }
+        };
+
+        const statusText = (status: string) => {
+          switch (status) {
+            case 'passed': return 'text-emerald-400';
+            case 'failed': return 'text-red-400';
+            case 'error': return 'text-orange-400';
+            case 'running': return 'text-blue-400';
+            case 'queued': return 'text-amber-400';
+            case 'timeout': return 'text-yellow-400';
+            default: return 'text-gray-500';
+          }
+        };
+
+        const cardBorderClass = (status: string) => {
+          switch (status) {
+            case 'running': return 'border-l-2 border-l-blue-500';
+            case 'queued': return 'border-l-2 border-l-amber-500';
+            default: return '';
+          }
+        };
+
+        return (
+          <div className="space-y-4">
+            {grouped.length === 0 ? (
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
+                <div className="text-gray-500 text-sm">No tests match the current filters</div>
+              </div>
+            ) : (
+              grouped.map(group => {
+                const isCollapsed = collapsedCategories.has(group.category);
+                return (
+                  <div key={group.category} className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+                    {/* Category header */}
+                    <div
+                      className="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-gray-800/50 transition-colors"
+                      onClick={() => toggleCategory(group.category)}
+                    >
+                      <div className="flex items-center gap-3">
+                        <svg className={`w-4 h-4 text-gray-500 transition-transform ${isCollapsed ? '' : 'rotate-90'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                        </svg>
+                        <span className={`text-xs px-2 py-0.5 rounded border font-semibold ${categoryBadgeClass(group.category)}`}>
+                          {group.category.toUpperCase()}
                         </span>
-                      )}
-                      {test.requires_auth && (
-                        <span className="flex-shrink-0 text-xs px-1.5 py-0.5 bg-amber-50 text-amber-600 border border-amber-200 dark:bg-amber-500/15 dark:text-amber-400 dark:border-amber-500/30 rounded font-medium">
-                          AUTH
+                        <span className="text-sm text-gray-400">
+                          {group.tests.length} test{group.tests.length !== 1 ? 's' : ''}
                         </span>
-                      )}
-                    </div>
-                    {run && (
-                      <span className={`flex-shrink-0 text-xs px-2 py-0.5 rounded-full border ${statusBadge(run.status)}`}>
-                        {run.status}
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs text-gray-500 mb-3 truncate">{test.url}</p>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-1.5 overflow-hidden">
-                      {test.tags?.slice(0, 3).map(tag => (
-                        <span key={tag} className="text-xs px-2 py-0.5 bg-gray-800 text-gray-400 rounded whitespace-nowrap">
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-                    <div className="flex items-center gap-3 flex-shrink-0">
-                      {run?.duration_ms != null && (
-                        <span className="text-xs text-gray-500">{(run.duration_ms / 1000).toFixed(1)}s</span>
-                      )}
-                      {run?.id && (
-                        <a href={`/runs/${run.id}`} className="text-xs text-indigo-400 hover:text-indigo-300">
-                          Details &rarr;
-                        </a>
-                      )}
+                      </div>
                       <button
-                        onClick={() => runSingleTest(test.id)}
+                        onClick={(e) => { e.stopPropagation(); runCategoryTests(group.category); }}
                         disabled={running}
-                        className="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-300 rounded-md transition-colors"
+                        className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-300 rounded-md transition-colors border border-gray-700"
                       >
-                        Run
+                        Run Category
                       </button>
                     </div>
+
+                    {/* Cards grid */}
+                    {!isCollapsed && (
+                      <div className="px-5 pb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {group.tests.map(test => {
+                          const run = getTestRunForTest(test.id);
+                          const runStatus = run?.status || 'not_run';
+                          const runStatusLabel = run ? run.status.charAt(0).toUpperCase() + run.status.slice(1) : 'Not run';
+                          const isRunning = runStatus === 'running';
+                          const isQueued = runStatus === 'queued';
+                          const isCompleted = ['passed', 'failed', 'error', 'timeout'].includes(runStatus);
+
+                          return (
+                            <div
+                              key={test.id}
+                              className={`bg-gray-800/50 border border-gray-700/50 rounded-lg p-4 hover:border-gray-600 transition-colors flex flex-col justify-between min-h-[90px] ${cardBorderClass(runStatus)} ${isCompleted ? 'cursor-pointer' : ''}`}
+                              onClick={() => { if (isCompleted && run?.id) window.location.href = `/runs/${run.id}`; }}
+                            >
+                              {/* Top row: name + category badge */}
+                              <div className="flex items-start justify-between gap-2 mb-3">
+                                <h3 className="font-semibold text-gray-50 text-sm leading-tight truncate">{test.name}</h3>
+                                <span className={`flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded border font-semibold ${categoryBadgeClass(test.category || 'sanity')}`}>
+                                  {(test.category || 'sanity').toUpperCase()}
+                                </span>
+                              </div>
+                              {/* Bottom row: status + view link + run button */}
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className={`w-2 h-2 rounded-full ${statusDot(runStatus)}`} />
+                                    <span className={`text-xs font-medium ${statusText(runStatus)}`}>{runStatusLabel}</span>
+                                  </div>
+                                  {isCompleted && run?.id && (
+                                    <a
+                                      href={`/runs/${run.id}`}
+                                      onClick={(e) => e.stopPropagation()}
+                                      className="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+                                    >
+                                      View Result &rarr;
+                                    </a>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  {isRunning && run?.id && (
+                                    <a
+                                      href={`/runs/${run.id}`}
+                                      onClick={(e) => e.stopPropagation()}
+                                      className="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+                                    >
+                                      View Details &rarr;
+                                    </a>
+                                  )}
+                                  {isRunning ? (
+                                    <button
+                                      disabled
+                                      className="text-xs px-2.5 py-1 bg-blue-600/20 text-blue-400 rounded-md flex items-center gap-1.5 opacity-80 cursor-not-allowed"
+                                    >
+                                      <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                      </svg>
+                                      Running...
+                                    </button>
+                                  ) : isQueued ? (
+                                    <button
+                                      disabled
+                                      className="text-xs px-2.5 py-1 bg-amber-600/20 text-amber-400 rounded-md opacity-80 cursor-not-allowed"
+                                    >
+                                      Queued
+                                    </button>
+                                  ) : (
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); runSingleTest(test.id); }}
+                                      disabled={running}
+                                      className="text-xs px-2.5 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded-md transition-colors"
+                                    >
+                                      Run
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* TEST RESULTS TAB */}
       {activeTab === 'results' && (
@@ -723,7 +1223,7 @@ export default function DashboardPage() {
             <select
               value={statusFilter}
               onChange={e => setStatusFilter(e.target.value)}
-              className="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500"
+              className={selectClasses}
             >
               <option value="all">All Statuses</option>
               <option value="passed">Passed</option>
@@ -889,8 +1389,36 @@ export default function DashboardPage() {
       {/* TEST MANAGER TAB */}
       {activeTab === 'tests' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-400">Test Definitions</h3>
+          {/* Top bar: selected count + bulk actions + create/import */}
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-3">
+              {selectedTests.size > 0 && (
+                <span className="text-sm text-indigo-400 font-medium">{selectedTests.size} selected</span>
+              )}
+              {selectedTests.size > 0 && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={runSelectedTests}
+                    disabled={running}
+                    className="text-xs px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-md transition-colors"
+                  >
+                    Run Selected
+                  </button>
+                  <button
+                    onClick={deleteSelectedTests}
+                    className="text-xs px-3 py-1.5 bg-red-600/20 hover:bg-red-600/30 text-red-400 border border-red-500/30 rounded-md transition-colors"
+                  >
+                    Delete
+                  </button>
+                  <button
+                    onClick={exportSelectedTests}
+                    className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-md transition-colors"
+                  >
+                    Export
+                  </button>
+                </div>
+              )}
+            </div>
             <div className="flex gap-2">
               <button
                 onClick={async () => {
@@ -942,45 +1470,150 @@ export default function DashboardPage() {
             </div>
           </div>
 
+          {/* Table */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-gray-800 text-gray-500 text-xs">
-                  <th className="text-left py-3 px-4 font-medium">Name</th>
+                  <th className="py-3 px-4 w-10">
+                    <input
+                      type="checkbox"
+                      checked={allVisibleSelected}
+                      onChange={toggleSelectAll}
+                      className="accent-indigo-500"
+                    />
+                  </th>
+                  <th className="text-left py-3 px-4 font-medium">
+                    <button
+                      onClick={() => setNameSortDir(d => d === 'asc' ? 'desc' : d === 'desc' ? null : 'asc')}
+                      className="flex items-center gap-1 hover:text-gray-300 transition-colors"
+                    >
+                      Name
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        {nameSortDir === 'asc' ? (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+                        ) : nameSortDir === 'desc' ? (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                        ) : (
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+                        )}
+                      </svg>
+                    </button>
+                  </th>
                   <th className="text-left py-3 px-4 font-medium">Category</th>
-                  <th className="text-left py-3 px-4 font-medium">URL</th>
                   <th className="text-left py-3 px-4 font-medium">Page</th>
                   <th className="text-left py-3 px-4 font-medium">Version</th>
+                  <th className="text-left py-3 px-4 font-medium">Active</th>
                   <th className="text-left py-3 px-4 font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {tests.map(test => (
-                  <tr key={test.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
-                    <td className="py-3 px-4 text-gray-50 font-medium">{test.name}</td>
-                    <td className="py-3 px-4">
-                      <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${
-                        test.category === 'smoke' ? 'bg-cyan-50 text-cyan-600 border-cyan-200 dark:bg-cyan-500/15 dark:text-cyan-400 dark:border-cyan-500/30' :
-                        test.category === 'sanity' ? 'bg-violet-50 text-violet-600 border-violet-200 dark:bg-violet-500/15 dark:text-violet-400 dark:border-violet-500/30' :
-                        test.category === 'regression' ? 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-500/15 dark:text-orange-400 dark:border-orange-500/30' :
-                        'bg-pink-50 text-pink-600 border-pink-200 dark:bg-pink-500/15 dark:text-pink-400 dark:border-pink-500/30'
-                      }`}>
-                        {(test.category || 'sanity').toUpperCase()}
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 text-gray-500 text-xs truncate max-w-[200px]">{test.url}</td>
-                    <td className="py-3 px-4 text-gray-400 text-xs">{test.page || '-'}</td>
-                    <td className="py-3 px-4 text-gray-400 text-xs">{test.version ?? '-'}</td>
-                    <td className="py-3 px-4">
-                      <div className="flex gap-2">
-                        <button onClick={() => openEditTest(test)} className="text-xs text-indigo-400 hover:text-indigo-300">Edit</button>
-                        <button onClick={() => setDeleteConfirm({ testId: test.id, testName: test.name })} className="text-xs text-red-400 hover:text-red-300">Delete</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                {filteredTests.map(test => {
+                  const run = getTestRunForTest(test.id);
+                  return (
+                    <tr key={test.id} className={`border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors ${selectedTests.has(test.id) ? 'bg-indigo-500/5' : ''}`}>
+                      <td className="py-3 px-4">
+                        <input
+                          type="checkbox"
+                          checked={selectedTests.has(test.id)}
+                          onChange={() => toggleSelectTest(test.id)}
+                          className="accent-indigo-500"
+                        />
+                      </td>
+                      <td className="py-3 px-4">
+                        <button onClick={() => openEditTest(test)} className="text-gray-50 font-medium hover:text-indigo-400 transition-colors text-left">
+                          {test.name}
+                        </button>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${categoryBadgeClass(test.category || 'sanity')}`}>
+                          {(test.category || 'sanity').toUpperCase()}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-gray-400 text-xs">{test.page || '-'}</td>
+                      <td className="py-3 px-4 text-gray-400 text-xs">{test.version ?? '-'}</td>
+                      <td className="py-3 px-4">
+                        <button
+                          onClick={() => toggleTestActive(test.id)}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${test.isActive !== false ? 'bg-indigo-600' : 'bg-gray-600'}`}
+                        >
+                          <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${test.isActive !== false ? 'translate-x-4' : 'translate-x-1'}`} />
+                        </button>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => runSingleTest(test.id)}
+                            disabled={running}
+                            className="text-xs px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-md transition-colors"
+                          >
+                            Run
+                          </button>
+                          {run?.id && (
+                            <a
+                              href={`/runs/${run.id}`}
+                              className="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-md transition-colors"
+                            >
+                              Logs
+                            </a>
+                          )}
+                          {/* ... menu */}
+                          <div className="relative" ref={testMenuOpen === test.id ? testMenuRef : undefined}>
+                            <button
+                              onClick={() => setTestMenuOpen(testMenuOpen === test.id ? null : test.id)}
+                              className="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded-md transition-colors"
+                            >
+                              ...
+                            </button>
+                            {testMenuOpen === test.id && (
+                              <div className="absolute right-0 mt-1 w-36 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 py-1">
+                                <button
+                                  onClick={() => { openEditTest(test); setTestMenuOpen(null); }}
+                                  className="w-full text-left px-3 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  onClick={() => duplicateTest(test.id)}
+                                  className="w-full text-left px-3 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors"
+                                >
+                                  Duplicate
+                                </button>
+                                <button
+                                  onClick={() => { setDeleteConfirm({ testId: test.id, testName: test.name }); setTestMenuOpen(null); }}
+                                  className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-gray-700 transition-colors"
+                                >
+                                  Delete
+                                </button>
+                                <button
+                                  onClick={() => exportTest(test.id)}
+                                  className="w-full text-left px-3 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors"
+                                >
+                                  Export
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
+          </div>
+
+          {/* Bottom status bar */}
+          <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border border-gray-800 rounded-lg text-xs text-gray-500">
+            <div>Tests: {filteredTests.length}</div>
+            {selectedTests.size > 0 && (
+              <div className="flex items-center gap-3">
+                <span className="text-indigo-400">{selectedTests.size} selected</span>
+                <button onClick={runSelectedTests} disabled={running} className="text-indigo-400 hover:text-indigo-300 disabled:text-gray-600">Run Selected</button>
+                <button onClick={deleteSelectedTests} className="text-red-400 hover:text-red-300">Delete</button>
+                <button onClick={exportSelectedTests} className="text-gray-400 hover:text-gray-300">Export</button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1064,19 +1697,19 @@ export default function DashboardPage() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Max Concurrency</label>
-                  <input type="number" value={settings.maxConcurrency} onChange={e => setSettings(s => s ? { ...s, maxConcurrency: Number(e.target.value) } : s)} min={1} max={10} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                  <input type="number" value={settings.maxConcurrency ?? 2} onChange={e => setSettings(s => s ? { ...s, maxConcurrency: Number(e.target.value) } : s)} min={1} max={10} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
                 </div>
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Default Max Turns</label>
-                  <input type="number" value={settings.maxTurnsDefault} onChange={e => setSettings(s => s ? { ...s, maxTurnsDefault: Number(e.target.value) } : s)} min={1} max={100} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                  <input type="number" value={settings.maxTurnsDefault ?? 500} onChange={e => setSettings(s => s ? { ...s, maxTurnsDefault: Number(e.target.value) } : s)} min={1} max={500} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
                 </div>
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Max Tokens/Session</label>
-                  <input type="number" value={settings.maxTokensPerSession} onChange={e => setSettings(s => s ? { ...s, maxTokensPerSession: Number(e.target.value) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                  <input type="number" value={settings.maxTokensPerSession ?? 200000} onChange={e => setSettings(s => s ? { ...s, maxTokensPerSession: Number(e.target.value) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
                 </div>
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Default Timeout (ms)</label>
-                  <input type="number" value={settings.defaultTimeout} onChange={e => setSettings(s => s ? { ...s, defaultTimeout: Number(e.target.value) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                  <input type="number" value={settings.defaultTimeout ?? 120000} onChange={e => setSettings(s => s ? { ...s, defaultTimeout: Number(e.target.value) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
                 </div>
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Default Headless</label>
@@ -1087,7 +1720,7 @@ export default function DashboardPage() {
                 </div>
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Allowed Domains</label>
-                  <input value={settings.allowedDomains.join(', ')} onChange={e => setSettings(s => s ? { ...s, allowedDomains: e.target.value.split(',').map(d => d.trim()).filter(Boolean) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
+                  <input value={(settings.allowedDomains || []).join(', ')} onChange={e => setSettings(s => s ? { ...s, allowedDomains: e.target.value.split(',').map(d => d.trim()).filter(Boolean) } : s)} className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 focus:outline-none focus:border-indigo-500" />
                 </div>
               </div>
               <div className="mt-4">

@@ -13,6 +13,7 @@ export interface ITestDef {
   timeout: number;
   viewport: { width: number; height: number };
   page: string;
+  cuaMode?: 'dom' | 'vision';
   version: number;
   isActive: boolean;
   createdAt: Date;
@@ -28,13 +29,14 @@ const TestDefSchema = new Schema({
   category: { type: String, default: 'sanity' },
   tags: { type: [String], default: [] },
   requiresAuth: { type: Boolean, default: false },
-  maxTurns: { type: Number, default: 40 },
+  maxTurns: { type: Number, default: 500 },
   timeout: { type: Number, default: 120000 },
   viewport: {
     type: { width: Number, height: Number },
     default: { width: 1440, height: 900 },
   },
   page: { type: String, default: '' },
+  cuaMode: { type: String, enum: ['dom', 'vision'], default: undefined },
   version: { type: Number, default: 1 },
   isActive: { type: Boolean, default: true },
 }, { timestamps: true, _id: false });

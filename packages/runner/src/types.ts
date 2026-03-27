@@ -119,12 +119,29 @@ export interface TurnTokenUsage {
   cumulativeReasoning: number;
 }
 
+export interface StepActionMeta {
+  action?: { type: string; target?: string; value?: string };
+  result?: { success: boolean; error?: string | null; description?: string };
+  validation?: {
+    urlChanged: boolean; domChanged: boolean; valueChanged: boolean;
+    errorAppeared: boolean; errorMessage?: string | null;
+    elementStillExists: boolean; intentMatch: boolean;
+  };
+  effective?: boolean;
+  retryStrategy?: string;
+  memory?: string;
+  nextGoal?: string;
+  domFingerprint?: string;
+  confidence?: number;
+  visionUsed?: boolean;
+}
+
 export interface CUALoopCallbacks {
   onTurnStart: (turn: number) => void;
   onTurnComplete: (turn: number, apiLatencyMs: number, tokensSoFar?: { input: number; output: number; reasoning: number }) => void;
   onTurnTokens: (turnTokens: TurnTokenUsage) => void;
   onActionsExecuted: (turn: number, actions: ComputerAction[]) => void;
-  onScreenshot: (turn: number, screenshot: ScreenshotRecord) => void;
+  onScreenshot: (turn: number, screenshot: ScreenshotRecord, actionMeta?: StepActionMeta) => void;
 }
 
 export interface PageState {

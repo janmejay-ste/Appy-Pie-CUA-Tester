@@ -356,7 +356,7 @@ export function createServer(): express.Express {
           category: t.category ?? 'sanity',
           tags: t.tags ?? [],
           requiresAuth: t.requires_auth ?? false,
-          maxTurns: t.max_turns ?? 40,
+          ...(t.max_turns ? { maxTurns: t.max_turns } : {}),
           timeout: t.timeout ?? 120000,
           viewport: t.viewport ?? { width: 1440, height: 900 },
           page: t.page ?? '',
@@ -385,7 +385,7 @@ export function createServer(): express.Express {
           category: t.category ?? 'sanity',
           tags: t.tags ?? [],
           requiresAuth: t.requires_auth ?? false,
-          maxTurns: t.max_turns ?? 40,
+          ...(t.max_turns ? { maxTurns: t.max_turns } : {}),
           timeout: t.timeout ?? 120000,
           viewport: t.viewport ?? { width: 1440, height: 900 },
           page: t.page ?? '',
@@ -437,7 +437,7 @@ export function createServer(): express.Express {
         category: parsed.category ?? 'sanity',
         tags: parsed.tags ?? [],
         requiresAuth: parsed.requires_auth ?? false,
-        maxTurns: parsed.max_turns ?? 40,
+        ...(parsed.max_turns ? { maxTurns: parsed.max_turns } : {}),
         timeout: parsed.timeout ?? 120000,
         viewport: parsed.viewport ?? { width: 1440, height: 900 },
         page: parsed.page ?? '',
@@ -545,7 +545,7 @@ export function createServer(): express.Express {
       for (const testDef of tests) {
         const testRun = await testService.createTestRun(session._id, testDef.id, testDef.name);
 
-        const jobData: TestJobData = {
+        const jobData: any = {
           sessionId: session._id,
           testRunId: testRun._id,
           testId: testDef.id,
@@ -558,6 +558,7 @@ export function createServer(): express.Express {
           maxTurns: testDef.max_turns || sysSettings.maxTurnsDefault,
           timeout: testDef.timeout || sysSettings.defaultTimeout,
           viewport: testDef.viewport,
+          cuaMode: testDef.cuaMode || undefined,
         };
         // Priority: smoke=1 (highest), e2e=2, regression=3, sanity=4 (lowest)
         const priorityMap: Record<string, number> = { smoke: 1, e2e: 2, regression: 3, sanity: 4 };
@@ -605,7 +606,7 @@ export function createServer(): express.Express {
       const session = await sessionService.createSession(1);
       const testRun = await testService.createTestRun(session._id, testDef.id, testDef.name);
 
-      const jobData: TestJobData = {
+      const jobData: any = {
         sessionId: session._id,
         testRunId: testRun._id,
         testId: testDef.id,
@@ -618,7 +619,8 @@ export function createServer(): express.Express {
         maxTurns: maxTurnsOverride ?? (testDef.max_turns || sysSettings.maxTurnsDefault),
         timeout: testDef.timeout || sysSettings.defaultTimeout,
         viewport: testDef.viewport,
-      } as any;
+        cuaMode: testDef.cuaMode || undefined,
+      };
 
       // If resuming from a timed-out run, attach page state + context
       if (resumeFromRunId) {
@@ -666,8 +668,21 @@ export function createServer(): express.Express {
   });
 
   // ── Abort a running test ─────────────────────────────────────
-  app.post('/api/runs/:runId/abort', (_req, res) => {
-    abortTestRun(_req.params.runId);
+  app.post('/api/runs/:runId/abort', async (_req, res) => {
+    const runId = _req.params.runId;
+    console.log(`[api] Abort requested for run: ${runId}`);
+    abortTestRun(runId);
+
+    // Also remove from queue if still queued (not yet picked up by worker)
+    const waitingJobs = await testExecutionQueue.getJobs(['waiting', 'delayed']);
+    for (const job of waitingJobs) {
+      if (job.data?.testRunId === runId) {
+        await job.remove();
+        await TestRun.updateOne({ _id: runId }, { $set: { status: 'aborted', completedAt: new Date(), error: 'Aborted by user (removed from queue)' } });
+        console.log(`[api] Removed queued job ${job.id} for run ${runId}`);
+      }
+    }
+
     res.json({ success: true, message: 'Run abort signal sent' });
   });
 
