@@ -169,8 +169,8 @@ export async function runCUALoop(
   callbacks: CUALoopCallbacks,
   testAccount?: TestAccountConfig,
   abortSignal?: AbortSignal,
-  maxTurns: number = DEFAULT_maxTurns,
-  tokenBudget: number = 200000,
+  maxTurns: number,
+  tokenBudget: number,
   testUrl?: string,
 ): Promise<CUALoopResult> {
   let previousResponseId: string | undefined;
@@ -378,6 +378,7 @@ export async function runCUALoop(
       cumulativeInput: totalTokens.input,
       cumulativeOutput: totalTokens.output,
       cumulativeReasoning: totalTokens.reasoning,
+      mode: 'vision',
     });
 
     // ── Check for computer_call items ───────────────────────────

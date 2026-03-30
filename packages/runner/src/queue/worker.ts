@@ -265,6 +265,7 @@ ${testInstructions}`;
             cumulativeInput: turnTokens.cumulativeInput,
             cumulativeOutput: turnTokens.cumulativeOutput,
             cumulativeReasoning: turnTokens.cumulativeReasoning,
+            mode: turnTokens.mode || 'dom',
           });
         },
         onActionsExecuted: (turn, actions) => {

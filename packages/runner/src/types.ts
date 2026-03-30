@@ -117,6 +117,7 @@ export interface TurnTokenUsage {
   cumulativeInput: number;
   cumulativeOutput: number;
   cumulativeReasoning: number;
+  mode?: 'dom' | 'vision' | 'vision-burst';
 }
 
 export interface StepActionMeta {

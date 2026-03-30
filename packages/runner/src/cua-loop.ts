@@ -32,7 +32,9 @@ CRITICAL:
 7. LOGIN: click email field → type email → click field again → type password → click LOGIN
 8. Never click "Forgot password" or "Sign in with Google" — use email+password only
 9. NEVER click expand/fullscreen/maximize buttons (diagonal arrows icon) on side panels — they break the layout
-10. When done: {"action":"done","verdict":"PASS/FAIL","summary":"...","stepsCompleted":[...],"issuesFound":[]}`;
+10. If the page shows a loading spinner or is mostly empty, use action "wait" with value "3000" — do NOT navigate away or go back. The page is loading.
+11. NEVER use "navigate" to go back to a previous page or restart the flow. Always move FORWARD through the steps.
+12. When done: {"action":"done","verdict":"PASS/FAIL","summary":"...","stepsCompleted":[...],"issuesFound":[]}`;
 
 // ── Helpers ─────────────────────────────────────────────────────
 async function saveScreenshotToDisk(
@@ -143,8 +145,8 @@ export async function runCUALoop(
   callbacks: CUALoopCallbacks,
   testAccount?: TestAccountConfig,
   abortSignal?: AbortSignal,
-  maxTurns: number = DEFAULT_MAX_TURNS,
-  tokenBudget: number = 200000,
+  maxTurns: number,
+  tokenBudget: number,
   
   testUrl?: string,
   mode: 'dom' | 'vision' = 'dom',
@@ -167,8 +169,8 @@ async function runCUALoopDOM(
   callbacks: CUALoopCallbacks,
   testAccount?: TestAccountConfig,
   abortSignal?: AbortSignal,
-  maxTurns: number = DEFAULT_MAX_TURNS,
-  tokenBudget: number = 200000,
+  maxTurns: number,
+  tokenBudget: number,
   testUrl?: string,
 ): Promise<CUALoopResult> {
   // ── Create adapter (CUA never touches Playwright directly) ─────
@@ -250,6 +252,24 @@ async function runCUALoopDOM(
     }
 
     callbacks.onTurnStart(turn);
+
+    // ── Auto-wait for loading spinners ──────────────────────────
+    // If page has very few elements (loading spinner), wait up to 10s for content to load
+    if (state.elements.length < 5) {
+      let waited = 0;
+      const LOAD_WAIT_INTERVAL = 2000;
+      const LOAD_WAIT_MAX = 10000;
+      while (waited < LOAD_WAIT_MAX) {
+        console.log(`[cua] Page loading (${state.elements.length} elements) — waiting ${LOAD_WAIT_INTERVAL / 1000}s...`);
+        await new Promise(r => setTimeout(r, LOAD_WAIT_INTERVAL));
+        waited += LOAD_WAIT_INTERVAL;
+        try { state = await adapter.getState(); } catch { break; }
+        if (state.elements.length >= 5) {
+          console.log(`[cua] Page loaded (${state.elements.length} elements after ${waited / 1000}s)`);
+          break;
+        }
+      }
+    }
 
     // ── Build prompt (self-contained, with rolling action history) ─
     const promptParts: string[] = [];
@@ -352,6 +372,7 @@ async function runCUALoopDOM(
     }
 
     // ── Call model ──────────────────────────────────────────────
+    const turnMode: 'dom' | 'vision' = content.some((c: any) => c.type === 'input_image') ? 'vision' : 'dom';
     const apiStart = Date.now();
     let responseText = '';
     let turnInput = 0, turnOutput = 0, turnReasoning = 0;
@@ -405,6 +426,7 @@ async function runCUALoopDOM(
       cumulativeInput: totalTokens.input,
       cumulativeOutput: totalTokens.output,
       cumulativeReasoning: totalTokens.reasoning,
+      mode: turnMode,
     });
 
     // ── Parse model response ────────────────────────────────────
@@ -694,7 +716,13 @@ async function runCUALoopDOM(
         el.text?.includes('Worksheet') ||
         el.text?.includes('Add an Account') ||
         el.text?.includes('Trigger Event') ||
+        el.text?.includes('Trigger Details') ||
         el.text?.includes('Action Event') ||
+        el.text?.includes('Action Details') ||
+        el.text?.includes('Change') ||
+        el.text?.includes('Connect Account') ||
+        el.text?.includes('Skip Run Test') ||
+        el.text?.includes('Set Up') ||
         el.placeholder?.includes('Search')
       );
       const hasCard = state.elements.some(el =>
@@ -705,24 +733,60 @@ async function runCUALoopDOM(
       );
 
       if (!hasSidePanel && hasCard && state.elements.length < 15) {
-        // Find the card element to double-click
-        const card = state.elements.find(el =>
-          el.text?.includes('Trigger Application') ||
-          el.text?.includes('Select Trigger') ||
-          el.text?.includes('Google Sheets') ||
-          el.text?.includes('Action Application') ||
-          el.text?.includes('Select Action')
+        // Strategy 1: Click the panel toggle icon (◁▏) — most reliable
+        // It's typically a small icon in the top-right area of the page
+        const panelToggle = state.elements.find(el =>
+          el.attributes?.['class']?.includes('collapse') ||
+          el.attributes?.['class']?.includes('toggle') ||
+          el.attributes?.['class']?.includes('panel') ||
+          el.attributes?.['aria-label']?.toLowerCase().includes('panel') ||
+          el.attributes?.['aria-label']?.toLowerCase().includes('collapse')
         );
-        if (card && card.boundingBox) {
-          console.log(`[cua] Side panel closed — auto double-clicking card "${card.text?.slice(0, 30)}" to re-open panel`);
-          await adapter.doubleClickByCoordinates(
-            card.boundingBox.x + card.boundingBox.w / 2,
-            card.boundingBox.y + card.boundingBox.h / 2,
+
+        if (panelToggle && panelToggle.boundingBox) {
+          console.log(`[cua] Side panel closed — clicking panel toggle icon to re-open`);
+          await adapter.clickByCoordinates(
+            panelToggle.boundingBox.x + panelToggle.boundingBox.w / 2,
+            panelToggle.boundingBox.y + panelToggle.boundingBox.h / 2,
           );
-          // Wait for panel to open
-          await new Promise(r => setTimeout(r, 2000));
-          // Re-index DOM after panel opens
-          try { state = await adapter.getState(); } catch {}
+        } else {
+          // Strategy 2: Click the panel toggle at a known position (top-right area)
+          // The ◁▏ icon is typically at ~(1355, 90) based on screenshots
+          console.log(`[cua] Side panel closed — clicking panel toggle at top-right position`);
+          await adapter.clickByCoordinates(1355, 90);
+        }
+
+        // Wait for panel to open
+        await new Promise(r => setTimeout(r, 3000));
+        // Re-index DOM after panel opens
+        try { state = await adapter.getState(); } catch {}
+
+        // If still no panel, try double-clicking the card as fallback
+        const stillNoPanel = !state.elements.some(el =>
+          el.text?.includes('Continue') ||
+          el.text?.includes('Spreadsheet') ||
+          el.text?.includes('Add an Account') ||
+          el.text?.includes('Trigger Details') ||
+          el.text?.includes('Action Details') ||
+          el.text?.includes('Change') ||
+          el.text?.includes('Connect Account') ||
+          el.placeholder?.includes('Search')
+        );
+        if (stillNoPanel) {
+          const card = state.elements.find(el =>
+            el.text?.includes('Trigger Application') ||
+            el.text?.includes('Google Sheets') ||
+            el.text?.includes('Action Application')
+          );
+          if (card && card.boundingBox) {
+            console.log(`[cua] Panel toggle didn't work — double-clicking card "${card.text?.slice(0, 30)}"`);
+            await adapter.doubleClickByCoordinates(
+              card.boundingBox.x + card.boundingBox.w / 2,
+              card.boundingBox.y + card.boundingBox.h / 2,
+            );
+            await new Promise(r => setTimeout(r, 2000));
+            try { state = await adapter.getState(); } catch {}
+          }
         }
       }
     }

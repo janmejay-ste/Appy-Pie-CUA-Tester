@@ -33,6 +33,7 @@ interface TurnToken {
   cumulative_input: number;
   cumulative_output: number;
   cumulative_reasoning: number;
+  mode?: 'dom' | 'vision' | 'vision-burst';
   timestamp: string;
 }
 
@@ -332,26 +333,42 @@ export default function RunDetailPage() {
           {showTokens && (
             <div className="border-t border-gray-800">
               {/* Summary bar */}
-              <div className="grid grid-cols-4 gap-4 px-5 py-3 bg-gray-800/50">
-                <div>
-                  <div className="text-xs text-gray-500">Total Input</div>
-                  <div className="text-sm font-semibold text-blue-400">{(run.input_tokens / 1000).toFixed(1)}k</div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Total Output</div>
-                  <div className="text-sm font-semibold text-emerald-400">{(run.output_tokens / 1000).toFixed(1)}k</div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Reasoning</div>
-                  <div className="text-sm font-semibold text-amber-400">{(run.reasoning_tokens / 1000).toFixed(1)}k</div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Avg per Turn</div>
-                  <div className="text-sm font-semibold text-gray-300">
-                    {run.turn_count > 0 ? ((run.input_tokens + run.output_tokens) / run.turn_count / 1000).toFixed(1) + 'k' : '--'}
+              {(() => {
+                const domTurns = run.turnTokens?.filter((t: TurnToken) => !t.mode || t.mode === 'dom') || [];
+                const visionTurns = run.turnTokens?.filter((t: TurnToken) => t.mode === 'vision' || t.mode === 'vision-burst') || [];
+                const domTokens = domTurns.reduce((s: number, t: TurnToken) => s + t.input_tokens + t.output_tokens, 0);
+                const visionTokens = visionTurns.reduce((s: number, t: TurnToken) => s + t.input_tokens + t.output_tokens, 0);
+                return (
+                  <div className="grid grid-cols-6 gap-4 px-5 py-3 bg-gray-800/50">
+                    <div>
+                      <div className="text-xs text-gray-500">Total Input</div>
+                      <div className="text-sm font-semibold text-blue-400">{(run.input_tokens / 1000).toFixed(1)}k</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Total Output</div>
+                      <div className="text-sm font-semibold text-emerald-400">{(run.output_tokens / 1000).toFixed(1)}k</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Reasoning</div>
+                      <div className="text-sm font-semibold text-amber-400">{(run.reasoning_tokens / 1000).toFixed(1)}k</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">DOM Tokens</div>
+                      <div className="text-sm font-semibold text-cyan-400">{(domTokens / 1000).toFixed(1)}k <span className="text-[10px] text-gray-500">({domTurns.length} turns)</span></div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Vision Tokens</div>
+                      <div className="text-sm font-semibold text-purple-400">{(visionTokens / 1000).toFixed(1)}k <span className="text-[10px] text-gray-500">({visionTurns.length} turns)</span></div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Avg per Turn</div>
+                      <div className="text-sm font-semibold text-gray-300">
+                        {run.turn_count > 0 ? ((run.input_tokens + run.output_tokens) / run.turn_count / 1000).toFixed(1) + 'k' : '--'}
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
+                );
+              })()}
               {/* Per-turn table */}
               {run.turnTokens?.length > 0 && (
                 <div className="max-h-[300px] overflow-y-auto">
@@ -359,6 +376,7 @@ export default function RunDetailPage() {
                     <thead className="sticky top-0 bg-gray-900">
                       <tr className="text-gray-500 border-b border-gray-800">
                         <th className="text-left py-2 px-4 font-medium">Turn</th>
+                        <th className="text-left py-2 px-4 font-medium">Mode</th>
                         <th className="text-right py-2 px-4 font-medium">Input</th>
                         <th className="text-right py-2 px-4 font-medium">Output</th>
                         <th className="text-right py-2 px-4 font-medium">Reasoning</th>
@@ -368,15 +386,24 @@ export default function RunDetailPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {run.turnTokens.map((tt) => {
+                      {run.turnTokens.map((tt: TurnToken) => {
                         const turnTotal = tt.input_tokens + tt.output_tokens;
                         const cumTotal = tt.cumulative_input + tt.cumulative_output;
-                        // Highlight expensive turns (> 2x average)
                         const avgPerTurn = run.turn_count > 0 ? (run.input_tokens + run.output_tokens) / run.turn_count : 0;
                         const isExpensive = turnTotal > avgPerTurn * 2;
+                        const mode = tt.mode || 'dom';
+                        const modeBadge = mode === 'vision' || mode === 'vision-burst'
+                          ? 'bg-purple-500/20 text-purple-400 border-purple-500/30'
+                          : 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30';
+                        const modeLabel = mode === 'vision-burst' ? 'V-Burst' : mode === 'vision' ? 'Vision' : 'DOM';
                         return (
                           <tr key={tt.id} className={`border-b border-gray-800/50 ${isExpensive ? 'bg-amber-500/5' : 'hover:bg-gray-800/30'}`}>
                             <td className="py-2 px-4 text-gray-300 font-mono">T{tt.turn_number}</td>
+                            <td className="py-2 px-4">
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${modeBadge}`}>
+                                {modeLabel}
+                              </span>
+                            </td>
                             <td className="py-2 px-4 text-right text-blue-400 font-mono">{(tt.input_tokens / 1000).toFixed(1)}k</td>
                             <td className="py-2 px-4 text-right text-emerald-400 font-mono">{(tt.output_tokens / 1000).toFixed(1)}k</td>
                             <td className="py-2 px-4 text-right text-amber-400 font-mono">{tt.reasoning_tokens > 0 ? (tt.reasoning_tokens / 1000).toFixed(1) + 'k' : '-'}</td>
@@ -442,19 +469,21 @@ export default function RunDetailPage() {
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             {currentScreenshot && screenshotFilename ? (
               <>
-                <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
-                  <div className="flex items-center gap-2">
+                <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800 gap-4">
+                  <div className="flex items-center gap-2 shrink-0">
                     <span className={`text-xs px-2 py-0.5 rounded-full ${currentCategory.color}`}>
                       {currentCategory.label}
                     </span>
-                    <span className="text-xs text-gray-500">
-                      Turn {currentScreenshot.turn_number} of {screenshots.length - 1}
+                    <span className="text-xs text-gray-400 font-mono whitespace-nowrap">
+                      Turn {currentScreenshot.turn_number} <span className="text-gray-600">of {screenshots.length - 1}</span>
                     </span>
                   </div>
-                  <div className="flex items-center gap-3 text-xs text-gray-500">
-                    {currentScreenshot.page_title && <span>{currentScreenshot.page_title}</span>}
+                  <div className="flex items-center gap-2 text-xs min-w-0">
+                    {currentScreenshot.page_title && (
+                      <span className="text-gray-400 truncate max-w-[250px]" title={currentScreenshot.page_title}>{currentScreenshot.page_title}</span>
+                    )}
                     {currentScreenshot.page_url && (
-                      <span className="text-gray-600 truncate max-w-xs">{currentScreenshot.page_url}</span>
+                      <span className="text-gray-600 truncate max-w-[300px]" title={currentScreenshot.page_url}>{currentScreenshot.page_url}</span>
                     )}
                   </div>
                 </div>

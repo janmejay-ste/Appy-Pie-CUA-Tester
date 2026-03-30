@@ -99,6 +99,7 @@ export async function updateStepTokens(testRunId: string, turnNumber: number, to
   cumulativeInput: number;
   cumulativeOutput: number;
   cumulativeReasoning: number;
+  mode?: string;
 }) {
   await Step.updateOne(
     { testRunId, turnNumber },

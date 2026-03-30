@@ -5,39 +5,40 @@ category: e2e
 instructions: |
   IMPORTANT UI PATTERN: This app uses a canvas + side panel layout. The main area shows workflow cards (trigger/action). Clicking a card opens a SIDE PANEL on the right with configuration details. If the side panel closes after clicking Continue, you MUST click the card again to re-open it. Configuration fields (dropdowns, inputs) are ONLY in the side panel — never on the canvas itself. If you cannot find expected fields, click the relevant card to open its panel.
 
-  1. If login is required, log in with the provided credentials. Otherwise navigate to the Connect dashboard.
+  1. If redirected to a login page, log in exactly as follows: enter the test account email in the email input field, enter the test account password in the password input field, then click the "Log In" or "Sign In" submit button. Do NOT click any other links on the login page.
   2. On the /connects page, click "Create Connect". Dismiss any onboarding overlay or "Support Available" modal if they appear.
   3. TRIGGER SETUP — In the side panel:
      - Type "Google Sheets" in the search bar and select it from the app list
-     
      - Select trigger event: "New Spreadsheet Row"
-     - Click Continue
+     - When the "Continue" button appears, click it immediately — do NOT click any other button like Guide or question mark icons
   4. GOOGLE SHEETS ACCOUNT — In the side panel:
-     - If a linked account is already shown, click Continue
-     - If no account is linked, click "Add an Account" to connect one
-     - After clicking Continue, the side panel may close. If so, click the Google Sheets trigger CARD on the canvas to re-open the side panel.
+     - When you see the Continue button, click it immediately — the account is already linked
+     - Do NOT click "Add an Account", "Change", "Guide", or any other button
+     - If no Continue button is visible, report an error that the account is not linked
+     - After clicking Continue, the side panel may close. If so, click the panel toggle icon (◁▏) at the top-right corner to re-open it
   5. SPREADSHEET SELECTION — In the side panel (click the trigger card if panel is closed):
      - IGNORE the "guide" / "Example" toggle section — do NOT click it
      - Find the "Spreadsheet *" dropdown BELOW the guide section and click its ARROW ICON to open it
      - Wait 2-3 seconds for options to load, then select the first available spreadsheet
      - After selecting, find the "Worksheet *" dropdown below and select the first available worksheet
      - If clicking has no effect, try action "select" with target=elementId and value="first"
-     - After both dropdowns are filled, click "Continue & Run Test" or "Skip Run Test"
+     - After both dropdowns are filled, click "Continue & Run Test"
   6. Click "Continue & Run Test" in the side panel:
      - Wait for the test to complete with a success message
      - Click "view record" to verify data, then click Continue to move to the action step
-  7. ACTION SETUP — Click the "+" button or "Add Action App" on the canvas:
+  7. ACTION SETUP — Click the "Add Action App" or "+" button on the canvas:
      - Search for "Gmail" and select it
      - Select action event: "Create Draft"
      - Click Continue
   8. GMAIL ACCOUNT — In the side panel:
-     - If a linked account is shown, click Continue
-     - If not, click "Add an Account" to connect one
+     - When you see the Continue button, click it immediately — the account is already linked
+     - Do NOT click "Add an Account", "Change", "Guide", or any other button
+     - If no Continue button is visible, report an error that the Gmail account is not linked
   9. CONFIGURE DRAFT FIELDS — In the side panel:
-     - Click the "Advance Mode" button to reveal the "To Email" field
-     - Enter a value for "To Email" (e.g., test@example.com)
      - Enter "Test" in the "Subject" field
      - Enter "This is a test email body" in the "Email Body" field
+     - If continue button is disabled, try clicking the "Advance Mode" button to reveal the "To Email" field
+     - Enter a value for "To Email" (e.g., test@example.com)
      - Click "Continue & Run Test"
   10. Click "Activate Connect" button in the top-right corner:
       - If an "Upgrade Plan" popup appears, note the exact message and report it as a blocking issue

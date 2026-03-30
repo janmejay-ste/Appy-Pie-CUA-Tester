@@ -32,6 +32,7 @@ export interface IStep {
   domFingerprint?: string;
   confidence?: number;
   visionUsed?: boolean;
+  mode?: 'dom' | 'vision' | 'vision-burst';
   // Token data
   inputTokens: number;
   outputTokens: number;
@@ -74,6 +75,7 @@ const StepSchema = new Schema({
   domFingerprint: { type: String },
   confidence: { type: Number },
   visionUsed: { type: Boolean, default: false },
+  mode: { type: String, enum: ['dom', 'vision', 'vision-burst'], default: 'dom' },
   // Token data
   inputTokens: { type: Number, default: 0 },
   outputTokens: { type: Number, default: 0 },
@@ -114,6 +116,7 @@ export function stepToTurnToken(s: IStep) {
     cumulative_input: s.cumulativeInput,
     cumulative_output: s.cumulativeOutput,
     cumulative_reasoning: s.cumulativeReasoning,
+    mode: s.mode || 'dom',
     timestamp: s.capturedAt instanceof Date ? s.capturedAt.toISOString() : s.capturedAt,
   };
 }

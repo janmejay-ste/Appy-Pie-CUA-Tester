@@ -16,7 +16,7 @@ const SettingsSchema = new Schema({
   _id: { type: String, default: 'global' },
   maxConcurrency: { type: Number, default: 2 },
   maxTurnsDefault: { type: Number, default: 500 },
-  maxTokensPerSession: { type: Number, default: 200000 },
+  maxTokensPerSession: { type: Number, default: 500000 },
   defaultTimeout: { type: Number, default: 120000 },
   defaultHeadless: { type: Boolean, default: true },
   allowedDomains: { type: [String], default: ['appypieautomate.ai', 'connectcloud.appypie.com'] },

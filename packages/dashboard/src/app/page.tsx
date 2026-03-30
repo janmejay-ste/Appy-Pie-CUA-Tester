@@ -52,6 +52,8 @@ interface TestRun {
   test_id: string;
   test_name: string;
   status: string;
+  started_at: string | null;
+  completed_at: string | null;
   duration_ms: number | null;
   turn_count: number;
   screenshot_count: number;
@@ -1073,9 +1075,14 @@ export default function DashboardPage() {
 
         const cardBorderClass = (status: string) => {
           switch (status) {
-            case 'running': return 'border-l-2 border-l-blue-500';
-            case 'queued': return 'border-l-2 border-l-amber-500';
-            default: return '';
+            case 'passed': return 'border-l-[3px] border-l-emerald-500';
+            case 'failed': return 'border-l-[3px] border-l-red-500';
+            case 'error': return 'border-l-[3px] border-l-orange-500';
+            case 'running': return 'border-l-[3px] border-l-blue-500';
+            case 'queued': return 'border-l-[3px] border-l-amber-500';
+            case 'timeout': return 'border-l-[3px] border-l-yellow-500';
+            case 'aborted': return 'border-l-[3px] border-l-gray-500';
+            default: return 'border-l-[3px] border-l-gray-700';
           }
         };
 
@@ -1096,8 +1103,11 @@ export default function DashboardPage() {
                       onClick={() => toggleCategory(group.category)}
                     >
                       <div className="flex items-center gap-3">
-                        <svg className={`w-4 h-4 text-gray-500 transition-transform ${isCollapsed ? '' : 'rotate-90'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                        <svg className="w-5 h-5 text-gray-400 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          {isCollapsed
+                            ? <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" />
+                            : <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                          }
                         </svg>
                         <span className={`text-xs px-2 py-0.5 rounded border font-semibold ${categoryBadgeClass(group.category)}`}>
                           {group.category.toUpperCase()}
@@ -1117,82 +1127,85 @@ export default function DashboardPage() {
 
                     {/* Cards grid */}
                     {!isCollapsed && (
-                      <div className="px-5 pb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                      <div className="px-5 grid grid-cols-1 md:grid-cols-2 gap-4" style={{ paddingBottom: '2rem', marginBottom: '0.5rem' }}>
                         {group.tests.map(test => {
                           const run = getTestRunForTest(test.id);
                           const runStatus = run?.status || 'not_run';
-                          const runStatusLabel = run ? run.status.charAt(0).toUpperCase() + run.status.slice(1) : 'Not run';
                           const isRunning = runStatus === 'running';
                           const isQueued = runStatus === 'queued';
-                          const isCompleted = ['passed', 'failed', 'error', 'timeout'].includes(runStatus);
+                          const isCompleted = ['passed', 'failed', 'error', 'timeout', 'aborted'].includes(runStatus);
+                          const isFailed = runStatus === 'failed' || runStatus === 'error';
+
+                          const durationMs = run?.duration_ms;
+                          const durationStr = durationMs ? (durationMs >= 60000 ? `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s` : `${Math.round(durationMs / 1000)}s`) : null;
+                          const lastRunStr = run?.completed_at ? (() => {
+                            const secs = Math.round((Date.now() - new Date(run.completed_at).getTime()) / 1000);
+                            if (secs < 60) return `${secs}s ago`;
+                            if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+                            if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+                            return `${Math.floor(secs / 86400)}d ago`;
+                          })() : run?.started_at ? 'just now' : 'never';
 
                           return (
                             <div
                               key={test.id}
-                              className={`bg-gray-800/50 border border-gray-700/50 rounded-lg p-4 hover:border-gray-600 transition-colors flex flex-col justify-between min-h-[90px] ${cardBorderClass(runStatus)} ${isCompleted ? 'cursor-pointer' : ''}`}
-                              onClick={() => { if (isCompleted && run?.id) window.location.href = `/runs/${run.id}`; }}
+                              className={`bg-gray-900 border border-gray-800 rounded-xl hover:bg-gray-800/80 hover:border-gray-700 transition-all duration-200 py-5 px-6 ${cardBorderClass(runStatus)} ${isCompleted || isRunning ? 'cursor-pointer' : ''}`}
+                              onClick={() => { if ((isCompleted || isRunning) && run?.id) window.location.href = `/runs/${run.id}`; }}
                             >
-                              {/* Top row: name + category badge */}
-                              <div className="flex items-start justify-between gap-2 mb-3">
-                                <h3 className="font-semibold text-gray-50 text-sm leading-tight truncate">{test.name}</h3>
-                                <span className={`flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded border font-semibold ${categoryBadgeClass(test.category || 'sanity')}`}>
-                                  {(test.category || 'sanity').toUpperCase()}
-                                </span>
-                              </div>
-                              {/* Bottom row: status + view link + run button */}
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-3">
-                                  <div className="flex items-center gap-1.5">
-                                    <span className={`w-2 h-2 rounded-full ${statusDot(runStatus)}`} />
-                                    <span className={`text-xs font-medium ${statusText(runStatus)}`}>{runStatusLabel}</span>
-                                  </div>
-                                  {isCompleted && run?.id && (
-                                    <a
-                                      href={`/runs/${run.id}`}
-                                      onClick={(e) => e.stopPropagation()}
-                                      className="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
-                                    >
-                                      View Result &rarr;
-                                    </a>
-                                  )}
+                              {/* Row 1: badge + name + status pill */}
+                              <div className="flex items-center justify-between gap-3 mb-2">
+                                <div className="flex items-center gap-4 min-w-0">
+                                  <span className={`flex-shrink-0 text-[10px] px-2 py-0.5 rounded border font-bold ${categoryBadgeClass(test.category || 'sanity')}`}>
+                                    {(test.category || 'sanity').toUpperCase()}
+                                  </span>
+                                  <h3 className="font-semibold text-gray-50 text-sm leading-snug truncate">{test.name}</h3>
                                 </div>
+                                {/* Status pill */}
+                                {isRunning ? (
+                                  <span className="flex-shrink-0 flex items-center gap-1.5 text-[11px] font-bold px-3 py-1 rounded-md bg-blue-500 text-white whitespace-nowrap">
+                                    Running...
+                                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                                  </span>
+                                ) : isQueued ? (
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-amber-500 text-white">Queued</span>
+                                ) : runStatus === 'passed' ? (
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-emerald-500 text-white">Passed</span>
+                                ) : runStatus === 'failed' ? (
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-red-500 text-white">Failed</span>
+                                ) : runStatus === 'error' ? (
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-orange-500 text-white">Error</span>
+                                ) : runStatus === 'timeout' ? (
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-yellow-500 text-gray-900">Timeout</span>
+                                ) : runStatus === 'aborted' ? (
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-gray-500 text-white">Aborted</span>
+                                ) : (
+                                  <span className="flex-shrink-0 text-[10px] font-medium text-gray-500">Not Run</span>
+                                )}
+                              </div>
+                              {/* Row 2: meta + buttons */}
+                              <div className="flex items-center justify-between mt-1">
+                                <span className="text-xs text-gray-500">
+                                  {(test.category || 'sanity').toUpperCase()}
+                                  {' '}&middot; Last run: {lastRunStr}
+                                  {durationStr && <> &middot; Duration: {durationStr}</>}
+                                </span>
                                 <div className="flex items-center gap-2">
-                                  {isRunning && run?.id && (
+                                  {isFailed && run?.id && (
                                     <a
                                       href={`/runs/${run.id}`}
                                       onClick={(e) => e.stopPropagation()}
-                                      className="text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+                                      className="text-xs px-3 py-1 rounded-md border border-gray-600 text-gray-300 hover:bg-gray-700/50 transition-colors whitespace-nowrap"
                                     >
-                                      View Details &rarr;
+                                      View Error
                                     </a>
                                   )}
-                                  {isRunning ? (
-                                    <button
-                                      disabled
-                                      className="text-xs px-2.5 py-1 bg-blue-600/20 text-blue-400 rounded-md flex items-center gap-1.5 opacity-80 cursor-not-allowed"
-                                    >
-                                      <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                                      </svg>
-                                      Running...
-                                    </button>
-                                  ) : isQueued ? (
-                                    <button
-                                      disabled
-                                      className="text-xs px-2.5 py-1 bg-amber-600/20 text-amber-400 rounded-md opacity-80 cursor-not-allowed"
-                                    >
-                                      Queued
-                                    </button>
-                                  ) : (
-                                    <button
-                                      onClick={(e) => { e.stopPropagation(); runSingleTest(test.id); }}
-                                      disabled={running}
-                                      className="text-xs px-2.5 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded-md transition-colors"
-                                    >
-                                      Run
-                                    </button>
-                                  )}
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); runSingleTest(test.id); }}
+                                    disabled={running || isRunning || isQueued}
+                                    className="text-xs text-blue-400 hover:text-blue-300 hover:underline cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+                                  >
+                                    Run
+                                  </button>
                                 </div>
                               </div>
                             </div>
@@ -1562,8 +1575,11 @@ export default function DashboardPage() {
                             <button
                               onClick={() => setTestMenuOpen(testMenuOpen === test.id ? null : test.id)}
                               className="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded-md transition-colors"
+                              title="More actions"
                             >
-                              ...
+                              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                                <path d="M10 6a2 2 0 110-4 2 2 0 010 4zM10 12a2 2 0 110-4 2 2 0 010 4zM10 18a2 2 0 110-4 2 2 0 010 4z" />
+                              </svg>
                             </button>
                             {testMenuOpen === test.id && (
                               <div className="absolute right-0 mt-1 w-36 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 py-1">

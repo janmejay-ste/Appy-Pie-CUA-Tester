@@ -55,6 +55,73 @@ export class PlaywrightAdapter implements ExecutionAdapter {
     } catch {}
     const maxElements = viewportHeight < 800 ? BASE_MAX_ELEMENTS : Math.min(70, BASE_MAX_ELEMENTS + 35);
 
+    // Remove trap elements + auto-recover from expanded layout
+    await this.activePage.evaluate(`(() => {
+      // AUTO-RECOVER: If expand was clicked, the Minimize button will be visible — click it to restore layout
+      var minimizeBtn = document.querySelector('[data-tooltip="Minimize"]');
+      if (!minimizeBtn) {
+        // Also check by SVG pattern: polyline points="4 14 10 14 10 20" is the minimize icon
+        document.querySelectorAll('button.rotate-180, button svg polyline').forEach(function(poly) {
+          if ((poly.getAttribute('points') || '').includes('4 14 10 14 10 20')) {
+            minimizeBtn = poly.closest('button');
+          }
+        });
+      }
+      if (minimizeBtn) {
+        minimizeBtn.click();
+        console.log('[dom-cleanup] Auto-clicked Minimize to restore layout');
+      }
+
+      // Remove forgot password, social login links
+      document.querySelectorAll('a').forEach(function(el) {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        var text = (el.textContent || '').trim().toLowerCase();
+        if (href.includes('forgot') || href.includes('forgotpassword') ||
+            text.includes('forgot password') || text.includes('forgot your password') ||
+            text === 'forgot' ||
+            href.includes('signup') || href.includes('register') ||
+            text.includes('sign in with google') || text.includes('sign in with apple') ||
+            text.includes('sign in with facebook')) {
+          el.remove();
+        }
+      });
+      // Remove expand/fullscreen buttons — they break the layout
+      document.querySelectorAll('[data-tooltip="Expand"], [data-tooltip="Full Screen"], [data-tooltip="Maximize"]').forEach(function(el) {
+        el.remove();
+      });
+      // Remove by SVG pattern: polyline points="15 3 21 3" is the expand icon
+      document.querySelectorAll('button').forEach(function(el) {
+        var svg = el.querySelector('svg polyline[points*="15 3 21 3"]');
+        if (svg) el.remove();
+      });
+
+      // Remove Guide button (question circle icon) — model must never click it
+      document.querySelectorAll('#step_guide_Btn, .step_guide, [tooltip="Guide"], button[id*="guide"]').forEach(function(el) {
+        el.remove();
+      });
+      // Also remove by icon class pattern
+      document.querySelectorAll('button .fa-question-circle').forEach(function(icon) {
+        var btn = icon.closest('button');
+        if (btn) btn.remove();
+      });
+
+      // Remove "Add an Account" / "Change" buttons — model should only click Continue
+      // Only remove if Continue button is already visible (account is linked)
+      var continueBtn = document.querySelector('[data-track="continue with account"] , [data-track="continue"] , .continue button');
+      if (continueBtn) {
+        document.querySelectorAll('[data-track="add account"], [data-track="change account"]').forEach(function(el) { el.remove(); });
+        // Remove "Change" links next to account entries
+        document.querySelectorAll('a').forEach(function(el) {
+          var text = (el.textContent || '').trim().toLowerCase();
+          if (text === 'change' || text === 'add an account' || text === 'add account') el.remove();
+        });
+        // Remove "Request a demo" links
+        document.querySelectorAll('a').forEach(function(el) {
+          if ((el.textContent || '').trim().toLowerCase().includes('request a demo')) el.remove();
+        });
+      }
+    })()`).catch(() => {});
+
     let rawData: any;
     try {
       // IMPORTANT: Use string-based evaluate to avoid tsx/esbuild __name injection
@@ -161,11 +228,19 @@ export class PlaywrightAdapter implements ExecutionAdapter {
           // Skip expand/fullscreen/maximize buttons and WhatsApp widget
           var elClass = (el.getAttribute('class') || '').toLowerCase();
           var elTitle = (el.getAttribute('title') || el.getAttribute('aria-label') || '').toLowerCase();
+          var elTooltip = (el.getAttribute('data-tooltip') || el.getAttribute('data-original-title') || '').toLowerCase();
           var elText = (el.textContent || '').trim().toLowerCase();
           if (elClass.includes('expand') || elClass.includes('fullscreen') || elClass.includes('maximize') ||
               elTitle.includes('expand') || elTitle.includes('fullscreen') || elTitle.includes('maximize') ||
+              elTooltip.includes('expand') || elTooltip.includes('fullscreen') || elTooltip.includes('maximize') ||
               elClass.includes('whatsapp') || elClass.includes('wa-widget') ||
-              (tag === 'svg' && el.closest && el.closest('[class*="expand"]'))) continue;
+              elClass.includes('custom-options-tooltip') ||
+              (tag === 'svg' && el.closest && el.closest('[data-tooltip="Expand"]')) ||
+              (tag === 'svg' && el.closest && el.closest('[class*="expand"]')) ||
+              (tag === 'button' && el.querySelector && el.querySelector('svg polyline[points*="15 3 21 3"]')) ||
+              elClass.includes('step_guide') || el.id === 'step_guide_Btn' ||
+              (el.getAttribute('tooltip') || '').toLowerCase() === 'guide' ||
+              (tag === 'button' && el.querySelector && el.querySelector('.fa-question-circle'))) continue;
 
           var cssSelector = '';
           if (el.id) cssSelector = '#' + el.id;
@@ -221,9 +296,11 @@ export class PlaywrightAdapter implements ExecutionAdapter {
 
     // Assign indices + stable elementId, filter out trap elements
     const BLOCKED_TEXTS = [
-      'forgot password', 'forgot your password',
+      'forgot password', 'forgot your password', 'forgot',
       'sign in with google', 'sign in with apple', 'sign in with facebook', 'sign in with microsoft',
-      'guide', 'example', 'choose your preferred', 'take a tour', 'watch tutorial', 'help center',
+      'sign up', 'create account', 'register',
+      'guide', 'choose your preferred', 'take a tour', 'watch tutorial', 'help center',
+      'request a demo',
     ];
     const elements: IndexedElement[] = rawData.elements
       .map((el: any, i: number) => ({
@@ -329,6 +406,7 @@ export class PlaywrightAdapter implements ExecutionAdapter {
       // Priority: label (Appy Pie checkboxes) → a → li → button → div → span
       const clicked = await this.activePage.evaluate(`(() => {
         var searchText = ${JSON.stringify(text.toLowerCase())};
+        var blocked = ['forgot', 'sign up', 'create account', 'register', 'sign in with', 'google sign', 'apple sign'];
         var selectors = ['label', '.form-checkbox', 'a', 'li', 'button', 'div', 'span', 'p'];
         for (var si = 0; si < selectors.length; si++) {
           var els = document.querySelectorAll(selectors[si]);
@@ -336,6 +414,11 @@ export class PlaywrightAdapter implements ExecutionAdapter {
             var el = els[ei];
             var elText = (el.textContent || '').trim().toLowerCase();
             if (elText.length < 2 || elText.length > 150) continue;
+            var isBlocked = false;
+            for (var bi = 0; bi < blocked.length; bi++) { if (elText.includes(blocked[bi])) { isBlocked = true; break; } }
+            if (isBlocked) continue;
+            var href = (el.getAttribute('href') || '').toLowerCase();
+            if (href.includes('forgot') || href.includes('signup') || href.includes('register')) continue;
             if (!elText.includes(searchText) && searchText.length > 3) continue;
             if (elText === searchText || elText.startsWith(searchText) || elText.includes(searchText)) {
               var rect = el.getBoundingClientRect();
