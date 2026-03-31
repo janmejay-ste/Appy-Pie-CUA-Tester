@@ -1153,33 +1153,33 @@ export default function DashboardPage() {
                               onClick={() => { if ((isCompleted || isRunning) && run?.id) window.location.href = `/runs/${run.id}`; }}
                             >
                               {/* Row 1: badge + name + status pill */}
-                              <div className="flex items-center justify-between gap-3 mb-2">
-                                <div className="flex items-center gap-4 min-w-0">
+                              <div className="flex items-center gap-3 mb-2">
+                                <div className="flex items-center gap-4 min-w-0 flex-1">
                                   <span className={`flex-shrink-0 text-[10px] px-2 py-0.5 rounded border font-bold ${categoryBadgeClass(test.category || 'sanity')}`}>
                                     {(test.category || 'sanity').toUpperCase()}
                                   </span>
                                   <h3 className="font-semibold text-gray-50 text-sm leading-snug truncate">{test.name}</h3>
                                 </div>
-                                {/* Status pill */}
+                                {/* Status pill — solid colors visible on any background */}
                                 {isRunning ? (
                                   <span className="flex-shrink-0 flex items-center gap-1.5 text-[11px] font-bold px-3 py-1 rounded-md bg-blue-500 text-white whitespace-nowrap">
                                     Running...
                                     <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
                                   </span>
                                 ) : isQueued ? (
-                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-amber-500 text-white">Queued</span>
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-amber-500 text-white whitespace-nowrap">Queued</span>
                                 ) : runStatus === 'passed' ? (
-                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-emerald-500 text-white">Passed</span>
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-emerald-500 text-white whitespace-nowrap">Passed</span>
                                 ) : runStatus === 'failed' ? (
-                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-red-500 text-white">Failed</span>
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-red-500 text-white whitespace-nowrap">Failed</span>
                                 ) : runStatus === 'error' ? (
-                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-orange-500 text-white">Error</span>
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-orange-500 text-white whitespace-nowrap">Error</span>
                                 ) : runStatus === 'timeout' ? (
-                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-yellow-500 text-gray-900">Timeout</span>
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-yellow-500 text-gray-900 whitespace-nowrap">Timeout</span>
                                 ) : runStatus === 'aborted' ? (
-                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-gray-500 text-white">Aborted</span>
+                                  <span className="flex-shrink-0 text-[10px] font-bold px-3 py-1 rounded-md bg-gray-500 text-white whitespace-nowrap">Aborted</span>
                                 ) : (
-                                  <span className="flex-shrink-0 text-[10px] font-medium text-gray-500">Not Run</span>
+                                  <span className="flex-shrink-0 text-[10px] font-medium text-gray-400 whitespace-nowrap">Not Run</span>
                                 )}
                               </div>
                               {/* Row 2: meta + buttons */}

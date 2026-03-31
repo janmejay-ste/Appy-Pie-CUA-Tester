@@ -7,6 +7,8 @@ import { PlaywrightAdapter, executeValidatedAction } from './adapter/index.js';
 import type { ActionStep, BrowserState } from './adapter/types.js';
 import type { ValidatedResult } from './adapter/action-engine.js';
 import type { CUALoopCallbacks, TurnTokenUsage, CUALoopResult, PageState, ScreenshotRecord, TestAccountConfig } from './types.js';
+import { VisionDecisionEngine } from './vision-decision.js';
+import type { VisionBrowserState, VisionActionResult, VisionDecision } from './vision-decision.js';
 
 // Re-export for backward compatibility
 export type { CUALoopCallbacks, TurnTokenUsage, CUALoopResult, PageState };
@@ -34,7 +36,8 @@ CRITICAL:
 9. NEVER click expand/fullscreen/maximize buttons (diagonal arrows icon) on side panels — they break the layout
 10. If the page shows a loading spinner or is mostly empty, use action "wait" with value "3000" — do NOT navigate away or go back. The page is loading.
 11. NEVER use "navigate" to go back to a previous page or restart the flow. Always move FORWARD through the steps.
-12. When done: {"action":"done","verdict":"PASS/FAIL","summary":"...","stepsCompleted":[...],"issuesFound":[]}`;
+12. ACCOUNT SETUP: When you see a linked account with a "Continue" button, ALWAYS click Continue. NEVER click "Add an Account", "Change", "Connect Account", or "Reconnect" — the account is already linked.
+13. When done: {"action":"done","verdict":"PASS/FAIL","summary":"...","stepsCompleted":[...],"issuesFound":[]}`;
 
 // ── Helpers ─────────────────────────────────────────────────────
 async function saveScreenshotToDisk(
@@ -182,14 +185,19 @@ async function runCUALoopDOM(
   let visionTurnsUsed = 0;
   let useVisionNextTurn = false;
 
-  // Stuck detection
+  // Stuck detection (OLD — kept for parallel comparison)
   let lastDOMFingerprint = '';
   let consecutiveSameDOM = 0;
   let lastActionSig = '';
   let consecutiveSameAction = 0;
   let consecutiveFailures = 0;
-  const STUCK_THRESHOLD = 4;  // triggers vision fallback after 4 same-state turns
+  const STUCK_THRESHOLD = 4;
   const LOW_CONFIDENCE = 0.4;
+
+  // ── NEW: Vision Decision Engine (parallel — log only, don't act) ──
+  const visionEngine = new VisionDecisionEngine();
+  let previousElementCount = 0;
+  let lastVisionDecision: VisionDecision | null = null;
 
   // Agent memory (overwritten each turn, NOT accumulated)
   let agentMemory = 'Starting test';
@@ -240,6 +248,7 @@ async function runCUALoopDOM(
 
   // ── Get initial DOM state ──────────────────────────────────────
   let state = await adapter.getState();
+  previousElementCount = state.elements.length; // initialize from first state
 
   if (state.elements.length < 3) {
     console.log(`[cua] Few DOM elements (${state.elements.length}), starting with vision`);
@@ -650,6 +659,44 @@ async function runCUALoopDOM(
 
     callbacks.onActionsExecuted(turn, [{ type: action.action, ...action }]);
 
+    // ── NEW: Feed action result to Vision Decision Engine ──────
+    visionEngine.setCurrentTurn(turn);
+    const visionActionResult: VisionActionResult = {
+      success: result.success,
+      effective: result.effective,
+      error: result.error,
+      urlChanged: result.validation.urlChanged,
+      domChanged: result.validation.domChanged,
+      valueChanged: result.validation.valueChanged,
+      intentMatch: result.validation.intentMatch,
+      elementStillExists: result.validation.elementStillExists,
+      isNetworkError: !!(result.error && (
+        result.error.includes('ECONNREFUSED') || result.error.includes('ETIMEDOUT') ||
+        result.error.includes('net::') || result.error.includes('ERR_CONNECTION')
+      )),
+    };
+    const failureType = visionEngine.classifyFailure(visionActionResult, result.error);
+    if (failureType) {
+      visionEngine.recordFailure({ type: failureType, turn, target: action.target, description: result.description });
+    } else if (result.success && result.effective) {
+      // Successful action — decay failure history
+      visionEngine.recordSuccess();
+    }
+    // Track progress
+    if (result.success && result.effective) {
+      if (result.validation.urlChanged) {
+        visionEngine.recordProgress('strong');
+      } else if (result.validation.domChanged || result.validation.valueChanged) {
+        visionEngine.recordProgress('weak');
+      }
+    }
+    // Feedback: if last turn used vision, record effectiveness
+    if (lastVisionDecision && lastVisionDecision.mode !== 'dom') {
+      visionEngine.recordVisionOutcome(result.validation.domChanged, result.success && result.effective);
+      visionEngine.startCooldown();
+    }
+
+    // OLD stuck detection (kept for now — parallel comparison)
     if (result.success && result.effective) {
       consecutiveFailures = 0;
     } else if (!result.success) {
@@ -811,6 +858,28 @@ async function runCUALoopDOM(
       useVisionNextTurn = true;
       if (isStuck) console.log(`[cua] Stuck (sameDom=${consecutiveSameDOM}, sameAction=${consecutiveSameAction}, failures=${consecutiveFailures}). Vision next.`);
     }
+
+    // ── NEW: Vision Decision Engine (parallel — log only) ────────
+    const visionState: VisionBrowserState = {
+      elementCount: state.elements.length,
+      previousElementCount: previousElementCount,
+      hasCanvas: state.hasCanvas,
+      duplicateTextCount: state.duplicateTextCount,
+      domFingerprint: state.domFingerprint,
+      url: await adapter.getUrl(),
+    };
+    previousElementCount = state.elements.length;
+
+    lastVisionDecision = visionEngine.decide(
+      visionState,
+      action.confidence,
+      allowedDomains,
+      EXTERNAL_TRAPS,
+    );
+
+    // Log both old and new decisions for comparison
+    const oldDecision = useVisionNextTurn ? (consecutiveSameDOM >= (STUCK_THRESHOLD + 2) ? 'full-vision' : 'vision-fallback') : 'dom';
+    console.log(`[vision-engine] T${turn} | score=${lastVisionDecision.visionScore.toFixed(2)} mode=${lastVisionDecision.mode} old=${oldDecision} | path=[${lastVisionDecision.decisionPath.join(' → ')}] | signals: sameDOM=${lastVisionDecision.signals.sameDOM.toFixed(2)} failure=${lastVisionDecision.signals.failureScore.toFixed(2)} intent=${lastVisionDecision.signals.intentMismatch.toFixed(2)} lowEl=${lastVisionDecision.signals.lowElements.toFixed(2)} stuck=${lastVisionDecision.signals.stuckDuration.toFixed(2)} | feedback: adj=${lastVisionDecision.feedback.adjustment.toFixed(2)} rate=${lastVisionDecision.feedback.visionSuccessRate}`);
 
     // ── Vision burst: delegate to vision CUA loop when truly stuck ──
     // Instead of just adding a screenshot to the DOM prompt, actually run

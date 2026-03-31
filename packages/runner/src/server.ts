@@ -408,7 +408,19 @@ export function createServer(): express.Express {
           }
         }
       }
-      res.json({ success: true, created, updated, unchanged, total: yamlTests.length });
+
+      // Deactivate DB entries whose YAML files no longer exist (handles renames/deletes)
+      const yamlIds = new Set(yamlTests.map(t => t.id));
+      const allDbTests = await TestDef.find({ isActive: true });
+      let deactivated = 0;
+      for (const dbTest of allDbTests) {
+        if (!yamlIds.has(dbTest._id)) {
+          await TestDef.updateOne({ _id: dbTest._id }, { $set: { isActive: false } });
+          deactivated++;
+        }
+      }
+
+      res.json({ success: true, created, updated, unchanged, deactivated, total: yamlTests.length });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

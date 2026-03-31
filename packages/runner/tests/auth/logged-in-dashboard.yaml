@@ -12,10 +12,10 @@ instructions: |
      - "Create Connect" button visible in the sidebar
   4. Click on "My Connects" in the sidebar — verify the connects list loads with columns: Name, ID, Apps, Created On, Last edit, Actions
   5. Click on "Task History" in the sidebar — verify it loads with a list/table of past task executions
-     - if it displaying null ignore it but report if it shows a emptypage not 503 error
+     - if it displaying null ignore it but report if it shows a empty page not 503 error
   6. Click on "Linked Accounts" in the sidebar — verify it shows connected app accounts
-  7. Click on "MCP" in the sidebar — verify the MCP page loads if it displaying null ignore it but report if it shows a emptypage not 503 error
-  8. Click on "Tools" in the sidebar — verify the Tools page loads if it displaying null ignore it but report if it shows a emptypage not 503 error
+  7. Click on "MCP" in the sidebar — verify the MCP page loads if it displaying null ignore it but report if it shows a empty page not 503 error
+  8. Click on "Tools" in the sidebar — verify the Tools page loads if it displaying null ignore it but report if it shows a empty page not 503 error
   9. Verify the "Create Connect" button is clickable (click it but do NOT proceed with creating a connect — just verify it opens the builder, then navigate back)
   10. Click on the user profile icon/avatar in the top-right corner — verify a dropdown/menu appears with options like Profile, Billing, Logout
   11. Click on "Profile" or "Account Settings" — verify the profile/account page loads with user information

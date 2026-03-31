@@ -67,10 +67,36 @@ export class PlaywrightAdapter implements ExecutionAdapter {
           }
         });
       }
+      if (!minimizeBtn) {
+        // Check for expanded panel state: panel takes >90% of viewport width
+        var panel = document.querySelector('.halfcolume, [class*="half-column"], [class*="sidebar-content"], [class*="trigger-details"], [class*="action-details"]');
+        if (panel) {
+          var panelRect = panel.getBoundingClientRect();
+          if (panelRect.width > window.innerWidth * 0.85) {
+            // Panel is expanded — find any collapse/minimize button inside it
+            var collapseBtn = panel.querySelector('[data-tooltip="Minimize"], [data-tooltip="Collapse"], button.rotate-180');
+            if (!collapseBtn) {
+              // Try the panel toggle icon at top-right of the panel
+              collapseBtn = panel.querySelector('button:last-child') || panel.querySelector('svg').closest('button');
+            }
+            if (collapseBtn) minimizeBtn = collapseBtn;
+          }
+        }
+      }
       if (minimizeBtn) {
         minimizeBtn.click();
         console.log('[dom-cleanup] Auto-clicked Minimize to restore layout');
       }
+      // Also remove ALL expand buttons more aggressively
+      document.querySelectorAll('[data-tooltip="Expand"], [data-tooltip="Full Screen"], [data-tooltip="Maximize"], [data-tooltip="Full screen"]').forEach(function(el) { el.remove(); });
+      document.querySelectorAll('button').forEach(function(el) {
+        var tooltip = (el.getAttribute('data-tooltip') || el.getAttribute('title') || el.getAttribute('aria-label') || '').toLowerCase();
+        if (tooltip.includes('expand') || tooltip.includes('full screen') || tooltip.includes('maximize') || tooltip.includes('fullscreen')) el.remove();
+        var svg = el.querySelector('svg polyline[points*="15 3 21 3"]');
+        if (svg) el.remove();
+        // Also catch custom-options-tooltip class
+        if (el.classList.contains('custom-options-tooltip')) el.remove();
+      });
 
       // Remove forgot password, social login links
       document.querySelectorAll('a').forEach(function(el) {
@@ -106,14 +132,34 @@ export class PlaywrightAdapter implements ExecutionAdapter {
       });
 
       // Remove "Add an Account" / "Change" buttons — model should only click Continue
-      // Only remove if Continue button is already visible (account is linked)
-      var continueBtn = document.querySelector('[data-track="continue with account"] , [data-track="continue"] , .continue button');
+      // Find Continue button by ANY method
+      var continueBtn = null;
+      document.querySelectorAll('button, a, [role="button"]').forEach(function(el) {
+        var text = (el.textContent || '').trim().toLowerCase();
+        var track = (el.getAttribute('data-track') || '').toLowerCase();
+        if (text === 'continue' || text === 'continue & run test' || text === 'skip run test' ||
+            track.includes('continue')) {
+          continueBtn = el;
+        }
+      });
+      // Also check .continue class container
+      if (!continueBtn) continueBtn = document.querySelector('.continue button, [data-track*="continue"]');
+
       if (continueBtn) {
-        document.querySelectorAll('[data-track="add account"], [data-track="change account"]').forEach(function(el) { el.remove(); });
-        // Remove "Change" links next to account entries
-        document.querySelectorAll('a').forEach(function(el) {
+        // Remove ALL account-related buttons/links that could trigger OAuth
+        document.querySelectorAll('button, a, [role="button"]').forEach(function(el) {
+          if (el === continueBtn) return; // keep Continue
           var text = (el.textContent || '').trim().toLowerCase();
-          if (text === 'change' || text === 'add an account' || text === 'add account') el.remove();
+          var href = (el.getAttribute('href') || '').toLowerCase();
+          var track = (el.getAttribute('data-track') || '').toLowerCase();
+          if (text === 'change' || text === 'add an account' || text === 'add account' ||
+              text === 'connect account' || text === 'connect an account' || text === 'reconnect' ||
+              text.includes('add an account') || text.includes('add account') ||
+              href.includes('/app/auth/') || href.includes('connectauth') ||
+              track.includes('add account') || track.includes('change account') ||
+              track.includes('connect account')) {
+            el.remove();
+          }
         });
         // Remove "Request a demo" links
         document.querySelectorAll('a').forEach(function(el) {

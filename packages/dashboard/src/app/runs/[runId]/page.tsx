@@ -243,7 +243,7 @@ export default function RunDetailPage() {
               >
                 {rerunning ? 'Starting...' : 'Re-Test'}
               </button>
-              {run.status === 'timeout' && (
+              {(run.status === 'timeout' || run.status === 'error' || run.status === 'aborted') && (
                 <button
                   onClick={async () => {
                     const moreTurns = run.turn_count + 20;
