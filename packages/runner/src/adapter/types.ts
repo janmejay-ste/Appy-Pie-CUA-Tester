@@ -38,9 +38,24 @@ export interface ActionResult {
 
 export type ActionType = 'click' | 'type' | 'select' | 'scroll' | 'navigate' | 'keypress' | 'wait' | 'done';
 
+// Structured target shape. Prefer elementId; fall back to text / domPath / index.
+// The LLM may still emit a bare string elementId — normalize via coerceLegacyTarget()
+// at the parser boundary (see adapter/target.ts).
+export interface ActionTarget {
+  elementId?: string;
+  text?: string;
+  domPath?: string;
+  index?: number;
+}
+
+// Transition-period union — ActionStep.target accepts either shape.
+// Downstream code should call coerceLegacyTarget() or resolveTargetElement()
+// rather than consuming this raw.
+export type ActionTargetLike = ActionTarget | string;
+
 export interface ActionStep {
   action: ActionType;
-  target?: string;        // stable elementId (hash) like "a1b2c3"
+  target?: ActionTargetLike;   // legacy string OR structured object — see adapter/target.ts
   value?: string;         // text to type, URL to navigate, key to press
   reason?: string;        // short reason for action
   expected?: string;      // expected outcome: "navigate_to_signup", "form_submit", "value_change"
@@ -69,13 +84,31 @@ export interface ExecutionAdapter {
   clickByPanelText(text: string): Promise<ActionResult>;  // search entire page for text match & click
   selectAppyPieEvent(eventText: string): Promise<ActionResult>;  // select event from checkbox list + click Continue
   openAndSelectDropdown(dropdownLabel: string, optionText: string): Promise<ActionResult>;  // open Appy Pie custom dropdown → select option
+  insertVariableToken(fieldLabel: string, tokenText: string): Promise<ActionResult>;  // click "+ Add or Select" → pick variable from picker modal
+  autoFillActionFields(): Promise<{ filled: number; fields: string[] }>;  // proactively fill all empty "+ Add or Select" fields on options page
+  clickContinueRunTest(): Promise<ActionResult>;  // wait for "Continue & Run Test" to enable, then click
   typeBySelector(selector: string, text: string): Promise<ActionResult>;
+  typeByContentEditable(selector: string, text: string): Promise<ActionResult>;
   typeByCoordinates(x: number, y: number, text: string): Promise<ActionResult>;
   selectBySelector(selector: string, value: string): Promise<ActionResult>;
   scroll(direction: 'up' | 'down', amount?: number): Promise<ActionResult>;
   navigate(url: string): Promise<ActionResult>;
   keypress(key: string): Promise<ActionResult>;
   wait(ms: number): Promise<ActionResult>;
+  /**
+   * Predicate-driven wait. Polls a JS expression in the page until it returns
+   * truthy, or until timeout. Replaces blind `wait(3000)` with deterministic
+   * "wait for this thing to be true". Returns success=true if predicate met,
+   * effective=true means it actually had to wait (the predicate wasn't already true).
+   */
+  waitUntil(predicate: string, options?: { timeoutMs?: number; pollMs?: number }): Promise<ActionResult>;
+  /**
+   * Evaluate a JS expression in-page and return its value. Used by the
+   * state-aware execution layer to read a single snapshot of DOM signals
+   * (overlayOpen, dropdownOpen, optionsReady, etc.) in one round-trip.
+   * Returns undefined if the expression throws.
+   */
+  evaluateExpr<T = unknown>(expr: string): Promise<T | undefined>;
 
   // Screenshot (for replay only, NOT for model)
   screenshot(path: string): Promise<void>;

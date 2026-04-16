@@ -4,13 +4,17 @@ import OpenAI from 'openai';
 import path from 'path';
 import { v4 as uuid } from 'uuid';
 import IORedis from 'ioredis';
-import { connectMongo } from '../db/mongo.js';
+import { connectDb } from '../db/turso.js';
 import { deadLetterQueue, testExecutionQueue, type TestJobData } from './queue.js';
 import { runCUALoop } from '../cua-loop.js';
 import { launchBrowser } from '../browser.js';
 import { getTestAccount } from '../config.js';
 import * as testService from '../services/test.service.js';
 import * as sessionService from '../services/session.service.js';
+import * as repo from '../db/repo.js';
+import { getSettings, findStuckRuns, updateTestRun, findPreviousTimeoutRun } from '../db/repo.js';
+import { logger } from '../logger.js';
+import type { ScreenshotRecord, StepActionMeta } from '../types.js';
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const openai = new OpenAI();
@@ -40,10 +44,10 @@ function generateReplayVideo(dir: string): Promise<string | null> {
     ];
     execFile('ffmpeg', args, { timeout: 60000 }, (err) => {
       if (err) {
-        console.warn('[video] FFmpeg failed:', err.message);
+        logger.warn({ err: err.message }, '[video] FFmpeg failed');
         resolve(null);
       } else {
-        console.log('[video] Generated replay video:', outputPath);
+        logger.info({ outputPath }, '[video] Generated replay video');
         resolve(outputPath);
       }
     });
@@ -59,7 +63,7 @@ async function mergeScreenshotsAndGenerateVideo(
   const fsPromises = require('fs/promises') as typeof import('fs/promises');
 
   if (!fsSync.existsSync(oldScreenshotDir) || !fsSync.existsSync(newScreenshotDir)) {
-    console.warn('[video] Cannot merge — one or both screenshot dirs missing');
+    logger.warn('[video] Cannot merge — one or both screenshot dirs missing');
     return generateReplayVideo(newScreenshotDir);
   }
 
@@ -93,7 +97,7 @@ async function mergeScreenshotsAndGenerateVideo(
       seq++;
     }
 
-    console.log(`[video] Merged ${oldFiles.length} old + ${newFiles.length} new screenshots (${seq} total)`);
+    logger.info({ oldCount: oldFiles.length, newCount: newFiles.length, total: seq }, '[video] Merged screenshots');
 
     // Generate video from merged screenshots
     const videoPath = await generateReplayVideo(mergedDir);
@@ -111,9 +115,64 @@ async function mergeScreenshotsAndGenerateVideo(
     fsSync.rmSync(mergedDir, { recursive: true, force: true });
     return null;
   } catch (err: any) {
-    console.warn('[video] Screenshot merge failed:', err.message);
+    logger.warn({ err: err.message }, '[video] Screenshot merge failed');
     return generateReplayVideo(newScreenshotDir);
   }
+}
+
+// ── Helper: check token budget and abort if exceeded ────────────
+async function checkTokenBudget(
+  testRunId: string,
+  tokensSoFar: { input: number; output: number; reasoning: number },
+  abortController: AbortController,
+  emitEvent: (type: string, message: string, detail?: string) => Promise<void>,
+) {
+  const totalUsed = tokensSoFar.input + tokensSoFar.output;
+  const currentSettings = await getSettings();
+  const budget = currentSettings.maxTokensPerSession;
+  const usagePercent = Math.round((totalUsed / budget) * 100);
+
+  if (totalUsed > budget) {
+    logger.warn({ totalUsed, budget, testRunId }, '[worker] Token budget exceeded, aborting');
+    emitEvent('run_failed', `Token budget exceeded (${totalUsed.toLocaleString()} / ${budget.toLocaleString()}). Aborting to save costs.`);
+    abortController.abort();
+  } else if (usagePercent >= 80 && usagePercent < 100) {
+    emitEvent('turn_completed', `WARNING: Token usage at ${usagePercent}% (${totalUsed.toLocaleString()} / ${budget.toLocaleString()}). Approaching limit.`);
+  }
+}
+
+// ── Helper: build step data from screenshot + action meta ───────
+function buildStepData(
+  testRunId: string,
+  turn: number,
+  screenshot: ScreenshotRecord,
+  actionMeta?: StepActionMeta,
+) {
+  const base = {
+    _id: screenshot.id,
+    testRunId,
+    turnNumber: turn,
+    filePath: screenshot.file_path,
+    capturedAt: new Date(screenshot.captured_at),
+    pageUrl: screenshot.page_url,
+    pageTitle: screenshot.page_title,
+  };
+
+  if (!actionMeta) return base;
+
+  return {
+    ...base,
+    action: actionMeta.action,
+    result: actionMeta.result,
+    validation: actionMeta.validation,
+    effective: actionMeta.effective,
+    retryStrategy: actionMeta.retryStrategy,
+    memory: actionMeta.memory,
+    nextGoal: actionMeta.nextGoal,
+    domFingerprint: actionMeta.domFingerprint,
+    confidence: actionMeta.confidence,
+    visionUsed: actionMeta.visionUsed,
+  };
 }
 
 async function processTestJob(job: Job<TestJobData>) {
@@ -122,9 +181,17 @@ async function processTestJob(job: Job<TestJobData>) {
     testInstructions, expectedOutcome, testUrl,
     requiresAuth, maxTurns, viewport,
     resumeFromUrl, resumeContext, resumeStorageStatePath,
+    validation: validationRules,
   } = job.data;
 
   const pub = getPublisher();
+
+  // Check if run was already aborted (e.g., by user while job was queued or stalled)
+  const existingRun = await repo.getTestRun(testRunId);
+  if (existingRun && (existingRun.status === 'aborted' || existingRun.status === 'passed' || existingRun.status === 'failed')) {
+    logger.info({ testRunId, status: existingRun.status }, '[worker] Skipping job — run already completed/aborted');
+    return; // Don't process — job is stale
+  }
 
   // Mark running
   const startedAt = new Date();
@@ -139,24 +206,35 @@ async function processTestJob(job: Job<TestJobData>) {
   // Listen for abort signals via Redis
   const abortSub = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
   await abortSub.subscribe(`abort:${testRunId}`);
-  abortSub.on('message', () => {
+  abortSub.once('message', () => {
     abortController.abort();
-    abortSub.unsubscribe().then(() => abortSub.disconnect());
+    abortSub.unsubscribe().then(() => abortSub.disconnect()).catch(() => {});
   });
 
   let seq = 0;
   const emitEvent = async (type: string, message: string, detail?: string) => {
-    const event = await testService.persistEvent({
-      _id: uuid(),
+    const eventId = uuid();
+    const timestamp = new Date();
+    await testService.persistEvent({
+      _id: eventId,
       testRunId,
       sequence: ++seq,
       type,
       message,
       detail: detail ?? null,
-      timestamp: new Date(),
+      timestamp,
     });
     // Publish to Redis for SSE relay
-    await pub.publish(`events:${testRunId}`, JSON.stringify(event.toJSON()));
+    const eventPayload = {
+      id: eventId,
+      test_run_id: testRunId,
+      sequence: seq,
+      type,
+      message,
+      detail: detail ?? null,
+      timestamp: timestamp.toISOString(),
+    };
+    await pub.publish(`events:${testRunId}`, JSON.stringify(eventPayload));
   };
 
   const screenshotDir = path.resolve(process.cwd(), 'data', 'screenshots', testId, testRunId);
@@ -190,10 +268,10 @@ async function processTestJob(job: Job<TestJobData>) {
 
     const testAccount = requiresAuth ? getTestAccount() : undefined;
     if (testAccount) {
-      console.log(`[worker] Credentials loaded for run ${testRunId}: email=${testAccount.email}, password=${'*'.repeat(testAccount.password.length - 2) + testAccount.password.slice(-2)}`);
+      logger.info({ testRunId, email: testAccount.email }, '[worker] Credentials loaded for run');
       await emitEvent('auth_info', `Test requires auth — using account: ${testAccount.email}`);
     } else {
-      console.log(`[worker] No credentials for run ${testRunId} (requiresAuth=${requiresAuth})`);
+      logger.info({ testRunId, requiresAuth }, '[worker] No credentials for run');
     }
 
     // Build instructions — for resume, tell model to continue from where it stopped
@@ -218,6 +296,11 @@ YOUR TASK:
 ${testInstructions}`;
     }
 
+    // Pre-load settings once for token budget + CUA mode
+    const settings = await getSettings();
+    const tokenBudget = settings.maxTokensPerSession;
+    const cuaMode = (job.data as any).cuaMode || settings.cuaMode || 'dom';
+
     const result = await runCUALoop(
       openai,
       session.page,
@@ -239,21 +322,7 @@ ${testInstructions}`;
               reasoningTokens: tokensSoFar.reasoning,
               lastHeartbeat: new Date(),
             });
-
-            // Token budget enforcement with early warning
-            const totalUsed = tokensSoFar.input + tokensSoFar.output;
-            const { getSettings: getSettingsNow } = await import('../db/models/Settings.js');
-            const currentSettings = await getSettingsNow();
-            const budget = currentSettings.maxTokensPerSession;
-            const usagePercent = Math.round((totalUsed / budget) * 100);
-
-            if (totalUsed > budget) {
-              console.warn(`[worker] Token budget exceeded: ${totalUsed} > ${budget}. Aborting.`);
-              emitEvent('run_failed', `Token budget exceeded (${totalUsed.toLocaleString()} / ${budget.toLocaleString()}). Aborting to save costs.`);
-              abortController.abort();
-            } else if (usagePercent >= 80 && usagePercent < 100) {
-              emitEvent('turn_completed', `WARNING: Token usage at ${usagePercent}% (${totalUsed.toLocaleString()} / ${budget.toLocaleString()}). Approaching limit.`);
-            }
+            await checkTokenBudget(testRunId, tokensSoFar, abortController, emitEvent);
           }
         },
         onTurnTokens: (turnTokens) => {
@@ -273,37 +342,17 @@ ${testInstructions}`;
           emitEvent('actions_executed', `Turn ${turn}: executed [${summary}]`);
         },
         onScreenshot: (turn, screenshot, actionMeta) => {
-          testService.persistStep({
-            _id: screenshot.id,
-            testRunId,
-            turnNumber: turn,
-            filePath: screenshot.file_path,
-            capturedAt: new Date(screenshot.captured_at),
-            pageUrl: screenshot.page_url,
-            pageTitle: screenshot.page_title,
-            // Action metadata from CUA loop
-            ...(actionMeta ? {
-              action: actionMeta.action,
-              result: actionMeta.result,
-              validation: actionMeta.validation,
-              effective: actionMeta.effective,
-              retryStrategy: actionMeta.retryStrategy,
-              memory: actionMeta.memory,
-              nextGoal: actionMeta.nextGoal,
-              domFingerprint: actionMeta.domFingerprint,
-              confidence: actionMeta.confidence,
-              visionUsed: actionMeta.visionUsed,
-            } : {}),
-          });
+          testService.persistStep(buildStepData(testRunId, turn, screenshot, actionMeta));
           emitEvent('screenshot_captured', `Screenshot captured (turn ${turn})`);
         },
       },
       testAccount,
       abortController.signal,
       maxTurns,
-      (await (await import('../db/models/Settings.js')).getSettings()).maxTokensPerSession,
+      tokenBudget,
       testUrl,
-      (job.data as any).cuaMode || (await (await import('../db/models/Settings.js')).getSettings()).cuaMode || 'dom',
+      cuaMode,
+      validationRules as any,
     );
 
     // Determine final status
@@ -331,20 +380,26 @@ ${testInstructions}`;
 
     await emitEvent('run_completed', `Test ${status}: ${result.verdict}`, result.modelMessage);
 
+    // Generate run log in background
+    void (async () => {
+      try {
+        const { generateRunLog } = await import('../services/runlog.service.js');
+        const logPath = await generateRunLog(testRunId, testId);
+        if (logPath) await emitEvent('log_generated', `Run log generated: ${logPath}`);
+      } catch (err: any) {
+        logger.warn({ err: err.message }, '[worker] Log generation failed');
+      }
+    })();
+
     // Generate replay video in background
-    (async () => {
+    void (async () => {
       try {
         // If resume run, merge old + new screenshots into one video
         if (isResume) {
-          const { TestRun: TestRunModel } = await import('../db/models/TestRun.js');
-          const prevRuns = await TestRunModel.find({
-            testId,
-            status: 'timeout',
-            _id: { $ne: testRunId },
-          }).sort({ completedAt: -1 }).limit(1).lean();
+          const prevRun = await findPreviousTimeoutRun(testId, testRunId);
 
-          if (prevRuns.length > 0) {
-            const prevRunId = prevRuns[0]._id;
+          if (prevRun) {
+            const prevRunId = prevRun.id;
             const oldScreenshotDir = path.resolve(process.cwd(), 'data', 'screenshots', testId, prevRunId);
             const merged = await mergeScreenshotsAndGenerateVideo(oldScreenshotDir, screenshotDir);
             if (merged) {
@@ -357,7 +412,7 @@ ${testInstructions}`;
         const videoPath = await generateReplayVideo(screenshotDir);
         if (videoPath) await emitEvent('video_ready', 'Replay video generated');
       } catch (err: any) {
-        console.warn('[video] Video generation error:', err.message);
+        logger.warn({ err: err.message }, '[video] Video generation error');
       }
     })();
 
@@ -368,7 +423,7 @@ ${testInstructions}`;
 
     // ── Handle abort separately — NEVER retry aborted runs ──
     if (abortController.signal.aborted) {
-      console.log(`[worker] Run ${testRunId} was aborted by user`);
+      logger.info({ testRunId }, '[worker] Run was aborted by user');
       await testService.updateTestRunStatus(testRunId, {
         status: 'aborted',
         completedAt,
@@ -409,6 +464,14 @@ ${testInstructions}`;
 
     await emitEvent('run_failed', `Test error (${isInfraError ? 'infra' : isTestFail ? 'test' : 'unknown'}): ${errorMsg}`);
 
+    // Generate run log for failed runs too
+    void (async () => {
+      try {
+        const { generateRunLog } = await import('../services/runlog.service.js');
+        await generateRunLog(testRunId, testId);
+      } catch {}
+    })();
+
     // Only allow BullMQ retry for infra errors — skip retry for test failures
     if (!isInfraError) {
       // Throw UnrecoverableError to prevent BullMQ from retrying
@@ -432,36 +495,27 @@ ${testInstructions}`;
 // Recover stuck runs on startup (runs left in 'running' state from a crash)
 // Uses heartbeat: if lastHeartbeat is older than 5 minutes, it's dead
 async function recoverStuckRuns() {
-  const { TestRun } = await import('../db/models/TestRun.js');
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
 
   // Find runs that are 'running' AND either have no heartbeat or stale heartbeat
-  const stuckRuns = await TestRun.find({
-    status: 'running',
-    $or: [
-      { lastHeartbeat: null },
-      { lastHeartbeat: { $lt: fiveMinAgo } },
-    ],
-  });
+  const stuckRuns = await findStuckRuns(fiveMinAgo);
 
   if (stuckRuns.length === 0) return;
 
-  console.log(`[worker] Recovering ${stuckRuns.length} stuck run(s) (no heartbeat for 5+ min)`);
+  logger.info({ count: stuckRuns.length }, '[worker] Recovering stuck run(s) (no heartbeat for 5+ min)');
   for (const run of stuckRuns) {
-    await TestRun.updateOne({ _id: run._id }, {
-      $set: {
-        status: 'error',
-        completedAt: new Date(),
-        error: 'Process crashed or stalled during execution (no heartbeat). Recovered on restart.',
-      },
+    await updateTestRun(run.id, {
+      status: 'error',
+      completed_at: new Date().toISOString(),
+      error: 'Process crashed or stalled during execution (no heartbeat). Recovered on restart.',
     });
-    await sessionService.updateSessionStats(run.sessionId);
+    await sessionService.updateSessionStats(run.suite_run_id);
   }
-  console.log(`[worker] Recovered ${stuckRuns.length} stuck run(s)`);
+  logger.info({ count: stuckRuns.length }, '[worker] Recovered stuck run(s)');
 }
 
 export async function startWorker() {
-  await connectMongo();
+  await connectDb();
 
   // Recover any runs stuck in 'running' from a previous crash
   await recoverStuckRuns();
@@ -471,22 +525,23 @@ export async function startWorker() {
     const failedJobs = await testExecutionQueue.getJobs(['failed']);
     if (failedJobs.length > 0) {
       for (const job of failedJobs) await job.remove();
-      console.log(`[worker] Cleaned ${failedJobs.length} stale failed job(s) from queue`);
+      logger.info({ count: failedJobs.length }, '[worker] Cleaned stale failed job(s) from queue');
     }
   } catch {}
 
+  const redisUrl = new URL(REDIS_URL);
   const worker = new Worker('test-execution', processTestJob, {
-    connection: { host: '127.0.0.1', port: 6379, maxRetriesPerRequest: null },
+    connection: { host: redisUrl.hostname, port: parseInt(redisUrl.port || '6379', 10), maxRetriesPerRequest: null },
     concurrency: 2,
   });
 
   // On final failure (all retries exhausted) → send to DLQ
   worker.on('failed', async (job, err) => {
-    console.error(`[worker] Job ${job?.id} failed (attempt ${job?.attemptsMade}/${job?.opts?.attempts}):`, err.message);
+    logger.error({ jobId: job?.id, attempt: job?.attemptsMade, maxAttempts: job?.opts?.attempts, err: err.message }, '[worker] Job failed');
 
     // If all retries exhausted, move to Dead Letter Queue
     if (job && job.attemptsMade >= (job.opts?.attempts ?? 1)) {
-      console.warn(`[worker] Moving job ${job.id} to DLQ after ${job.attemptsMade} attempts`);
+      logger.warn({ jobId: job.id, attempts: job.attemptsMade }, '[worker] Moving job to DLQ');
       await deadLetterQueue.add('failed-test', {
         ...job.data,
         failedAt: new Date().toISOString(),
@@ -497,14 +552,18 @@ export async function startWorker() {
   });
 
   worker.on('completed', (job) => {
-    console.log(`[worker] Job ${job.id} completed`);
+    logger.info({ jobId: job.id }, '[worker] Job completed');
   });
 
   worker.on('error', (err) => {
-    console.error('[worker] Worker error:', err.message);
+    logger.error({ err: err.message }, '[worker] Worker error');
   });
 
-  console.log('[worker] Test execution worker started (concurrency: 2, retries: 2, DLQ: enabled)');
+  worker.on('stalled', (jobId) => {
+    logger.warn({ jobId }, '[worker] Job stalled — will be retried by BullMQ');
+  });
+
+  logger.info('[worker] Test execution worker started (concurrency: 2, retries: 2, DLQ: enabled)');
   return worker;
 }
 
@@ -512,12 +571,12 @@ export async function startWorker() {
 export function abortTestRun(testRunId: string) {
   const controller = activeAbortControllers.get(testRunId);
   if (controller) {
-    console.log(`[worker] Aborting run ${testRunId} (local controller found)`);
+    logger.info({ testRunId }, '[worker] Aborting run (local controller found)');
     controller.abort();
     return true;
   }
   // If not in this process, publish abort via Redis
-  console.log(`[worker] Aborting run ${testRunId} (publishing via Redis)`);
+  logger.info({ testRunId }, '[worker] Aborting run (publishing via Redis)');
   getPublisher().publish(`abort:${testRunId}`, '1');
   return true;
 }

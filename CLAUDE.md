@@ -23,26 +23,30 @@ pnpm --filter dashboard dev  # Next.js dashboard on :3002
 pnpm build                   # builds both packages
 ```
 
-There are no automated tests (unit/integration). The "tests/" directory contains YAML test definitions for the AI to execute, not code tests.
+Unit tests exist (`pnpm test` — vitest, 50 tests). The "tests/" directory contains YAML test definitions for the AI to execute, not code tests.
 
 ## Prerequisites
 
-MongoDB on :27017, Redis/Memurai on :6379, FFmpeg in PATH, `OPENAI_API_KEY` in root `.env`.
+Redis on :6379, FFmpeg in PATH, `OPENAI_API_KEY` in root `.env`. Database: Turso (local SQLite file by default, or Turso cloud with `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`).
 
 ## Architecture
 
 **Monorepo** (pnpm workspaces) with two packages:
 
 ### `packages/runner` — Backend (Express + TypeScript ESM)
-- **Entry**: `src/index.ts` — boots MongoDB, BullMQ worker, cleanup/metrics schedulers, Express server
-- **`src/server.ts`** — Express API (~25 endpoints). Dashboard proxies all `/api/*` calls here via Next.js rewrites
+- **Entry**: `src/index.ts` — boots Turso DB, BullMQ worker, cleanup/metrics schedulers, Express server
+- **`src/server.ts`** — Express setup (~96 lines), mounts 5 route modules + middleware
 - **`src/cua-loop.ts`** — Core DOM-first AI loop. Extracts DOM → sends structured text to GPT-5.4 → gets JSON action → executes via adapter. Falls back to vision mode when DOM is insufficient (<5 elements, stuck detection, low confidence)
 - **`src/cua-loop-vision.ts`** — Vision mode loop (screenshot-based, higher token cost)
 - **`src/adapter/`** — Abstraction layer between AI decisions and Playwright. All browser interaction goes through `ExecutionAdapter` interface (in `types.ts`). `action-engine.ts` has 4-layer fallback: elementId → text search → coordinates → panel search
 - **`src/dom-extractor.ts`** — Extracts top-25 interactive elements from page DOM with stable hash-based IDs
 - **`src/actions.ts`** — Legacy action execution (pre-adapter)
 - **`src/queue/`** — BullMQ queue (`queue.ts`) and worker (`worker.ts`). Worker launches browser, runs CUA loop, generates replay video via FFmpeg
-- **`src/db/models/`** — Mongoose models: TestDef, TestRun, Session, Step, Event, Settings, MetricSnapshot
+- **`src/db/turso.ts`** — Turso/libSQL connection + schema migrations
+- **`src/db/repo.ts`** — Repository layer: all SQL queries for 7 tables (replaces Mongoose models)
+- **`src/routes/`** — Express route modules: tests, suites, runs, config, metrics
+- **`src/middleware/`** — Auth, Zod error handler, utilities
+- **`src/logger.ts`** — Pino structured logging
 - **`src/services/`** — Business logic: test CRUD, session management, cleanup (data retention), metrics aggregation
 - **`src/validation/`** — Zod schemas for API input validation
 
@@ -58,4 +62,5 @@ MongoDB on :27017, Redis/Memurai on :6379, FFmpeg in PATH, `OPENAI_API_KEY` in r
 - **Stable element IDs**: DOM elements get 8-char hash IDs that survive re-extraction, so the AI can reference the same element across turns.
 - **Adapter pattern**: `ExecutionAdapter` interface decouples AI actions from Playwright. The action engine tries multiple strategies (ID lookup → text match → coordinates → full-page search) before failing.
 - **SSE for live updates**: Test execution progress streams to dashboard via Redis pub/sub → SSE.
-- **All config in `.env` at repo root** — runner loads it via `tsx --env-file=../../.env`. Runtime config (test account, concurrency, token budgets) stored in MongoDB Settings collection, editable from dashboard.
+- **All config in `.env` at repo root** — runner loads it via `tsx --env-file=../../.env`. Runtime config (test account, concurrency, token budgets) stored in Turso Settings table, editable from dashboard.
+- **Turso/SQLite for persistence**: Zero-config local dev (file:local.db), Turso cloud for production. No MongoDB dependency.

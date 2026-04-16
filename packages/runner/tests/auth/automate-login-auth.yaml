@@ -25,3 +25,16 @@ tags:
   - auth
   - e2e
   - automate
+# Hard-verification rules — checked AFTER the model emits its verdict.
+# Final verdict = model PASS AND all rules pass. Soft-matched (substring,
+# case-insensitive). Keep to 2-5 strong signals; more is noise.
+validation:
+  - type: url
+    value: /connects
+    label: "Reached Connect dashboard URL"
+  - type: text
+    value: "Create Connect"
+    label: "Authenticated CTA visible"
+  - type: not_text
+    value: "Sign in with"
+    label: "Login form NOT shown post-auth"

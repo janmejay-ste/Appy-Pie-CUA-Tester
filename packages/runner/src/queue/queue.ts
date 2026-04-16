@@ -49,6 +49,8 @@ export interface TestJobData {
   resumeContext?: string;
   resumeStorageStatePath?: string; // browser cookies/localStorage from timed-out run
   attempt?: number;
+  /** Optional declarative validation rules from the test definition. */
+  validation?: Array<{ type: 'url' | 'text' | 'element' | 'not_text'; value: string; label?: string }>;
 }
 
 export function createSubscriber() {

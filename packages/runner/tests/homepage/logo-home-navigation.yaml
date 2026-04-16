@@ -3,14 +3,14 @@ url: "https://www.appypieautomate.ai"
 category: smoke
 instructions: |
   1. Verify the Appy Pie Automate logo is visible in the header/navigation bar
-  2. Navigate to the Pricing page using the navigation menu
-  3. Verify the Pricing page loads and the URL changes
-  4. Click on the logo in the header to navigate back to the homepage
-  5. Verify the homepage loads correctly after clicking the logo
-  6. Navigate to the Integrations page
-  7. Click the logo again and verify it returns to the homepage
-  8. Navigate to any other internal page (e.g., Help, Blog, or Features)
-  9. Click the logo once more and confirm it always returns to the homepage
+  2. Click the "Pricing" link in the navigation menu to go to the Pricing page
+  3. Verify the URL changed to include "pricing"
+  4. Click the Appy Pie Automate logo in the header to go back to the homepage
+  5. Verify the URL is now the homepage root "/"
+  6. Click the "Explore" link in the navigation menu to go to the App Directory page
+  7. Verify the URL changed to include "app-directory"
+  8. Click the Appy Pie Automate logo in the header to go back to the homepage
+  9. Verify the URL is now the homepage root "/" — all steps are done, report PASS
 timeout: 120000
 expected_outcome: "Logo is visible on all pages and clicking it consistently navigates back to the homepage from any page"
 tags: ["logo", "navigation", "homepage", "automate"]

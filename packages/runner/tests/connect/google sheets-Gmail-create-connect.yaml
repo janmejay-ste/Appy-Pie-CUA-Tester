@@ -12,33 +12,60 @@ instructions: |
      - Select trigger event: "New Spreadsheet Row"
      - When the "Continue" button appears, click it immediately — do NOT click any other button like Guide or question mark icons
   4. GOOGLE SHEETS ACCOUNT — In the side panel:
-     - When you see the Continue button, click it immediately — the account is already linked
-     - Do NOT click "Add an Account", "Change", "Guide", or any other button
-     - If no Continue button is visible, report an error that the account is not linked
+     - If a "Continue" button is visible, click it immediately — the account is already linked
+     - If no "Continue" button is visible but "Add an Account" or a dropdown is visible, click "Add an Account" or select the account from the dropdown to link it
+     - Do NOT click "Change", "Reconnect", "Guide", or any question mark icons
      - After clicking Continue, the side panel may close. If so, click the panel toggle icon (◁▏) at the top-right corner to re-open it
   5. SPREADSHEET SELECTION — In the side panel (click the trigger card if panel is closed):
      - IGNORE the "guide" / "Example" toggle section — do NOT click it
-     - Find the "Spreadsheet *" dropdown BELOW the guide section and click its ARROW ICON to open it
-     - Wait 2-3 seconds for options to load, then select the first available spreadsheet
-     - After selecting, find the "Worksheet *" dropdown below and select the first available worksheet
+
+     CRITICAL IDEMPOTENCY RULES — check BEFORE every action in this step:
+     - Spreadsheet and Worksheet are TWO SEPARATE dropdowns with DIFFERENT elementIds. They look visually similar but are independent.
+     - BEFORE acting, INSPECT the current state of each field:
+         * If the Spreadsheet field ALREADY has a green chip (e.g. "Test sheet" with X to remove), Spreadsheet is DONE — DO NOT reopen it, DO NOT click its dropdown arrow, DO NOT search again. Skip directly to Worksheet.
+         * If the Worksheet field ALREADY has a green chip, Worksheet is DONE — skip to Continue & Run Test.
+     - NEVER repeat an action whose outcome is already visible on the page. Each selection is a one-way commit; reopening a done dropdown risks overwriting it with a stale cached click.
+
+     5a. SPREADSHEET dropdown (labeled "Spreadsheet *"):
+       - First check: does the Spreadsheet field already show a green chip like "Test sheet"? If YES, skip to 5b. Only proceed if the field is empty.
+       - Find the "Spreadsheet *" label and click the dropdown ARROW ICON immediately BELOW that label to open it
+       - Wait 2-3 seconds for options to load
+       - Type "Test Sheet" in the dropdown's search bar
+       - Press ArrowDown, then Enter to commit the selection (or click the filtered "Test sheet" row)
+       - Verify: a green chip showing "Test sheet" should now appear inside the Spreadsheet field. If chip is visible, move to 5b IMMEDIATELY — do not revisit Spreadsheet.
+
+     5b. WORKSHEET dropdown (labeled "Worksheet *", appears BELOW the Spreadsheet field):
+       - First check: does the Worksheet field already show a green chip? If YES, skip to step 6. Only proceed if the field is empty.
+       - Wait 4-5 seconds AFTER Spreadsheet is set — the Worksheet options load from Google Sheets after Spreadsheet selection
+       - Scroll down if Worksheet field is not visible
+       - Click the Worksheet dropdown arrow — this is a DIFFERENT elementId from the Spreadsheet opener. Do NOT reuse the Spreadsheet's opener elementId. If the DOM shows the same opener id for both, use coordinates/text to target the Worksheet one specifically.
+       - Wait 2-3 seconds for worksheet tab names (like "Sheet1", "Tab 1") to appear. If you see spreadsheet names (like "Demand Genration"), the Worksheet options have not loaded yet — wait longer. These names are SPREADSHEETS, not worksheets.
+       - Select the first available worksheet
+       - Verify: a green chip appears inside the Worksheet field. Once visible, proceed to step 6 — do not revisit Worksheet.
+
      - If clicking has no effect, try action "select" with target=elementId and value="first"
-     - After both dropdowns are filled, click "Continue & Run Test"
+     - After BOTH chips are visible (Spreadsheet chip + Worksheet chip), click "Continue & Run Test"
   6. Click "Continue & Run Test" in the side panel:
      - Wait for the test to complete with a success message
-     - Click "view record" to verify data, then click Continue to move to the action step
-  7. ACTION SETUP — Click the "Add Action App" or "+" button on the canvas:
+     - If a "view record" link appears, click it to verify data, then click Continue
+     - IMPORTANT: After clicking Continue or after test completes, the side panel will close and you will see the canvas with just the Google Sheets trigger card and "Add Action App" / "Add AI Agent" / "Add Flow" buttons at the bottom
+     - When the side panel closes, do NOT click the connect title/name at the top (e.g. "Google Sheets Integration") — clicking it activates a text input which hides the action buttons
+     - Do NOT click anywhere on the canvas background — look only for the "Add Action App" button at the bottom
+     - If you need to re-check test results, click the Google Sheets trigger CARD (not the title bar) to reopen the side panel
+  7. ACTION SETUP — Click the "Add Action App" or "+" button at the bottom of the canvas:
      - Search for "Gmail" and select it
      - Select action event: "Create Draft"
      - Click Continue
   8. GMAIL ACCOUNT — In the side panel:
-     - When you see the Continue button, click it immediately — the account is already linked
-     - Do NOT click "Add an Account", "Change", "Guide", or any other button
-     - If no Continue button is visible, report an error that the Gmail account is not linked
+     - If a "Continue" button is visible, click it immediately — the account is already linked
+     - If no "Continue" button is visible but "Add an Account" or a dropdown is visible, click "Add an Account" or select the account from the dropdown
+     - Do NOT click "Change", "Reconnect", "Guide", or any question mark icons
   9. CONFIGURE DRAFT FIELDS — In the side panel:
-     - Enter "Test" in the "Subject" field
-     - Enter "This is a test email body" in the "Email Body" field
-     - If continue button is disabled, try clicking the "Advance Mode" button to reveal the "To Email" field
-     - Enter a value for "To Email" (e.g., test@example.com)
+     - Fields with "+ Add or Select" buttons are auto-filled with dynamic variable tokens from the trigger output. Check if Subject and Email Body already have green token chips (tags showing trigger data like spreadsheet values). If they do, skip to clicking "Continue & Run Test".
+     - If Subject is still empty: click the "+ Add or Select" link next to the Subject label — a picker will appear with available data fields from the trigger. Click the FIRST available item in the picker list.
+     - If Email Body is still empty: do the same for the Email Body field.
+     - If no picker appears or the fields don't accept tokens, type "Test Subject" and "Test email body" directly.
+     - If the Continue button is disabled, try clicking the "Advance Mode" button to reveal the "To Email" field and enter test@example.com
      - Click "Continue & Run Test"
   10. Click "Activate Connect" button in the top-right corner:
       - If an "Upgrade Plan" popup appears, note the exact message and report it as a blocking issue
@@ -49,8 +76,9 @@ instructions: |
       - Action: Gmail / Create Draft
 
   NOTE: If a 503 error or empty state appears, wait 3 seconds and retry once.
+  IMPORTANT: Transient 503/400/network errors on background requests (images, analytics, CDN) are NOT blocking issues. If the workflow was successfully created and activated, report PASS even if background network errors were observed. Only report FAIL if the workflow itself could not be created or activated.
 timeout: 300000
-expected_outcome: "A connect workflow is created successfully where Trigger is Google Sheets (New Spreadsheet Row) and Action is Gmail (Create Draft). The workflow appears in the connects list with an active/ON status."
+expected_outcome: "A connect workflow is created successfully where Trigger is Google Sheets (New Spreadsheet Row) and Action is Gmail (Create Draft). The workflow appears in the connects list with an active/ON status. Transient 503 or network errors on background requests should not affect the verdict — only the final workflow activation state matters."
 tags:
   - workflow
   - integration

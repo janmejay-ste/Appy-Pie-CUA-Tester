@@ -3,59 +3,11 @@
 import { useEffect, useState, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import { useSSE } from '@/lib/use-sse';
+import type { RunDetail, TurnToken } from '@cua/shared';
 
 const API = process.env.NEXT_PUBLIC_API_URL || '';
 
-interface Screenshot {
-  id: string;
-  turn_number: number;
-  file_path: string;
-  captured_at: string;
-  page_url: string | null;
-  page_title: string | null;
-}
-
-interface RunEvent {
-  id: string;
-  type: string;
-  message: string;
-  timestamp: string;
-  sequence: number;
-}
-
-interface TurnToken {
-  id: string;
-  turn_number: number;
-  input_tokens: number;
-  output_tokens: number;
-  reasoning_tokens: number;
-  api_latency_ms: number;
-  cumulative_input: number;
-  cumulative_output: number;
-  cumulative_reasoning: number;
-  mode?: 'dom' | 'vision' | 'vision-burst';
-  timestamp: string;
-}
-
-interface RunDetail {
-  id: string;
-  test_id: string;
-  test_name: string;
-  status: string;
-  started_at: string;
-  completed_at: string | null;
-  duration_ms: number | null;
-  turn_count: number;
-  screenshot_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  reasoning_tokens: number;
-  model_verdict: string | null;
-  error: string | null;
-  screenshots: Screenshot[];
-  events: RunEvent[];
-  turnTokens: TurnToken[];
-}
+// RunDetail from @cua/shared includes: screenshots, events, turnTokens
 
 export default function RunDetailPage() {
   const params = useParams();
@@ -109,7 +61,7 @@ export default function RunDetailPage() {
     }
   }, [liveEvents.length, runId]);
 
-  // Poll while active, check for video when completed
+  // Poll run state while active
   useEffect(() => {
     if (!isActive) return;
     const interval = setInterval(async () => {
@@ -117,17 +69,50 @@ export default function RunDetailPage() {
       if (res.ok) {
         const data = await res.json();
         setRun(data);
-        // When run just completed, check for video after a short delay (FFmpeg needs time)
-        if (data.status !== 'running' && data.status !== 'queued') {
-          setTimeout(async () => {
-            const videoRes = await fetch(`${API}/api/runs/${runId}/video`, { method: 'HEAD' });
-            setHasVideo(videoRes.ok);
-          }, 3000);
-        }
       }
     }, 3000);
     return () => clearInterval(interval);
   }, [isActive, runId]);
+
+  // Poll for replay video once the run stops — FFmpeg runs async after the run ends
+  // (also runs after abort, failure, timeout — any terminal state that produces screenshots).
+  // Retries every 2s for up to 60s, or until the video is found, or SSE video_ready event lands.
+  useEffect(() => {
+    if (isActive) return;
+    if (hasVideo) return;
+    if (!run) return;
+
+    // Fire once immediately, then poll
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 30; // 30 * 2s = 60s
+
+    const tick = async () => {
+      if (cancelled) return;
+      attempts++;
+      try {
+        const r = await fetch(`${API}/api/runs/${runId}/video`, { method: 'HEAD' });
+        if (r.ok) {
+          setHasVideo(true);
+          return;
+        }
+      } catch {/* ignore */}
+      if (attempts < MAX_ATTEMPTS) {
+        setTimeout(tick, 2000);
+      }
+    };
+    tick();
+
+    return () => { cancelled = true; };
+  }, [isActive, hasVideo, runId, run?.id]);
+
+  // Any video_ready SSE event → immediately re-check
+  useEffect(() => {
+    if (hasVideo) return;
+    const videoEvent = liveEvents.find((e: any) => e.type === 'video_ready');
+    if (!videoEvent) return;
+    fetch(`${API}/api/runs/${runId}/video`, { method: 'HEAD' }).then(r => setHasVideo(r.ok)).catch(() => {});
+  }, [liveEvents, hasVideo, runId]);
 
   // Auto-scroll thumbnail strip to latest screenshot when new one arrives
   const screenshotCount = run?.screenshots?.length ?? 0;
@@ -286,6 +271,8 @@ export default function RunDetailPage() {
                 setAborting(true);
                 try {
                   await fetch(`${API}/api/runs/${runId}/abort`, { method: 'POST' });
+                  // Small delay for DB write, then refetch
+                  await new Promise(r => setTimeout(r, 500));
                   const res = await fetch(`${API}/api/runs/${runId}`);
                   if (res.ok) setRun(await res.json());
                 } catch (err) {
@@ -554,19 +541,41 @@ export default function RunDetailPage() {
         </div>
 
         {/* Event Log */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-h-[360px] overflow-y-auto">
-          <h3 className="text-sm font-semibold text-gray-400 mb-4">Event Log</h3>
-          <div className="space-y-3">
-            {events.map(event => (
-              <div key={event.id} className="text-xs">
-                <div className="text-gray-600 font-mono">
-                  {new Date(event.timestamp).toLocaleTimeString()}
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-h-[500px] overflow-y-auto" ref={(el) => { if (el && isActive) el.scrollTop = el.scrollHeight; }}>
+          <h3 className="text-sm font-semibold text-gray-400 mb-4">Event Log {events.length > 0 && <span className="text-gray-600 font-normal">({events.length})</span>}</h3>
+          <div className="space-y-2">
+            {events.map(event => {
+              const isError = event.type === 'run_failed' || event.message.includes('error') || event.message.includes('Error');
+              const isComplete = event.type === 'run_completed';
+              const isScreenshot = event.type === 'screenshot_captured';
+              const isTurnStart = event.message.includes('started');
+              const isTurnComplete = event.message.includes('complete') && event.message.includes('API:');
+              const isAction = event.type === 'actions_executed';
+              return (
+                <div key={event.id} className={`text-xs rounded px-2 py-1.5 ${isError ? 'bg-red-500/10 border-l-2 border-red-500' : isComplete ? 'bg-emerald-500/10 border-l-2 border-emerald-500' : isTurnStart ? 'bg-blue-500/5 border-l-2 border-blue-500/40' : ''}`}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-gray-600 font-mono shrink-0">
+                      {new Date(event.timestamp).toLocaleTimeString()}
+                    </span>
+                    <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                      isError ? 'bg-red-500/20 text-red-400' :
+                      isComplete ? 'bg-emerald-500/20 text-emerald-400' :
+                      isScreenshot ? 'bg-purple-500/15 text-purple-400' :
+                      isTurnComplete ? 'bg-cyan-500/15 text-cyan-400' :
+                      isAction ? 'bg-amber-500/15 text-amber-400' :
+                      'bg-gray-800 text-gray-500'
+                    }`}>
+                      {isError ? 'ERROR' : isComplete ? 'DONE' : isScreenshot ? 'SNAP' : isTurnComplete ? 'API' : isAction ? 'ACT' : isTurnStart ? 'TURN' : event.type.split('_')[0].toUpperCase()}
+                    </span>
+                  </div>
+                  <div className={`mt-1 ${isError ? 'text-red-300' : isComplete ? 'text-emerald-300' : 'text-gray-300'}`}>
+                    {event.message}
+                  </div>
                 </div>
-                <div className="text-gray-300 mt-0.5">{event.message}</div>
-              </div>
-            ))}
+              );
+            })}
             {isActive && (
-              <div className="text-xs text-blue-400 animate-pulse">Waiting for events...</div>
+              <div className="text-xs text-blue-400 animate-pulse px-2 py-1">Waiting for events...</div>
             )}
           </div>
         </div>

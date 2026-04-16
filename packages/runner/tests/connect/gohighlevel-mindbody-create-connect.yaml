@@ -22,9 +22,11 @@ instructions: |
      - IMPORTANT: After clicking Continue, verify you are STILL on the editor page (URL should contain /customeditor/). If you got redirected back to /connects, it means the event was not properly selected — navigate back to the editor and try again
   4. For GoHighLevel V2 account:
      - After selecting the trigger event, the account connection section should appear
-     - If a linked account is already shown, click on the continue button to proceed to the next step
-     - If no account is linked, click "Add an Account" to connect one
-     - IMPORTANT: Do NOT click any button that takes you back to /connects — stay on the editor page
+     - FIRST check if there is a dropdown/select to choose an existing connected account — if so, select the first available account from the dropdown, then click Continue
+     - If a linked account is already shown with a Continue button, click Continue immediately
+     - ONLY if no account dropdown AND no Continue button exist, click "Add an Account" to connect one
+     - IMPORTANT: Do NOT click "Add an Account" if there is already a way to select an existing account — always prefer existing accounts
+     - Do NOT click any button that takes you back to /connects — stay on the editor page
   5. Configure the trigger fields:
      - If a "Select Location" or similar dropdown appears, select the first available location
      - If a "Pipeline" dropdown appears, select the first available pipeline
@@ -37,8 +39,9 @@ instructions: |
      - Search for and select application: "Mindbody" or "MINDBODY"
      - Select action event: Create Sale
   8. For Mindbody account:
-     - If a linked account is already shown, click continue to proceed
-     - If no account is linked, click "Add an Account" to connect one
+     - FIRST check if there is a dropdown/select to choose an existing connected account — if so, select the first available account, then click Continue
+     - If a linked account is already shown with a Continue button, click Continue immediately
+     - ONLY if no account dropdown AND no Continue button exist, click "Add an Account" to connect one
   9. Configure the Create Sale fields — IMPORTANT: The form is long, you MUST scroll down to see all fields. Follow this exact order:
      a. Select Site List — select "appy pie sandbox" or the first available site from the dropdown
      b. ClientId — map a dynamic value from GoHighLevel trigger output:
@@ -77,7 +80,8 @@ instructions: |
       - Trigger application shows "GoHighLevel V2" with event "New Opportunity"
       - Action application shows "MINDBODY" with event "Create Sale"
   NOTE: If any page shows a 503 error or empty state, wait 3 seconds and retry once. If a 503 error occurs during trigger/action testing, wait and retry. Empty states (no existing data) are acceptable — proceed with the test flow.
-timeout: 360000
+timeout: 600000
+max_turns: 70
 expected_outcome: "A connect workflow is created successfully where Trigger is GoHighLevel V2 (New Opportunity) and Action is Mindbody (Create Sale) with Product/Item selected and ClientId mapped from trigger output. The workflow appears in the connects list with an active/ON status."
 tags:
   - workflow

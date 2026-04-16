@@ -1,28 +1,9 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import type { SuiteRun, TestRun } from '@cua/shared';
 
 const API = process.env.NEXT_PUBLIC_API_URL || '';
-
-interface SuiteRun {
-  id: string;
-  started_at: string;
-  completed_at: string | null;
-  total: number;
-  passed: number;
-  failed: number;
-  errors: number;
-  timeouts: number;
-}
-
-interface TestRun {
-  id: string;
-  test_id: string;
-  test_name: string;
-  status: string;
-  duration_ms: number | null;
-  model_verdict: string | null;
-}
 
 export default function HistoryPage() {
   const [suites, setSuites] = useState<SuiteRun[]>([]);

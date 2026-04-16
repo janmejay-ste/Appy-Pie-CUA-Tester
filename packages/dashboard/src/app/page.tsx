@@ -1,76 +1,10 @@
 'use client';
 
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import type { TestDefinition, TestRun, SuiteRun, SystemSettings, TestAccount, TabId } from '@cua/shared';
+import { useQuickTest } from '@/lib/use-quick-test';
 
 const API = process.env.NEXT_PUBLIC_API_URL || '';
-
-// ── Types ────────────────────────────────────────────────────────
-
-interface TestDefinition {
-  id: string;
-  _id?: string;
-  name: string;
-  url: string;
-  instructions?: string;
-  expected_outcome?: string;
-  expectedOutcome?: string;
-  tags?: string[];
-  category?: 'smoke' | 'sanity' | 'regression' | 'e2e';
-  timeout: number;
-  requires_auth?: boolean;
-  requiresAuth?: boolean;
-  max_turns?: number;
-  maxTurns?: number;
-  page?: string;
-  version?: number;
-  isActive?: boolean;
-}
-
-interface SystemSettings {
-  _id: string;
-  maxConcurrency: number;
-  maxTurnsDefault: number;
-  maxTokensPerSession: number;
-  defaultTimeout: number;
-  defaultHeadless: boolean;
-  allowedDomains: string[];
-}
-
-interface SuiteRun {
-  id: string;
-  started_at: string;
-  completed_at: string | null;
-  total: number;
-  passed: number;
-  failed: number;
-  errors: number;
-  timeouts: number;
-}
-
-interface TestRun {
-  id: string;
-  test_id: string;
-  test_name: string;
-  status: string;
-  started_at: string | null;
-  completed_at: string | null;
-  duration_ms: number | null;
-  turn_count: number;
-  screenshot_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  reasoning_tokens: number;
-  model_verdict: string | null;
-  error: string | null;
-}
-
-interface TestAccount {
-  email: string;
-  password: string;
-  passwordMasked: string;
-}
-
-type TabId = 'overview' | 'results' | 'failures' | 'logs' | 'tests' | 'config';
 
 function statusBadge(status: string) {
   switch (status) {
@@ -100,6 +34,7 @@ export default function DashboardPage() {
   const [latestSuite, setLatestSuite] = useState<SuiteRun | null>(null);
   const [testRuns, setTestRuns] = useState<TestRun[]>([]);
   const [running, setRunning] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [activeSuiteId, setActiveSuiteId] = useState<string | null>(null);
   const activeSuiteIdRef = useRef<string | null>(null);
   useEffect(() => { activeSuiteIdRef.current = activeSuiteId; }, [activeSuiteId]);
@@ -164,6 +99,9 @@ export default function DashboardPage() {
   // Settings state
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [settingsSaving, setSettingsSaving] = useState(false);
+
+  // Quick Test (prompt) state
+  const { promptText, setPromptText, promptUrl, setPromptUrl, promptRunning, runPromptTest } = useQuickTest();
 
   // Modal state
   const [showResetModal, setShowResetModal] = useState(false);
@@ -354,6 +292,7 @@ export default function DashboardPage() {
   };
 
   const stopTests = async () => {
+    setStopping(true);
     try {
       if (activeSuiteId) {
         await fetch(`${API}/api/suites/${activeSuiteId}/abort`, { method: 'POST' });
@@ -364,12 +303,25 @@ export default function DashboardPage() {
           await fetch(`${API}/api/runs/${run.id}/abort`, { method: 'POST' });
         }
       }
+      // Poll until all runs leave 'running' state (worker sets them to 'aborted')
+      for (let attempt = 0; attempt < 30; attempt++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const res = await fetch(`${API}/api/runs?limit=20`);
+        if (res.ok) {
+          const data = await res.json();
+          const runs: any[] = data.runs ?? data ?? [];
+          const stillRunning = runs.some((r: any) => r.status === 'running');
+          if (!stillRunning) break;
+        }
+      }
       setRunning(false);
       setActiveSuiteId(null);
       showToast('Tests stopped', 'info');
-      setTimeout(loadData, 1000);
+      await loadData();
     } catch (err) {
       console.error('Failed to abort:', err);
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -854,9 +806,16 @@ export default function DashboardPage() {
           {running && (
             <button
               onClick={stopTests}
-              className="px-5 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg text-sm transition-colors"
+              disabled={stopping}
+              className="px-5 py-2 bg-red-600 hover:bg-red-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg text-sm transition-colors flex items-center gap-2"
             >
-              Stop Test
+              {stopping && (
+                <svg className="animate-spin h-3.5 w-3.5 text-gray-300" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                </svg>
+              )}
+              {stopping ? 'Stopping...' : 'Stop Test'}
             </button>
           )}
 
@@ -880,6 +839,45 @@ export default function DashboardPage() {
           </button>
         </div>
       </div>
+
+      {/* ── Quick Test (Prompt) ──────────────────────────────────── */}
+      {!running && (
+        <div className="p-4 bg-gray-900 border border-gray-800 rounded-lg space-y-3">
+          <h3 className="text-sm font-semibold text-gray-200">Quick Test</h3>
+          <textarea
+            rows={3}
+            placeholder="Describe what you want to test... e.g., 'Go to appypieautomate.ai, search for Gmail, and verify the integration page loads'"
+            value={promptText}
+            onChange={e => setPromptText(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors resize-y"
+          />
+          <div className="flex items-center gap-3">
+            <input
+              type="text"
+              placeholder="URL (default: https://www.appypieautomate.ai)"
+              value={promptUrl}
+              onChange={e => setPromptUrl(e.target.value)}
+              className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-50 placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors"
+            />
+            <button
+              onClick={async () => {
+                try {
+                  const testRunId = await runPromptTest({ headless });
+                  if (testRunId) {
+                    window.location.href = `/runs/${testRunId}`;
+                  }
+                } catch {
+                  showToast('Failed to start prompt test', 'error');
+                }
+              }}
+              disabled={!promptText.trim() || promptRunning}
+              className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg text-sm transition-colors whitespace-nowrap"
+            >
+              {promptRunning ? 'Starting...' : 'Run Test'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Filter Bar ──────────────────────────────────────────── */}
       <div className="flex items-center gap-3 flex-wrap">

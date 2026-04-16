@@ -6,8 +6,8 @@ const CONFIG_PATH = path.resolve(process.cwd(), 'data', 'config.json');
 
 const DEFAULT_CONFIG: AppConfig = {
   defaultTestAccount: {
-    email: process.env.DEFAULT_TEST_EMAIL || 'vexelsadas993221312dsada@yopmail.com',
-    password: process.env.DEFAULT_TEST_PASSWORD || 'Hancock1!',
+    email: process.env.DEFAULT_TEST_EMAIL || '',
+    password: process.env.DEFAULT_TEST_PASSWORD || '',
   },
 };
 

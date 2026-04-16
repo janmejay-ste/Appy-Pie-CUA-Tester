@@ -9,6 +9,13 @@ export interface AppConfig {
 }
 
 // ── Test Definition (loaded from YAML) ──────────────────────────
+/** Hard-verification rule. See validation/validator.ts. */
+export interface TestValidationRule {
+  type: 'url' | 'text' | 'element' | 'not_text';
+  value: string;
+  label?: string;
+}
+
 export interface TestDefinition {
   id: string;
   name: string;
@@ -22,6 +29,8 @@ export interface TestDefinition {
   max_turns?: number;
   requires_auth?: boolean;
   page?: string;
+  /** Optional declarative validation rules run after the model emits a verdict. */
+  validation?: TestValidationRule[];
 }
 
 // ── Runtime Types ───────────────────────────────────────────────
@@ -153,11 +162,34 @@ export interface PageState {
 }
 
 export interface CUALoopResult {
+  /**
+   * Unified verdict — model's claim overridden by system validation when rules exist.
+   * Callers should use this for the run `status` (worker already does).
+   */
   verdict: 'PASS' | 'FAIL' | 'TIMEOUT' | 'UNKNOWN';
+  /**
+   * Raw model verdict (before hard-validation override). Preserved separately
+   * so dashboards can show "model said PASS, system verified FAIL".
+   */
+  modelVerdict?: 'PASS' | 'FAIL';
   modelMessage: string;
   turns: number;
   totalTokens: { input: number; output: number; reasoning: number };
   pageState?: PageState;
+  /**
+   * Result of the hard-verification layer. Populated only when `validation`
+   * rules were provided on the test definition (or inferred). `passed: true`
+   * with zero checks means the test had no rules and the model was trusted.
+   */
+  systemValidation?: {
+    passed: boolean;
+    score: number;
+    checks: Array<{
+      rule: { type: string; value: string; label?: string };
+      passed: boolean;
+      detail?: string;
+    }>;
+  };
 }
 
 // ── DOM-First CUA Types ────────────────────────────────────────

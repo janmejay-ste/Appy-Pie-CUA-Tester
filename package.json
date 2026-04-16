@@ -2,10 +2,12 @@
   "private": true,
   "scripts": {
     "dev": "concurrently -k -n runner,dash -c blue,green \"pnpm --filter runner dev\" \"pnpm --filter dashboard dev\"",
-    "build": "pnpm --filter runner build && pnpm --filter dashboard build"
+    "build": "pnpm --filter runner build && pnpm --filter dashboard build",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.1.0",
+    "vitest": "^4.1.3"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
