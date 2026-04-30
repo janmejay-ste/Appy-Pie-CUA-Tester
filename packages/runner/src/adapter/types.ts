@@ -53,12 +53,24 @@ export interface ActionTarget {
 // rather than consuming this raw.
 export type ActionTargetLike = ActionTarget | string;
 
+/**
+ * Structured expected outcome for an action.
+ * Use this instead of free-form strings so validation is deterministic.
+ */
+export type ExpectedOutcome =
+  | { type: 'navigation';          urlIncludes?: string }
+  | { type: 'value_change';        field?: string }
+  | { type: 'element_appears';     text: string }
+  | { type: 'element_disappears';  text: string }
+  | { type: 'dom_change' }  // meaningful structural change (count shift or key text shift)
+  | { type: 'none' };       // action expected to produce no observable change (scroll, wait)
+
 export interface ActionStep {
   action: ActionType;
   target?: ActionTargetLike;   // legacy string OR structured object — see adapter/target.ts
   value?: string;         // text to type, URL to navigate, key to press
   reason?: string;        // short reason for action
-  expected?: string;      // expected outcome: "navigate_to_signup", "form_submit", "value_change"
+  expected?: ExpectedOutcome | string; // structured preferred; string accepted for LLM backward compat
   memory?: string;        // what the model remembers about this action
   next_goal?: string;     // what the model plans to do next
   confidence?: number;

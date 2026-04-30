@@ -168,7 +168,7 @@ router.post('/sync-yaml', async (_req, res) => {
           existing.expected_outcome !== data.expected_outcome ||
           existing.name !== data.name ||
           existing.url !== data.url ||
-          !existing.is_active;
+          !existing.isActive;
         if (changed) {
           await repo.incrementTestDefVersion(t.id, { ...data, is_active: true });
           updated++;

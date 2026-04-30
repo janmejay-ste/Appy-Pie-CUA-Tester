@@ -4,9 +4,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import { v4 as uuid } from 'uuid';
 import { PlaywrightAdapter, executeValidatedAction } from './adapter/index.js';
-import type { ActionStep, BrowserState, ActionTarget } from './adapter/types.js';
-import type { ValidatedResult, ExecutionStrategy } from './adapter/action-engine.js';
-import { deriveValidation } from './adapter/action-engine.js';
+import type { ActionStep, ActionResult, BrowserState, ActionTarget } from './adapter/types.js';
+import type { ValidatedResult, ExecutionStrategy, ActionSignals, ValidationDetails } from './adapter/action-engine.js';
+import { deriveValidation, resetLegacyValidationCounter, waitForUIStability } from './adapter/action-engine.js';
 import {
   coerceLegacyTarget,
   targetToDisplay,
@@ -15,6 +15,10 @@ import {
   targetsEqual,
 } from './adapter/target.js';
 import { buildConstraints, formatConstraintsForPrompt } from './decision-engine.js';
+import { detectPageState, gateAction, safeSubstitute } from './state-machine.js';
+import { FlowStep, detectFlowStep, enforceFlowStep } from './step-engine.js';
+import { getExpectedState, validateExpectedState, enforceExpectedState, probeForAddAction, probePanelOpen, validatePanelContent } from './expected-state-engine.js';
+import { checkTransition } from './transition-engine.js';
 import { fieldValueSignatureExpr, normalizeFieldKey } from './interaction/field-probe.js';
 import type { DecisionConstraints, Constraint } from './decision-engine.js';
 import {
@@ -47,12 +51,37 @@ import {
   incrementCacheReject,
   maybeDisableCacheForRun, isRunCacheDisabled, getRunCacheDisabledReason,
   resetOverlayStreak,
+  resetSequenceReplayGuard, resetShadowStats, getShadowPatterns,
   resolveTarget,
   type CachedAction, type DOMElement,
 } from './action-cache.js';
 
 // Re-export for backward compatibility
 export type { CUALoopCallbacks, TurnTokenUsage, CUALoopResult, PageState };
+
+// ── Cache sensitivity classifier ───────────────────────────────────────────────
+// Returns true when a type action's value is test-specific (credentials, PII,
+// unique identifiers) and must NOT be replayed for a different test run.
+// Returns false for generic, reusable values (search terms, labels, counts).
+//
+// Why not block all type actions: generic inputs (e.g. searching "gmail" in an
+// app picker, entering "5" as a row count) are safe to cache and skipping them
+// forces unnecessary GPT calls on every run.  Only truly run-specific data needs
+// filtering — blocking everything was a correct security fix but an efficiency regression.
+function isTestSpecificValue(value: string, targetText: string): boolean {
+  if (!value) return false;
+  const v = value.trim();
+  const t = (targetText ?? '').toLowerCase();
+  // Email addresses — always bound to a specific test account
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return true;
+  // Fields whose labels imply secret content — value is sensitive regardless of form
+  if (/password|passwd|secret|token|api.?key|credential|auth|private/i.test(t)) return true;
+  // Long hex strings — UUIDs, API keys, OAuth tokens
+  if (/^[0-9a-f-]{12,}$/i.test(v)) return true;
+  // Phone-number-shaped strings (7–15 digit-heavy patterns)
+  if (/^\+?[\d\s\-().]{7,15}$/.test(v) && /\d{5,}/.test(v)) return true;
+  return false;
+}
 
 // ── State Machine Types ─────────────────────────────────────────
 type Mode = 'DOM_NORMAL' | 'DOM_WITH_VISION' | 'VISION_BURST';
@@ -398,6 +427,9 @@ async function runCUALoopDOM(
   // state is based on this run's observations only (prevents a phantom
   // streak carrying over from the previous test's final modal).
   resetOverlayStreak();
+  resetLegacyValidationCounter();
+  resetSequenceReplayGuard();
+  resetShadowStats();
   const cacheStats = getCacheStats();
   const cacheHealth = getCacheHealth();
   if (cacheStats.singles > 0 || cacheStats.sequences > 0) {
@@ -508,11 +540,40 @@ async function runCUALoopDOM(
   let pendingBatchActions: ActionStep[] = [];
   let isBatchTurn = false; // true when executing from batch queue
 
+  // ── State-gate retry slot ─────────────────────────────────────
+  // When the state machine blocks an action (LOADING, FIELD_SELECTING, PANEL_CLOSED),
+  // the original intent is preserved here and retried next turn BEFORE the LLM is called.
+  // Cleared after one retry attempt, on vision burst, and on mode change.
+  let gateRetryAction: ActionStep | null = null;
+
+  // ── Step engine tracking ──────────────────────────────────────
+  // Tracks which workflow step we're currently on. The step engine fires once per
+  // turn and can override the LLM's proposed action when progression is required.
+  let currentFlowStep: FlowStep = FlowStep.UNKNOWN;
+  let turnsInCurrentStep = 0;
+  // Consecutive turns where the expected DOM contract for the current step failed.
+  // Reset on step transition, vision burst, and expected-state success.
+  let stepFailureCount = 0;
+  // Transition engine: step from the turn before the current detection (used for
+  // pre-action transition check and post-action step-advancement proof).
+  let prevFlowStep: FlowStep = FlowStep.UNKNOWN;
+  // Center of the last successfully clicked element (viewport coordinates).
+  // Passed to probeForAddAction as an anchor to prefer candidates geometrically
+  // nearest to the prior interaction — reduces wrong-button false confidence.
+  let lastActionBounds: { cx: number; cy: number } | null = null;
+
   // ── Sequence recording ────────────────────────────────────────
   // Track successful actions on current page for sequence caching
   let currentPageKey = ''; // changes on URL change
   let currentPageTitle = '';
-  let pageActionSequence: Array<{ action: string; targetText: string; targetTag: string; value: string; confidence: number }> = [];
+  let pageActionSequence: Array<{ action: string; targetText: string; targetTag: string; value: string; confidence: number; validationConfidence?: 'strong' | 'medium' | 'weak' }> = [];
+
+  // ── Sequence replay failure tracking ────────────────────────
+  // When a batch came from a sequence cache hit, track its source so we can
+  // penalize the sequence on failure (prevents infinite replay loops).
+  let batchFromSequence = false;
+  let batchSequenceUrl = '';
+  let batchSequenceTitle = '';
 
   // ── Rolling action history (prevents loops) ─────────────────
   // Keeps last N turns. Structured form (signals + source) enables the picker
@@ -601,6 +662,12 @@ async function runCUALoopDOM(
     // against GPT's chosen action. null on cache-hit turns.
     let turnConstraints: DecisionConstraints | null = null;
 
+    // Pre-executed result from the hybrid-force coordinate click path.
+    // Set in the expected-state escalate handler when the probe found the element;
+    // consumed at the executeValidatedAction call to skip a redundant second click.
+    // Re-declared each turn (natural null reset — no cross-turn bleed).
+    let hybridForceResult: ValidatedResult | null = null;
+
     // ── Auto-wait for loading spinners ──────────────────────────
     // If page has very few elements (loading spinner), wait up to 10s for content to load
     if (state.elements.length < 5) {
@@ -627,6 +694,17 @@ async function runCUALoopDOM(
     const pageTitle = state.title || '';
     isBatchTurn = false;
 
+    // ── Consume state-gate retry slot (highest priority — before batch/cache/LLM) ──
+    // When the gate blocked an action last turn and the state was transient (LOADING /
+    // FIELD_SELECTING / PANEL_CLOSED), the original action was preserved in gateRetryAction.
+    // Retry it once before asking the LLM so we don't waste a turn on re-planning.
+    if (gateRetryAction && mode === 'DOM_NORMAL' && consecutiveFailures === 0) {
+      const retry = gateRetryAction;
+      gateRetryAction = null; // consume immediately — only one attempt
+      pendingBatchActions.unshift(retry);
+      console.log(`[state-gate] Retrying gate-blocked action: ${retry.action} "${targetToDisplay(retry.target) || retry.value}"`);
+    }
+
     // ── Check batch queue first (remaining actions from multi-action response) ──
     let batchAction: ActionStep | null = null;
     if (pendingBatchActions.length > 0 && mode === 'DOM_NORMAL' && consecutiveFailures === 0) {
@@ -638,6 +716,7 @@ async function runCUALoopDOM(
         batchAction = pendingBatchActions.shift()!;
         console.log(`[cua] T${turn} BATCH → ${batchAction.action} ${targetToDisplay(batchAction.target) || batchAction.value} (${pendingBatchActions.length} remaining)`);
         isBatchTurn = true;
+        if (pendingBatchActions.length === 0) batchFromSequence = false; // batch exhausted — clear sequence attribution
 
         callbacks.onTurnComplete(turn, 0, { ...totalTokens });
         callbacks.onTurnTokens({
@@ -669,10 +748,28 @@ async function runCUALoopDOM(
     if (!isBatchTurn && pendingBatchActions.length === 0 && !inStagnationRecovery &&
         mode === 'DOM_NORMAL' && !stuckContext && consecutiveFailures === 0 &&
         consecutiveCacheHits < MAX_CONSECUTIVE_CACHE_HITS && !lastTurnWasGPT) {
-      const cachedSeq = getCachedSequence(state.url, pageTitle, cacheElements);
+      // Semantic progress signature: URL + top-3 visible headings/labels.
+      // This captures what the user actually sees — immune to ephemeral DOM churn
+      // (attribute changes, animation frames) that makes raw domFingerprint a false positive.
+      // Same URL + same headings after replay = no meaningful navigation occurred.
+      const progressSignature = state.url + '|' + state.keyText.slice(0, 3).join('|');
+      const cachedSeqRaw = getCachedSequence(state.url, pageTitle, cacheElements, progressSignature);
+      // Filter sequences that contain type actions — their values are test-specific
+      // (credentials, form content) and would be wrong when replayed for a different test
+      // on the same page (e.g. a login sequence caching user1@example.com would retype
+      // that address when test B runs as user2@example.com).
+      let cachedSeq = cachedSeqRaw ?? null;
+      if (cachedSeq && cachedSeq.actions.some(a => a.action === 'type' && isTestSpecificValue(a.value, a.targetText))) {
+        console.log(`[cua] T${turn} SEQUENCE SKIP: "${cachedSeq.description}" contains sensitive type action (credentials/PII) — letting GPT decide`);
+        cachedSeq = null;
+      }
       if (cachedSeq) {
         console.log(`[cua] T${turn} SEQUENCE HIT → "${cachedSeq.description}" (${cachedSeq.actions.length} actions)`);
         consecutiveCacheHits++;
+        // Tag this batch so failures can be attributed back to this sequence
+        batchFromSequence = true;
+        batchSequenceUrl = state.url;
+        batchSequenceTitle = pageTitle;
         // Queue all sequence actions as a batch — first one is this turn's action
         const seqActions: ActionStep[] = cachedSeq.actions.map(a => ({
           action: a.action as any,
@@ -697,7 +794,15 @@ async function runCUALoopDOM(
     if (!isBatchTurn && pendingBatchActions.length === 0 && !inStagnationRecovery &&
         mode === 'DOM_NORMAL' && !stuckContext && consecutiveFailures === 0 &&
         consecutiveCacheHits < MAX_CONSECUTIVE_CACHE_HITS && !lastTurnWasGPT) {
-      const cachedAction = getCachedAction(state.url, pageTitle, cacheElements);
+      const cachedActionRaw = getCachedAction(state.url, pageTitle, cacheElements);
+      // Skip sensitive type actions from cache — emails, passwords, tokens, phone numbers.
+      // Generic type values (search terms, counts, labels) are safe to replay.
+      const cachedAction = (cachedActionRaw?.action === 'type' &&
+        isTestSpecificValue(cachedActionRaw.value, cachedActionRaw.targetText))
+        ? null : cachedActionRaw;
+      if (!cachedAction && cachedActionRaw) {
+        console.log(`[cua] T${turn} CACHE SKIP: sensitive type action filtered (credentials/PII)`);
+      }
       if (cachedAction) {
         const target = cachedAction.resolvedTarget || cachedAction.targetText;
         console.log(`[cua] T${turn} CACHE HIT → ${cachedAction.action} "${cachedAction.targetText}" (${cachedAction.successCount}x success, saved ~5s)`);
@@ -724,9 +829,15 @@ async function runCUALoopDOM(
         callbacks.onActionsExecuted(turn, [{ type: step.action }]);
 
         if (result.effective) {
-          recordSuccessfulAction(state.url, pageTitle, cacheElements,
+          recordSuccessfulAction(
+            state.url,
+            pageTitle,
+            cacheElements,
             { action: cachedAction.action, target, value: cachedAction.value, confidence: cachedAction.confidence },
-            result.description, true);
+            result.description,
+            true,
+            result.validationConfidence
+          );
           consecutiveFailures = 0;
           // Update action sig so cache actions break GPT repeat detection
           lastActionSig = `${cachedAction.action}:${target}:${(cachedAction.value || '').slice(0, 20)}`;
@@ -750,8 +861,13 @@ async function runCUALoopDOM(
       // Flush batch if action failed on previous turn
       if (consecutiveFailures > 0) {
         console.log(`[cua] Flushing batch queue (${pendingBatchActions.length} actions) due to failure`);
+        if (batchFromSequence) {
+          recordFailedSequence(batchSequenceUrl, batchSequenceTitle);
+          console.warn(`[cua] Penalized sequence for "${batchSequenceUrl}" after batch failure`);
+        }
         pendingBatchActions = [];
         isBatchTurn = false;
+        batchFromSequence = false;
         action = null; // fall through to GPT
       }
     }
@@ -872,6 +988,37 @@ async function runCUALoopDOM(
       promptParts.push(cacheLoopWarning);
     }
 
+    // Progress stall detection: if no URL change in 5+ turns AND shadow stats show repeated
+    // weak signals on the same targets, the model is looping. Two responses:
+    // 1. Structured feedback injected into prompt (advisory) — so the model sees WHY it's stuck.
+    // 2. Authoritative: forcibly increment consecutiveFailures to drive the state machine into
+    //    DOM_WITH_VISION / VISION_BURST. Advisory text alone is insufficient — the model ignores
+    //    hints when its confidence is high. Hard escalation breaks the loop unconditionally.
+    const turnsWithoutProgress = turn - lastProgressTurn;
+    if (turnsWithoutProgress >= 5) {
+      const shadowPatterns = getShadowPatterns();
+      if (shadowPatterns.length > 0) {
+        const patternBlock = JSON.stringify({
+          warning: `No URL progress for ${turnsWithoutProgress} turns`,
+          flaky_targets: shadowPatterns.map(p => ({ pattern: p.key, weak_signal_count: p.count })),
+          instruction: 'These targets have consistently failed to produce strong validation evidence this run. Avoid them or use an entirely different approach.',
+        }, null, 2);
+        promptParts.push(`PROGRESS_STALL_PATTERNS:\n${patternBlock}`);
+
+        // Authoritative escalation: treat stall as a failure so the state machine escalates.
+        // Only escalate once per 5-turn stall window (not every turn) — check that we haven't
+        // already incremented this turn (lastResult still reflects previous turn here).
+        if (consecutiveFailures === 0) {
+          consecutiveFailures = 1;
+          if (!stuckContext) {
+            stuckContext = { goal: nextGoal, url: state.url, trigger: `stall: ${turnsWithoutProgress} turns, ${shadowPatterns.length} flaky target(s)`, failedActions: [] };
+          }
+          mode = 'DOM_WITH_VISION';
+          console.warn(`[cua] T${turn} Stall escalation: ${turnsWithoutProgress} turns without progress + ${shadowPatterns.length} flaky targets → DOM_WITH_VISION`);
+        }
+      }
+    }
+
     // ── Action history — gives model full awareness of what it tried ──
     if (actionHistory.length > 0) {
       promptParts.push(`=== ACTION HISTORY (last ${actionHistory.length} actions) ===`);
@@ -925,6 +1072,45 @@ async function runCUALoopDOM(
       }
       if (lastResult.retryStrategy && lastResult.retryStrategy !== 'none') {
         promptParts.push(`MANDATORY RETRY: ${lastResult.retryStrategy} — you MUST follow this hint unless clearly invalid.`);
+      }
+      // Fix 3: validation feedback loop with multi-step failure memory.
+      // Aggregate repeated failures at the same target across history — gives the model
+      // pattern context, not just single-event context.
+      const failuresByTarget = new Map<string, number>();
+      for (const h of actionHistory) {
+        if (!h.effective) {
+          const k = `${h.action}:${h.target}`;
+          failuresByTarget.set(k, (failuresByTarget.get(k) ?? 0) + 1);
+        }
+      }
+      const repeatedFailurePatterns = [...failuresByTarget.entries()]
+        .filter(([, count]) => count >= 2)
+        .map(([key, count]) => `${key} (${count}x)`);
+
+      if (lastResult.validationConfidence === 'weak') {
+        const feedback: Record<string, unknown> = {
+          previous_action: `${lastResult.action} on ${lastResult.target ?? '?'}`,
+          value: lastResult.value || undefined,
+          expected: 'visible page change (DOM/URL/value)',
+          actual: `urlChanged=${lastResult.signals.urlChanged} domChanged=${lastResult.signals.domChanged} valueChanged=${lastResult.signals.valueChanged}`,
+          confidence: 'weak',
+          instruction: 'Do NOT assume this action succeeded. Re-examine the DOM before choosing the next action.',
+        };
+        if (repeatedFailurePatterns.length > 0) {
+          feedback.repeated_failures = { count: repeatedFailurePatterns.length, patterns: repeatedFailurePatterns };
+        }
+        promptParts.push(`VALIDATION_FAILURE:\n${JSON.stringify(feedback, null, 2)}`);
+      } else if (lastResult.validationConfidence === 'medium' && !lastResult.effective) {
+        const note: Record<string, unknown> = {
+          action: lastResult.action,
+          confidence: 'medium',
+          effective: false,
+          hint: 'State signal detected but no net effect — verify current DOM matches expectation.',
+        };
+        if (repeatedFailurePatterns.length > 0) {
+          note.repeated_failures = repeatedFailurePatterns;
+        }
+        promptParts.push(`VALIDATION_NOTE:\n${JSON.stringify(note, null, 2)}`);
       }
     } else {
       promptParts.push('LAST ACTION: none (first turn)');
@@ -1190,29 +1376,80 @@ async function runCUALoopDOM(
           : 'ISSUES: None';
 
       // ── Combine model verdict with system validation ─────────
-      // PASS only when BOTH the model claims success AND the validator
-      // passes (or no rules were defined). If the model said PASS but the
-      // validator caught a missing signal, we override to FAIL.
+      // System validation is the authoritative ground truth — it checks objective,
+      // pre-defined rules against the actual page state.  The model verdict is a
+      // secondary signal that can be wrong in two opposite directions:
+      //
+      //   Model PASS + validation FAIL → FAIL
+      //     Model missed a broken signal the validator caught.
+      //
+      //   Model FAIL + validation PASS (100%) → PASS
+      //     Two failure modes that both produce this pattern:
+      //     (a) Subjective over-penalisation — model expected a specific UI
+      //         behaviour (dropdown, animation) that wasn't required by the test.
+      //     (b) Agent execution failure — model couldn't interact with an element
+      //         (click, locate CTA) even though the element exists and the page is
+      //         correct.  The validator confirmed the test objective was met; the
+      //         agent's inability to click something is not a page bug.
+      //     In both cases, 100% system validation is authoritative. Override to PASS
+      //     and surface the model's issues as warnings so they remain visible.
       const modelVerdictFinal: 'PASS' | 'FAIL' = finalVerdict === 'PASS' ? 'PASS' : 'FAIL';
       let overallVerdict: 'PASS' | 'FAIL' = modelVerdictFinal;
       let validationFailedIssues: string[] = [];
+
       if (systemValidation && !systemValidation.passed && modelVerdictFinal === 'PASS') {
+        // Model claimed PASS but objective checks failed — demote to FAIL
         overallVerdict = 'FAIL';
         validationFailedIssues = systemValidation.checks
           .filter(c => !c.passed)
           .map(c => c.detail || `${c.rule.type}:${c.rule.value}`);
         console.warn(`[validation] OVERRIDE: model said PASS, system validation FAILED → final FAIL`);
+      } else if (
+        systemValidation &&
+        systemValidation.passed &&
+        systemValidation.score === 1 &&
+        systemValidation.checks.length >= 3 &&
+        modelVerdictFinal === 'FAIL'
+      ) {
+        // Model claimed FAIL but ≥3 objective checks all passed at 100%.
+        // Require at least 3 rules so a single inferred rule cannot blindly
+        // override a correct model FAIL (1-rule inferred fallbacks are too weak).
+        // System validation is authoritative — promote to PASS.
+        // Model issues (if any) are preserved as warnings in the summary.
+        overallVerdict = 'PASS';
+        console.warn(
+          `[validation] OVERRIDE: model said FAIL, system validation PASSED (100%, ${systemValidation.checks.length} rules) → final PASS` +
+          (functionalIssues.length ? ` (model issues demoted to warnings: ${functionalIssues.join('; ')})` : ''),
+        );
+      } else if (
+        systemValidation &&
+        systemValidation.passed &&
+        systemValidation.score === 1 &&
+        systemValidation.checks.length < 3 &&
+        modelVerdictFinal === 'FAIL'
+      ) {
+        // Validation passed but with fewer than 3 rules — likely an inferred
+        // fallback (1–2 rules), not enough signal to override a model FAIL.
+        // Keep model FAIL as final verdict and log a warning so it's visible.
+        console.warn(
+          `[validation] NO OVERRIDE: model said FAIL, system validation passed but only ${systemValidation.checks.length} rule(s) — insufficient to override. Declare ≥3 explicit validation rules in the YAML to enable override.`,
+        );
       }
 
       const extendedIssues = [
         ...functionalIssues,
         ...validationFailedIssues.map(i => `validation: ${i}`),
       ];
-      const finalIssuesSummary = extendedIssues.length
-        ? `ISSUES: ${extendedIssues.join(', ')}`
-        : transientIssues.length
-          ? `WARNINGS (transient): ${transientIssues.join(', ')}`
-          : 'ISSUES: None';
+      // When system validation promoted a model FAIL to PASS, functional issues
+      // are demoted to warnings so they remain visible without affecting verdict.
+      const wasPromoted = overallVerdict === 'PASS' && modelVerdictFinal === 'FAIL';
+      const finalIssuesSummary = wasPromoted && extendedIssues.length
+        ? `WARNINGS (overridden by validation): ${extendedIssues.join(', ')}`
+        : extendedIssues.length
+          ? `ISSUES: ${extendedIssues.join(', ')}`
+          : transientIssues.length
+            ? `WARNINGS (transient): ${transientIssues.join(', ')}`
+            : 'ISSUES: None';
 
       return {
         verdict: overallVerdict as any,
@@ -1244,7 +1481,7 @@ async function runCUALoopDOM(
         const noopSignals = { urlChanged: false, domChanged: false, valueChanged: false };
         const noopDetails = { errorAppeared: false, elementStillExists: true, intentMatch: true };
         const skipResult: ValidatedResult = {
-          success: true, effective: false, action: 'type',
+          success: true, effective: false, validationConfidence: 'strong', action: 'type',
           description: `skipped: field ${actionTargetDisplay} already contains "${action.value.slice(0, 15)}"`,
           strategyUsed: 'selector', retryStrategy: 'change_target' as any,
           signals: noopSignals, details: noopDetails,
@@ -1304,7 +1541,7 @@ async function runCUALoopDOM(
     if (
       stuckContext &&
       action.target &&
-      stuckContext.failedActions.slice(-3).some(f => f.target === actionTargetDisplayForSig && f.action === action.action)
+      stuckContext.failedActions.slice(-3).some(f => f.target === actionTargetDisplayForSig && f.action === action!.action)
     ) {
       console.warn(`[cua] Blocked: model retried failed action-target ${action.action}:${actionTargetDisplayForSig} — forcing replan`);
       consecutiveFailures++;
@@ -1610,11 +1847,382 @@ async function runCUALoopDOM(
       }
     }
 
+    // ── Step engine — deterministic progression authority ────────
+    // Detects which workflow step we're on (UI is ground truth, not LLM memory).
+    // On step change: clears stale memory so old goals can't persist.
+    // On enforcement: overrides or blocks the proposed action before execution.
+    // This fires ABOVE the state machine — step authority wins.
+    {
+      prevFlowStep = currentFlowStep; // snapshot before detection (transition engine input)
+      const detectedStep = await detectFlowStep(adapter);
+
+      if (detectedStep !== currentFlowStep) {
+        console.log(`[step-engine] Step transition: ${currentFlowStep} → ${detectedStep}`);
+        // Clear stale LLM context accumulated in the previous step
+        pendingBatchActions = [];
+        gateRetryAction = null;
+        stuckContext = null;
+        consecutiveFailures = 0;
+        consecutiveNonMeaningful = 0;
+        turnsInCurrentStep = 0;
+        stepFailureCount = 0;
+        lastActionBounds = null; // anchor is step-scoped — stale in new step context
+        currentFlowStep = detectedStep;
+      } else {
+        turnsInCurrentStep++;
+      }
+
+      // ── Transition Engine — INVALID_TRANSITION guard ────────────────
+      // Stall escalation removed: expected-state-engine now owns that authority
+      // (escalate → vision on confirmed-absent element, count ≥ 2).
+      // This block's sole remaining job: detect backward navigation and reset.
+      {
+        const tr = checkTransition(prevFlowStep, currentFlowStep);
+        if (tr.type === 'INVALID_TRANSITION') {
+          console.warn(`[transition-engine] INVALID_TRANSITION: ${prevFlowStep} → ${currentFlowStep} — resetting to UNKNOWN`);
+          currentFlowStep = FlowStep.UNKNOWN;
+        }
+      }
+
+      const enforcement = enforceFlowStep(currentFlowStep, action, turnsInCurrentStep);
+
+      if (enforcement.kind === 'override') {
+        console.warn(`[step-engine] OVERRIDE at ${currentFlowStep}: ${enforcement.logMsg}`);
+        actionHistory.push({
+          turn,
+          action: action.action,
+          target: actionTargetDisplayForSig,
+          value: action.value,
+          effective: false,
+          description: `STEP-OVERRIDE[${currentFlowStep}]: ${enforcement.logMsg}`,
+        });
+        if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+        // Force the step-correct action — clears any stale batch/retry
+        pendingBatchActions = [];
+        gateRetryAction = null;
+        action = enforcement.action;
+
+      } else if (enforcement.kind === 'block') {
+        console.warn(`[step-engine] BLOCK at ${currentFlowStep}: ${enforcement.reason}`);
+        consecutiveFailures++;
+        actionHistory.push({
+          turn,
+          action: action.action,
+          target: actionTargetDisplayForSig,
+          value: action.value,
+          effective: false,
+          description: `STEP-BLOCK[${currentFlowStep}]: ${enforcement.reason}`,
+        });
+        if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+        const saved = await saveScreenshotToDisk(adapter, screenshotDir, turn, runId);
+        callbacks.onScreenshot(turn, saved);
+        callbacks.onActionsExecuted(turn, [{ type: action.action }]);
+        continue; // skip execution — LLM must re-plan
+      }
+      // enforcement.kind === 'allow' → fall through unchanged
+    }
+
+    // ── Expected State Engine — DOM contract validation per step ─────────
+    // Validates that the UI is actually in the state we expect for the current
+    // flow step. Guards against async canvas updates (e.g. "Add Action App"
+    // not yet rendered after trigger test success) and upgrades progress signals.
+    {
+      const expected = getExpectedState(currentFlowStep);
+      const expectedResult = await validateExpectedState(adapter, expected);
+
+      if (!expectedResult.success && currentFlowStep !== FlowStep.UNKNOWN) {
+        // Only increment and enforce in DOM_NORMAL. In vision modes the loop is already in
+        // recovery — incrementing here would keep triggering escalation on every vision turn
+        // before the LLM's proposed action can execute, creating an escalation deadlock.
+        if (mode === 'DOM_NORMAL') {
+          stepFailureCount++;
+          console.log(`[expected-state] Contract failed at ${currentFlowStep} (count=${stepFailureCount}): ${expectedResult.reasons.join('; ')}`);
+        }
+      } else {
+        stepFailureCount = 0;
+      }
+
+      // Skip enforcement in vision modes — vision is already handling recovery.
+      // Allowing the action to proceed lets the LLM re-plan with a screenshot.
+      const expectedDecision = mode === 'DOM_NORMAL'
+        ? enforceExpectedState(currentFlowStep, expectedResult, stepFailureCount)
+        : { kind: 'allow' as const };
+
+      if (expectedDecision.kind === 'wait') {
+        console.warn(`[expected-state] WAIT at ${currentFlowStep}: ${expectedDecision.logMsg}`);
+        await waitForUIStability(adapter, 'click');
+        actionHistory.push({
+          turn,
+          action: action.action,
+          target: actionTargetDisplayForSig,
+          value: action.value,
+          effective: false,
+          description: `EXPECTED-STATE-WAIT[${currentFlowStep}]: ${expectedDecision.logMsg}`,
+        });
+        if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+        continue;
+      }
+
+      if (expectedDecision.kind === 'escalate') {
+        // Contract failed after wait. Before committing to vision mode, probe the DOM
+        // with a broader scan to distinguish false-negative detection from true absence.
+        //
+        // Hybrid force strategy:
+        //   probeForAddAction found element → safe force click (one more attempt)
+        //   probeForAddAction confirmed absent → escalate to vision immediately
+        //
+        // This prevents escalation when the strict CSS/text contract misfires on a
+        // minified class name or slow-rendering canvas node that IS actually present.
+        // probeForAddAction returns { text, cx, cy } — the button's clean textContent and
+        // its viewport-center coordinates — or null when absent.
+        //
+        // Using coordinates (not text search) for the force click eliminates the pre-existing
+        // first-match priority bug in clickByPanelText: when multiple elements share the same
+        // label (e.g. canvas button + sidebar entry both saying "Add Action App"), text search
+        // returns the first DOM match, which may be the wrong element. Coordinates hit the
+        // EXACT element the probe selected via canvas-priority + anchor-sort.
+        const probeResult = stepFailureCount === 2
+          ? await probeForAddAction(adapter, lastActionBounds ?? undefined).catch(() => null)
+          : null; // count≥3 already tried probe — don't repeat
+
+        if (probeResult !== null) {
+          // forceAction is created before the coordinate click so it's available
+          // on both the coordinate and fallback (bounds-failed) paths.
+          const forceAction: ActionStep = {
+            action: 'click',
+            value:  probeResult.text,
+            reason: `[expected-state] Hybrid force: element "${probeResult.text}" found at (${probeResult.cx},${probeResult.cy})`,
+          };
+
+          // ── Pre-click bounds validation ─────────────────────────────────
+          // Layout shifts, scroll changes, and async canvas re-renders can move
+          // elements between the probe's getBoundingClientRect call and the click.
+          // elementFromPoint confirms the expected element is still at (cx,cy) before
+          // committing to a coordinate click. Fail-open (true on eval error) so a
+          // transient DOM-read failure doesn't block the click entirely.
+          const elementAtCoords = await adapter.evaluateExpr<boolean>(
+            `(() => {
+               var el = document.elementFromPoint(${probeResult.cx}, ${probeResult.cy});
+               if (!el) return false;
+               // Test each attribute independently — concatenating textContent + aria-label
+               // can produce cross-attribute false-positives (e.g. "Add" + "cart action").
+               var tc = (el.textContent || '').trim();
+               var al = el.getAttribute('aria-label') || '';
+               return /add action|add another action/i.test(tc) || /add action|add another action/i.test(al);
+             })()`,
+          ).catch(() => true);
+
+          if (elementAtCoords) {
+            // ── Coordinate click ─────────────────────────────────────────
+            // Bypasses clickByPanelText first-match ambiguity: hits the EXACT
+            // element the probe selected (canvas-priority, anchor-sorted).
+            const t0 = Date.now();
+            const coordClick = await adapter.clickByCoordinates(probeResult.cx, probeResult.cy)
+              .catch((): ActionResult => ({ success: false, effective: false, error: 'coordinate click threw' }));
+            const coordDurationMs = Date.now() - t0;
+
+            // Signals are conservative — real DOM change is validated semantically
+            // by the transition engine (step detection) and exit-state validation
+            // (panel open + step alignment) that run in the post-action section.
+            // Setting effective=false here forces both validators to always run,
+            // preventing a false-success when the click landed on the wrong element.
+            const hfSignals: ActionSignals  = { urlChanged: false, domChanged: false, valueChanged: false };
+            const hfDetails: ValidationDetails = {
+              errorAppeared:      false,
+              elementStillExists: true,  // confirmed by pre-click bounds check
+              intentMatch:        false, // not self-certifying — transition engine verifies
+            };
+            hybridForceResult = {
+              ...coordClick,
+              effective:           false, // NOT self-certifying — transition engine must validate
+              validationConfidence: 'weak',
+              action:        'click',
+              target:        probeResult.text,
+              value:         probeResult.text,
+              description:   coordClick.success
+                ? `[hybrid-force] coordinate-clicked "${probeResult.text}" at (${probeResult.cx},${probeResult.cy})`
+                : `[hybrid-force] coordinate click failed at (${probeResult.cx},${probeResult.cy}): ${coordClick.error ?? 'unknown'}`,
+              strategyUsed:  'coordinates',
+              signals:       hfSignals,
+              details:       hfDetails,
+              validation:    deriveValidation(hfSignals, hfDetails),
+              durationMs:    coordDurationMs,
+              ialHandled:    false, // let legacy text fallback fire if coordinate click failed
+            };
+            console.warn(
+              `[expected-state] HYBRID-FORCE at ${currentFlowStep}: ` +
+              `coordinate-clicked "${probeResult.text}" at (${probeResult.cx},${probeResult.cy}) — ` +
+              `success=${coordClick.success}`,
+            );
+          } else {
+            // Element moved since probe — skip coordinate click, fall through to
+            // executeValidatedAction with text-based forceAction (clickByPanelText fallback).
+            // hybridForceResult stays null so executeValidatedAction runs normally.
+            console.warn(
+              `[expected-state] HYBRID-FORCE at ${currentFlowStep}: ` +
+              `bounds check failed at (${probeResult.cx},${probeResult.cy}) — element moved, using text fallback`,
+            );
+          }
+
+          // History records this turn regardless of coordinate vs text path.
+          actionHistory.push({
+            turn,
+            action:      forceAction.action,
+            target:      probeResult.text,
+            value:       forceAction.value,
+            effective:   false,
+            description: elementAtCoords
+              ? `EXPECTED-STATE-HYBRID-FORCE[${currentFlowStep}]: coordinate-clicked "${probeResult.text}" at (${probeResult.cx},${probeResult.cy})`
+              : `EXPECTED-STATE-HYBRID-FORCE[${currentFlowStep}]: bounds failed — text fallback "${probeResult.text}"`,
+          });
+          if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+          pendingBatchActions = [];
+          gateRetryAction = null;
+          action = forceAction;
+          // hybridForceResult non-null  → executeValidatedAction skipped (coord click already done).
+          // hybridForceResult null      → executeValidatedAction runs with text-based forceAction.
+          // Either path: stepFailureCount stays at 2 — if step transitions it resets; if not → 3 → escalate.
+        } else {
+          // Broad probe also found nothing — element is genuinely absent.
+          // Stop execution and switch to vision so the LLM can re-plan.
+          console.warn(`[expected-state] ESCALATE at ${currentFlowStep}: ${expectedDecision.logMsg}`);
+          mode = 'DOM_WITH_VISION';
+          // Reset the failure counter so the expected-state block does not trigger
+          // another escalation on vision turns before the LLM's action has executed.
+          stepFailureCount = 0;
+          actionHistory.push({
+            turn,
+            action: action.action,
+            target: actionTargetDisplayForSig,
+            value: action.value,
+            effective: false,
+            description: `EXPECTED-STATE-ESCALATE[${currentFlowStep}]: ${expectedDecision.logMsg}`,
+          });
+          if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+          continue;
+        }
+      }
+
+      if (expectedDecision.kind === 'override') {
+        console.warn(`[expected-state] OVERRIDE at ${currentFlowStep}: ${expectedDecision.logMsg}`);
+        actionHistory.push({
+          turn,
+          action: action.action,
+          target: actionTargetDisplayForSig,
+          value: action.value,
+          effective: false,
+          description: `EXPECTED-STATE-OVERRIDE[${currentFlowStep}]: ${expectedDecision.logMsg}`,
+        });
+        if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+        pendingBatchActions = [];
+        gateRetryAction = null;
+        action = expectedDecision.action;
+      }
+      // expectedDecision.kind === 'allow' → fall through
+    }
+
+    // ── State machine gate — block actions illegal in current UI state ──
+    // Detects LOADING / FIELD_SELECTING / PANEL_CLOSED / LOST_CONTEXT and substitutes
+    // a safe action. Original intent preserved in gateRetryAction for transient blocks
+    // so we retry it next turn instead of re-planning from scratch.
+    {
+      const detected = await detectPageState(adapter, consecutiveScrolls);
+      const blockReason = gateAction(action.action, actionTargetDisplayForSig, detected);
+      if (blockReason) {
+        const sub = safeSubstitute(detected);
+        console.warn(`[state-gate] BLOCK ${action.action} on "${actionTargetDisplayForSig}" — ${blockReason} → substitute: ${sub.action}(${sub.value})`);
+        actionHistory.push({
+          turn,
+          action: action.action,
+          target: actionTargetDisplayForSig,
+          value: action.value,
+          effective: false,
+          description: `BLOCKED[${detected.state}]: ${blockReason}`,
+        });
+        if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+        if (!stuckContext) {
+          stuckContext = {
+            goal: nextGoal,
+            url: await adapter.getUrl(),
+            trigger: `State gate blocked ${action.action}: ${blockReason}`,
+            failedActions: [],
+          };
+        }
+
+        // For transient blocks (LOADING, FIELD_SELECTING, PANEL_CLOSED): preserve the
+        // original action for a one-shot retry next turn. Non-transient states (LOST_CONTEXT)
+        // require LLM re-plan — don't preserve.
+        const isTransientBlock =
+          detected.state === 'LOADING' ||
+          detected.state === 'FIELD_SELECTING' ||
+          detected.state === 'PANEL_CLOSED';
+        if (isTransientBlock && !gateRetryAction) {
+          gateRetryAction = action; // store original — consumed at turn start
+        }
+
+        if (detected.state === 'LOADING' && sub.value === '__stability__') {
+          // Call waitForUIStability directly — more precise than a blind wait(800).
+          // Polls loader selectors + DOM fingerprint; resolves when UI is settled.
+          await waitForUIStability(adapter, 'click');
+          action = { ...action, action: 'wait' as any, value: '0' };
+        } else {
+          action = { ...action, action: sub.action as any, value: sub.value };
+        }
+      }
+    }
+
+    // ── Navigate URL guard — block internal/localhost navigation ─
+    // The model occasionally hallucinates the test-runner's own localhost URL
+    // (e.g. http://localhost:3002/runs/...) as a navigate target, either from
+    // screenshot metadata or from misreading the instructions. Executing that
+    // navigate pulls the browser off the product page and into a loop where
+    // every subsequent turn sees the runner's own UI instead of the test page.
+    //
+    // Block any navigate that:
+    //  (a) targets localhost / 127.0.0.1 — always wrong during a real test
+    //  (b) targets a domain that is not in the allowedDomains whitelist
+    // In both cases: skip execution, inject a corrective hint so the model
+    // knows it mis-navigated, and continue to the next turn.
+    if (action.action === 'navigate' && action.value) {
+      let navBlocked = false;
+      let navBlockReason = '';
+      try {
+        const navUrl = new URL(action.value);
+        const navHost = navUrl.hostname;
+        if (navHost === 'localhost' || navHost === '127.0.0.1' || navHost.startsWith('::1')) {
+          navBlocked = true;
+          navBlockReason = `localhost navigation blocked — the test must stay on the product page`;
+        } else if ((navHost === 'connectcloud.appypie.com' || navHost.endsWith('.connectcloud.appypie.com')) && !testAccount) {
+          navBlocked = true;
+          navBlockReason = `navigate to connectcloud.appypie.com blocked — this domain requires authentication which is not configured for this test; stay on the public appypieautomate.ai pages`;
+        } else if (!allowedDomains.some(d => navHost === d || navHost.endsWith('.' + d))) {
+          navBlocked = true;
+          navBlockReason = `navigate to "${navHost}" blocked — not in allowed domains [${allowedDomains.join(', ')}]`;
+        }
+      } catch {
+        // Malformed URL — let it fail naturally in the action engine
+      }
+      if (navBlocked) {
+        console.warn(`[cua] T${turn}: BLOCKED navigate to "${action.value}" — ${navBlockReason}`);
+        const blockNote = `[BLOCKED NAVIGATE] ${action.value}: ${navBlockReason}. Stay on the current product page.`;
+        agentMemory = agentMemory ? `${agentMemory} | ${blockNote}` : blockNote;
+        actionHistory.push({
+          turn, action: 'navigate', target: action.value || '', value: action.value || '',
+          effective: false, description: `BLOCKED: ${navBlockReason}`,
+        });
+        if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+        callbacks.onActionsExecuted(turn, [{ type: 'navigate' }]);
+        continue;
+      }
+    }
+
     // ── Execute through Action Engine (with validation) ─────────
     // Coordinates are only appropriate when click-blocked (overlay) or explicitly forced
     const lastFailureType = stuckContext?.failedActions.slice(-1)[0]?.type;
     const allowCoordinates = !stuckContext || forceStrategySwitch === 'coordinates' || lastFailureType === 'NO_EFFECT_CLICK_BLOCKED';
-    let result = await executeValidatedAction(adapter, action, state, {
+    // hybridForceResult is non-null when the probe already executed a coordinate click
+    // this turn. Use it directly — do NOT call executeValidatedAction (would double-click).
+    let result: ValidatedResult = hybridForceResult ?? await executeValidatedAction(adapter, action, state, {
       forcedStrategy: forceStrategySwitch ?? undefined,
       preferredStrategy: lastSuccessfulStrategy ?? undefined,
       allowCoordinates,
@@ -1823,6 +2431,178 @@ async function runCUALoopDOM(
       }
     }
 
+    // ── Transition Engine post-action — step advancement proof ──────
+    // Re-detect the flow step after all smart handlers have run.
+    // If the step advanced (prev → new is a valid transition) the action provably
+    // made progress regardless of DOM signal strength — upgrade effective=true.
+    // Only fires when the action engine returned effective=false to avoid a
+    // redundant eval on already-confirmed successes.
+    //
+    // postStep is declared in outer scope so exit-state validation below can
+    // reuse the detection result without a second round-trip.
+    let postActionStep: FlowStep | null = null;
+    if (!result.effective && action.action !== 'wait' && action.action !== 'scroll') {
+      try {
+        postActionStep = await detectFlowStep(adapter);
+        // Compare from currentFlowStep (step as of THIS turn's pre-action detection),
+        // NOT prevFlowStep (step from last turn). Using prevFlowStep would give a false
+        // positive when the step already advanced at detection time before the action ran.
+        const postTr = checkTransition(currentFlowStep, postActionStep);
+        if (postTr.ok) {
+          result = { ...result, effective: true };
+          // Step transition is semantic proof the action achieved its intent.
+          // Upgrade 'weak' (coordinate/heuristic) → 'medium' (step-level evidence).
+          // Does not downgrade actions already at 'medium' or 'strong'.
+          if (result.validationConfidence === 'weak') {
+            result = { ...result, validationConfidence: 'medium' };
+          }
+          console.log(`[transition-engine] Post-action: ${currentFlowStep} → ${postActionStep} → effective=true confidence=${result.validationConfidence}`);
+        }
+      } catch {
+        // Non-fatal — fall back to action-engine's effective signal
+      }
+    }
+
+    // ── Exit-State Validation — panel-open + step alignment ──────────
+    // After clicking "Add Action App" (including step-engine overrides and hybrid
+    // force clicks), validate two conditions together:
+    //
+    //   1. panelOpen === true  (structural — the side panel DOM node exists)
+    //   2. step ∈ {ACTION_SETUP, ACTION_CONFIG}  (semantic — correct panel opened)
+    //
+    // Both conditions must pass. Requiring only panelOpen would allow the trigger
+    // panel (or a modal) to satisfy validation — wrong-panel false success.
+    // Requiring only step transition misses slow async panel renders that lag
+    // one turn behind the canvas re-render. Together they are necessary and
+    // sufficient for "Add Action App" click success.
+    //
+    // postActionStep is reused from the transition check above when available,
+    // avoiding a redundant detectFlowStep call on already-effective actions.
+    if (
+      action.action === 'click' &&
+      /add.{0,10}action/i.test(
+        String(action.value ?? '') + ' ' + String(
+          typeof action.target === 'string'
+            ? action.target
+            : (action.target as { text?: string } | undefined)?.text ?? ''
+        )
+      )
+    ) {
+      try {
+        const panelOpened = await probePanelOpen(adapter);
+        if (panelOpened) {
+          // Re-detect step if not already available from the transition check
+          const exitStep = postActionStep ?? await detectFlowStep(adapter).catch(() => null);
+          // Narrowed to FlowStep (not null) by the === checks below.
+          // Using a type predicate avoids the non-null assertion later.
+          const alignedStep =
+            exitStep === FlowStep.ACTION_SETUP ? FlowStep.ACTION_SETUP
+            : exitStep === FlowStep.ACTION_CONFIG ? FlowStep.ACTION_CONFIG
+            : null;
+
+          if (alignedStep !== null) {
+            // Both structural (panel exists) and semantic (correct step) conditions pass.
+            // Panel content validation is soft — enhances logging but doesn't block execution.
+            const contentResult = await validatePanelContent(adapter, alignedStep).catch(() => null);
+            if (contentResult?.valid === false) {
+              console.warn(`[exit-state] Panel open, step=${alignedStep}, but no text or structural match — snippet: "${contentResult.snippet}" — proceeding (soft check)`);
+            } else if (contentResult?.valid) {
+              const via = contentResult.structureFound && contentResult.matchedPattern
+                ? `text+"${contentResult.matchedPattern}" + structure`
+                : contentResult.structureFound
+                  ? 'structure (interactive elements found)'
+                  : `text pattern "${contentResult.matchedPattern}"`;
+              console.log(`[exit-state] Panel content valid via ${via} for ${alignedStep}`);
+            }
+
+            if (!result.effective) result = { ...result, effective: true };
+            // Upgrade confidence: panel-open + step alignment is dual-signal evidence.
+            // 'weak' (coordinate/heuristic) → 'medium' (structural + semantic confirmation).
+            // Does not downgrade actions already validated at 'medium' or 'strong'.
+            if (result.validationConfidence === 'weak') {
+              result = { ...result, validationConfidence: 'medium' };
+            }
+            console.log(`[exit-state] Panel open + step=${alignedStep} — exit-state aligned ✓ confidence=${result.validationConfidence} (${currentFlowStep})`);
+          } else {
+            // Wrong panel opened — the click hit an unintended target.
+            // Downgrade effective=true (if it was blindly set by the action engine)
+            // so the next turn's step engine treats this as a failed attempt.
+            // This prevents silent wrong-panel false-success from coordinate clicks.
+            if (result.effective) {
+              result = { ...result, effective: false };
+              console.warn(`[exit-state] Wrong panel: step=${exitStep ?? 'null'} — downgrading effective=false (${currentFlowStep})`);
+            } else {
+              console.warn(`[exit-state] Panel open but step=${exitStep ?? 'null'} — wrong panel or delayed transition (${currentFlowStep})`);
+            }
+          }
+        } else {
+          // Panel did not open — click missed, wrong element, or async render too slow.
+          // Downgrade effective=true so the step engine treats this turn as no progress.
+          if (result.effective) {
+            result = { ...result, effective: false };
+            console.warn(`[exit-state] Panel did NOT open — downgrading effective=false (${currentFlowStep})`);
+          } else {
+            console.warn(`[exit-state] Panel did NOT open after "Add Action App" click — click may have missed or render is slow (${currentFlowStep})`);
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    // ── Interaction anchor capture ────────────────────────────────
+    // After a successful click, record the element's viewport center so the
+    // hybrid probe can prefer "Add Action App" candidates nearest to the last
+    // interaction point. Best-effort — failure leaves lastActionBounds as-is.
+    //
+    // Lookup priority (most → least precise):
+    //   1. Text from state.elements[elementId] — matches exactly what the
+    //      action engine used to find the element this turn.
+    //   2. action.value — the LLM-specified click value.
+    //
+    // Candidate scoring:
+    //   Exact full-text match + button tag = 4
+    //   Exact full-text match             = 3
+    //   Prefix match   + button tag       = 2
+    //   Prefix match                      = 1
+    //
+    // Scoring prevents DOM-order bias when multiple elements share a prefix.
+    if (result.success && result.effective && action.action === 'click') {
+      const eId = targetElementId(action.target);
+      const eRecord = eId ? state.elements.find((e: { elementId: string; text?: string }) => e.elementId === eId) : null;
+      const lookupText = (eRecord?.text ?? String(action.value ?? '')).trim().slice(0, 60).toLowerCase();
+
+      if (lookupText) {
+        try {
+          const boundsExpr = `
+            (() => {
+              try {
+                var t = ${JSON.stringify(lookupText)};
+                var prefix = t.slice(0, 20);
+                var nodes = document.querySelectorAll('button,[role="button"],a,[class*="btn"]');
+                var best = null, bestScore = 0;
+                for (var i = 0; i < nodes.length; i++) {
+                  var txt = (nodes[i].textContent || '').trim().toLowerCase();
+                  var isBtn = nodes[i].tagName === 'BUTTON';
+                  var score = 0;
+                  if (txt === t)               score = isBtn ? 4 : 3;
+                  else if (txt.startsWith(prefix)) score = isBtn ? 2 : 1;
+                  if (score > bestScore) { bestScore = score; best = nodes[i]; }
+                }
+                if (!best) return null;
+                var r = best.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0)
+                  return { cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2) };
+                return null;
+              } catch(e) { return null; }
+            })()
+          `.trim();
+          const bounds = await adapter.evaluateExpr<{ cx: number; cy: number } | null>(boundsExpr).catch(() => null);
+          if (bounds) lastActionBounds = bounds;
+        } catch { /* non-fatal */ }
+      }
+    }
+
     lastResult = result;
 
     // ── Canvas title-edit guard ───────────────────────────────────
@@ -1927,11 +2707,16 @@ async function runCUALoopDOM(
       .replace(/\/[a-f0-9]{24,}/g, '/*').replace(/\/[a-z0-9]{20,}/g, '/*');
     const isBackwardNav = result.signals.urlChanged && visitedUrlPaths.has(postActionPath);
     if (result.effective && !isBackwardNav && (action.confidence ?? 0) >= 0.80) {
-      recordSuccessfulAction(state.url, pageTitle, cacheElements,
-        { action: action.action, target: actionTargetIdForCache, value: action.value || '', confidence: action.confidence ?? 0.9 },
-        result.description, true);
+      const shouldRecord = !!result.validationConfidence && result.validationConfidence !== 'weak';
+      if (shouldRecord) {
+        recordSuccessfulAction(state.url, pageTitle, cacheElements,
+          { action: action.action, target: actionTargetIdForCache, value: action.value || '', confidence: action.confidence ?? 0.9 },
+          result.description, true, result.validationConfidence);
+      } else {
+        console.debug(`[cache-skip] weak-validation action=${action.action} target=${actionTargetIdForCache} confidence=${result.validationConfidence ?? 'undefined'}`);
+      }
 
-      // Track for sequence recording
+      // Always track for sequence recording — sequence gate filters weak at recordSequence time
       const targetEl = resolveTargetElement(action.target, state.elements);
       pageActionSequence.push({
         action: action.action,
@@ -1939,13 +2724,19 @@ async function runCUALoopDOM(
         targetTag: targetEl?.tag || '',
         value: action.value || '',
         confidence: action.confidence ?? 0.9,
+        validationConfidence: result.validationConfidence,
       });
     } else if (!result.effective) {
       recordFailedAction(state.url, pageTitle, cacheElements);
       // Flush batch on failure — remaining queued actions are stale
       if (pendingBatchActions.length > 0) {
         console.log(`[cua] Flushing ${pendingBatchActions.length} batch actions after failure`);
+        if (batchFromSequence) {
+          recordFailedSequence(batchSequenceUrl, batchSequenceTitle);
+          console.warn(`[cua] Penalized sequence for "${batchSequenceUrl}" after ineffective action`);
+        }
         pendingBatchActions = [];
+        batchFromSequence = false;
       }
     }
 
@@ -2161,7 +2952,7 @@ async function runCUALoopDOM(
         console.warn(`[cua] BACKWARD NAV detected → ${currentUrlPathForVisited} (already visited). Flushing ${pendingBatchActions.length} batch actions.`);
         pendingBatchActions = [];
         // Invalidate the sequence that caused this
-        recordFailedSequence(currentUrl, state.title || '');
+        recordFailedSequence(currentUrl, state.title || '', state.elements);
       }
       // Track where we've been (use normalized path, not full URL with IDs)
       visitedUrlPaths.add(currentUrlPathForVisited);
@@ -2323,12 +3114,73 @@ async function runCUALoopDOM(
     const VISION_BURST_TURNS = 10;
 
     if (mode === 'VISION_BURST') {
-      // Circuit breaker
+      // Circuit breaker — run system validation before giving up.
+      // The agent being stuck does NOT mean the page is wrong; validation is authoritative.
       if (visionBurstsUsed >= MAX_VISION_BURSTS) {
+        // Run the same validation path as the normal 'done' handler.
+        const cbRules: ValidationRule[] = validationRules && validationRules.length > 0
+          ? validationRules
+          : inferValidationRules(expectedOutcome, state.url);
+        let cbValidation: ValidationResult | undefined;
+        if (cbRules.length > 0) {
+          let cbState = state;
+          if (cbState.elements.length < 5) {
+            await new Promise(r => setTimeout(r, 2000));
+            try { cbState = await adapter.getState(); } catch { /* stale ok */ }
+          }
+          cbValidation = validateState(cbState, cbRules);
+          console.log(`[validation] circuit-breaker check:`);
+          console.log(formatValidation(cbValidation));
+        }
+
+        // Sanitize URL — getUrl() can return a Playwright-composed double-URL like
+        // "https://host/http://localhost:3002/..." when the model navigated to the
+        // test-runner's local URL while still on the product page.
+        const rawCbUrl = await adapter.getUrl().catch(() => '');
+        const cbUrl = /https?:\/\/localhost/i.test(rawCbUrl)
+          ? rawCbUrl.replace(/https?:\/\/localhost[^/]*(\/[^?#]*)?(\?.*)?$/, '')
+          : rawCbUrl;
+
+        const stuckGoal = stuckContext?.goal || nextGoal;
+
+        if (cbValidation && cbValidation.passed && cbValidation.score === 1) {
+          // System validation confirms the page objective was met despite agent getting stuck.
+          // The test passed — agent execution difficulty ≠ page failure.
+          console.warn(`[validation] OVERRIDE: circuit-breaker hit but system validation PASSED (100%) → final PASS`);
+          const validationLine = `SYSTEM VALIDATION: PASS (${(cbValidation.score * 100).toFixed(0)}%)`;
+          return {
+            verdict: 'PASS',
+            modelVerdict: 'FAIL',
+            modelMessage: [
+              'VERDICT: PASS',
+              'MODEL VERDICT: FAIL',
+              validationLine,
+              `SUMMARY: Agent exhausted ${MAX_VISION_BURSTS} vision bursts but system validation confirmed the page objective was met.`,
+              `WARNINGS (overridden by validation): Could not complete agent goal "${stuckGoal}"${cbUrl ? ` at ${cbUrl}` : ''}`,
+            ].join('\n'),
+            turns: turn,
+            totalTokens,
+            systemValidation: cbValidation,
+          };
+        }
+
+        const validationSummary = cbValidation
+          ? `SYSTEM VALIDATION: ${cbValidation.passed ? 'PASS' : 'FAIL'} (${(cbValidation.score * 100).toFixed(0)}%)`
+          : 'SYSTEM VALIDATION: skipped (no rules)';
+
         return {
           verdict: 'FAIL',
-          modelMessage: `VERDICT: FAIL\nSUMMARY: Exhausted ${MAX_VISION_BURSTS} vision bursts without resolving stuck state.\nISSUES: Could not complete: ${stuckContext?.goal || nextGoal} at ${await adapter.getUrl()}`,
-          turns: turn, totalTokens,
+          modelVerdict: 'FAIL',
+          modelMessage: [
+            'VERDICT: FAIL',
+            'MODEL VERDICT: FAIL',
+            validationSummary,
+            `SUMMARY: Exhausted ${MAX_VISION_BURSTS} vision bursts without resolving stuck state.`,
+            `ISSUES: Could not complete: ${stuckGoal}${cbUrl ? ` at ${cbUrl}` : ''}`,
+          ].join('\n'),
+          turns: turn,
+          totalTokens,
+          systemValidation: cbValidation,
         };
       }
 
@@ -2382,6 +3234,20 @@ async function runCUALoopDOM(
         consecutiveNonMeaningful = 0;
         consecutiveScrolls = 0;
         stuckContext = null;
+        gateRetryAction = null;   // vision burst re-plans — original intent is stale
+        currentFlowStep = FlowStep.UNKNOWN; // re-detect on next turn
+        turnsInCurrentStep = 0;
+        stepFailureCount = 0;
+        prevFlowStep = FlowStep.UNKNOWN;
+        lastActionBounds = null; // vision burst replans from scratch — anchor is stale
+        // Reset progress counters to the current turn — vision burst turns must NOT
+        // count against the stall/URL-stuck windows.  Without this reset, the stall
+        // detector (turnsWithoutProgress >= 5) fires on the very first DOM turn after
+        // the burst (because burst turns inflated 'turn' without updating lastProgressTurn),
+        // forcing consecutiveFailures=1 and mode=DOM_WITH_VISION immediately, which then
+        // escalates to VISION_BURST on the second DOM turn — the exact 2-turn loop pattern.
+        lastProgressTurn = turn;
+        sameUrlTurns = 0;
 
         try { state = await adapter.getState(); } catch {}
 
@@ -2419,32 +3285,74 @@ async function runCUALoopDOM(
       lastProgressTurn = turn; // URL changed = progress
     }
 
-    // Track progress: URL change or effective action = real progress
-    if (result.success && result.effective && (result.validation.urlChanged || result.validation.domChanged)) {
+    // Track progress: only semantically meaningful changes count
+    const isRealProgress =
+      result.validation.urlChanged ||
+      (result.effective && result.validationConfidence === 'strong') ||
+      (result.effective && result.validationConfidence === 'medium' && result.validation.valueChanged);
+
+    if (result.success && isRealProgress) {
       lastProgressTurn = turn;
     }
 
     // ── Sequence recording: save action sequence on page transition ──
-    if (result.validation.urlChanged && pageActionSequence.length >= 2) {
-      // Guard: don't record sequences that result in backward navigation
-      // (e.g., redirect back to /connects after incomplete trigger setup)
-      const destPath = currentUrl.replace(/https?:\/\/[^/]+/, '').split('?')[0];
-      const isBackward = visitedUrlPaths.has(
-        destPath.replace(/\/[a-f0-9]{24,}/g, '/*').replace(/\/[a-z0-9]{20,}/g, '/*'),
-      );
-      if (!isBackward) {
-        const seqDesc = `${pageActionSequence.length} actions: ${pageActionSequence.map(a => a.action).join('→')}`;
-        recordSequence(state.url, currentPageTitle, pageActionSequence, seqDesc);
-        console.log(`[cua] Recorded sequence: "${seqDesc}" for ${currentPageKey}`);
+    // SPA trigger: URL change (classic) OR significant in-page state transition.
+    // SPA gate is intentionally strict — heuristics that are too loose recorded garbage before.
+    // Requirements: 4+ actions, domChanged, ≥3 unique targets (not the same element repeated),
+    // no repeated action+target pairs (loop artifact), all actions ≥ medium confidence.
+    const spaUniqueTargets = new Set(pageActionSequence.map(a => a.targetText).filter(Boolean)).size;
+    const hasConsecutiveRepeatedActionTarget = pageActionSequence.some(
+      (a, i) =>
+        i > 0 &&
+        a.action === pageActionSequence[i - 1].action &&
+        a.targetText === pageActionSequence[i - 1].targetText
+    );
+    const isSpaTransition =
+      !result.signals.urlChanged &&
+      result.signals.domChanged &&
+      pageActionSequence.length >= 4 &&
+      spaUniqueTargets >= 3 &&
+      !hasConsecutiveRepeatedActionTarget &&
+      pageActionSequence.every(a => a.validationConfidence === 'strong' || a.validationConfidence === 'medium');
+    if ((result.validation.urlChanged || isSpaTransition) && pageActionSequence.length >= 2) {
+      if (consecutiveFailures > 0) {
+        console.warn(`[cua] Skipping sequence recording — ${consecutiveFailures} consecutive failures in sequence`);
       } else {
-        console.warn(`[cua] Skipped recording sequence — destination is a previously visited URL`);
+        // Sequence-level sanity checks before recording.
+        // Degenerate sequences (all same action, duplicate consecutive targets) are loop
+        // artifacts, not real flows. Reject before they enter the cache.
+        const actionTypes = new Set(pageActionSequence.map(a => a.action));
+        const allSameAction = actionTypes.size === 1 && !['click'].includes([...actionTypes][0]);
+        const hasConsecutiveDuplicateTarget = pageActionSequence.some(
+          (a, i) => i > 0 && a.targetText && a.targetText === pageActionSequence[i - 1].targetText,
+        );
+        if (allSameAction) {
+          console.warn(`[cua] Skipping sequence recording — degenerate: all actions are "${[...actionTypes][0]}"`);
+        } else if (hasConsecutiveDuplicateTarget) {
+          console.warn(`[cua] Skipping sequence recording — loop indicator: consecutive duplicate targets`);
+        } else {
+          const destPath = currentUrl.replace(/https?:\/\/[^/]+/, '').split('?')[0];
+          const isBackward = visitedUrlPaths.has(
+            destPath.replace(/\/[a-f0-9]{24,}/g, '/*').replace(/\/[a-z0-9]{20,}/g, '/*'),
+          );
+          if (!isBackward) {
+            const seqDesc = `${pageActionSequence.length} actions: ${pageActionSequence.map(a => a.action).join('→')}`;
+            recordSequence(state.url, currentPageTitle, pageActionSequence, seqDesc, state.elements);
+            console.log(`[cua] Recorded sequence: "${seqDesc}" for ${currentPageKey}`);
+          } else {
+            console.warn(`[cua] Skipped recording sequence — destination is a previously visited URL`);
+          }
+        }
       }
     }
-    if (result.validation.urlChanged || !currentPageKey) {
-      // Reset sequence tracking for new page
+    if (result.validation.urlChanged || isSpaTransition || !currentPageKey) {
+      // Reset sequence tracking for new page or SPA transition.
+      // SPA transition: sequence recorded above — start fresh so the next flow isn't
+      // contaminated by actions from a prior in-page state.
       currentPageKey = state.url;
       currentPageTitle = state.title || '';
       pageActionSequence = [];
+      batchFromSequence = false;
     }
 
     // Abort if stuck on same URL too long
