@@ -1,6 +1,5 @@
 import { v4 as uuid } from 'uuid';
-import { MetricSnapshot } from '../db/models/MetricSnapshot.js';
-import { TestRun } from '../db/models/TestRun.js';
+import * as repo from '../db/repo.js';
 import { getQueueMetrics } from '../queue/queue.js';
 
 // Alert thresholds (configurable via env)
@@ -13,32 +12,31 @@ export async function captureMetricSnapshot() {
 
   // Compute stats from last 24 hours
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const recentRuns = await TestRun.find({
-    completedAt: { $gte: since },
-    status: { $nin: ['queued', 'running'] },
-  }).lean();
+  const recentRuns = await repo.getRecentCompletedRuns(since);
 
   const totalRuns = recentRuns.length;
   const failedRuns = recentRuns.filter(r => r.status === 'failed' || r.status === 'error').length;
   const failureRate = totalRuns > 0 ? Math.round((failedRuns / totalRuns) * 100) : 0;
 
-  const durations = recentRuns.filter(r => r.durationMs).map(r => r.durationMs!);
+  const durations = recentRuns.filter(r => r.duration_ms).map(r => r.duration_ms!);
   const avgLatencyMs = durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
 
-  const totalTokensUsed = recentRuns.reduce((sum, r) => sum + (r.inputTokens || 0) + (r.outputTokens || 0), 0);
+  const totalTokensUsed = recentRuns.reduce((sum, r) => sum + (r.input_tokens || 0) + (r.output_tokens || 0), 0);
 
-  // Generate alerts
+  // Generate alerts — only when there are recent runs (skip on cold start)
   const alerts: string[] = [];
-  if (failureRate > ALERT_FAILURE_RATE) {
-    alerts.push(`HIGH_FAILURE_RATE: ${failureRate}% failure rate in last 24h (threshold: ${ALERT_FAILURE_RATE}%)`);
+  if (totalRuns >= 3) {
+    if (failureRate > ALERT_FAILURE_RATE) {
+      alerts.push(`HIGH_FAILURE_RATE: ${failureRate}% failure rate in last 24h (${failedRuns}/${totalRuns} runs)`);
+    }
+    if (avgLatencyMs > ALERT_AVG_LATENCY_MS) {
+      alerts.push(`HIGH_LATENCY: avg ${Math.round(avgLatencyMs / 1000)}s per test (threshold: ${Math.round(ALERT_AVG_LATENCY_MS / 1000)}s)`);
+    }
   }
   if (queue.waiting > ALERT_QUEUE_SIZE) {
     alerts.push(`QUEUE_BACKLOG: ${queue.waiting} jobs waiting (threshold: ${ALERT_QUEUE_SIZE})`);
   }
-  if (avgLatencyMs > ALERT_AVG_LATENCY_MS) {
-    alerts.push(`HIGH_LATENCY: avg ${Math.round(avgLatencyMs / 1000)}s per test (threshold: ${Math.round(ALERT_AVG_LATENCY_MS / 1000)}s)`);
-  }
-  if (queue.failed > 5) {
+  if (queue.failed > 10) {
     alerts.push(`QUEUE_FAILURES: ${queue.failed} failed jobs in queue`);
   }
 
@@ -48,28 +46,31 @@ export async function captureMetricSnapshot() {
   }
 
   // Save snapshot
-  const snapshot = await MetricSnapshot.create({
-    _id: uuid(),
+  const id = uuid();
+  await repo.createMetricSnapshot({
+    id,
     timestamp: new Date(),
-    queueWaiting: queue.waiting,
-    queueActive: queue.active,
-    queueFailed: queue.failed,
-    totalRuns,
-    failureRate,
-    avgLatencyMs,
-    totalTokensUsed,
+    queue_waiting: queue.waiting,
+    queue_active: queue.active,
+    queue_failed: queue.failed,
+    total_runs: totalRuns,
+    failure_rate: failureRate,
+    avg_latency_ms: avgLatencyMs,
+    total_tokens_used: totalTokensUsed,
     alerts,
   });
 
-  return snapshot;
+  // Clean up old metrics (replace MongoDB TTL index)
+  const ttlCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 7 days
+  await repo.deleteOldMetrics(ttlCutoff);
+
+  return repo.getMetricsSince(new Date(Date.now() - 1000)); // return the just-created snapshot
 }
 
 // Get time-series data for the last N hours
 export async function getMetricsTimeSeries(hours = 24) {
   const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-  return MetricSnapshot.find({ timestamp: { $gte: since } })
-    .sort({ timestamp: 1 })
-    .lean();
+  return repo.getMetricsSince(since);
 }
 
 // Schedule metrics capture every 5 minutes

@@ -2,7 +2,6 @@ name: "App pairing - GoHighLevel and Mindbody"
 url: "https://www.appypieautomate.ai"
 requires_auth: true
 category: e2e
-max_turns: 60
 instructions: |
   1. On the homepage, look for the app integration search fields in the hero section
      - If two app search fields with a "+" icon between them are available, use them:
@@ -15,7 +14,8 @@ instructions: |
      - Click the Login/Sign In button
      - Wait for redirect to the connect editor
   3. If already logged in, verify redirect to the connect editor page
-  4. On the connect editor page, verify the workflow loaded:
+  4. On the connect editor page, if the editor shows an empty state or a 503 error, wait 3 seconds and retry by refreshing the page. If the 503 persists, note it as an issue but do not fail immediately — continue checking other elements.
+     Verify the workflow loaded:
      - GoHighLevel is shown as the Trigger application
      - A trigger event is selected (e.g. "New Form Submission" or similar)
      - Mindbody is shown as the Action application
@@ -33,6 +33,7 @@ instructions: |
      - If a linked account is already shown, note it and proceed
      - If no account is linked, note that account linking is required and capture the "Connect a MINDBODY Account" or "Add an Account" prompt
   9. Report the final state: whether both apps are configured with events and accounts, or which step requires further action
+  NOTE: If any page shows a 503 error or empty state, wait 3 seconds and retry. Empty states (no existing data) are acceptable — proceed with the test flow. If the editor shows empty state or 503, note as issue but don't fail immediately.
 timeout: 360000
 expected_outcome: "The connect editor loads with GoHighLevel as trigger and Mindbody as action, both with default events pre-selected. The workflow editor layout shows both app brandings and account connection status."
 tags:

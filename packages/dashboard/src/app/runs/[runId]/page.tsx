@@ -1,66 +1,21 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import { useSSE } from '@/lib/use-sse';
+import type { RunDetail, TurnToken } from '@cua/shared';
 
 const API = process.env.NEXT_PUBLIC_API_URL || '';
 
-interface Screenshot {
-  id: string;
-  turn_number: number;
-  file_path: string;
-  captured_at: string;
-  page_url: string | null;
-  page_title: string | null;
-}
-
-interface RunEvent {
-  id: string;
-  type: string;
-  message: string;
-  timestamp: string;
-  sequence: number;
-}
-
-interface TurnToken {
-  id: string;
-  turn_number: number;
-  input_tokens: number;
-  output_tokens: number;
-  reasoning_tokens: number;
-  api_latency_ms: number;
-  cumulative_input: number;
-  cumulative_output: number;
-  cumulative_reasoning: number;
-  timestamp: string;
-}
-
-interface RunDetail {
-  id: string;
-  test_id: string;
-  test_name: string;
-  status: string;
-  started_at: string;
-  completed_at: string | null;
-  duration_ms: number | null;
-  turn_count: number;
-  screenshot_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  reasoning_tokens: number;
-  model_verdict: string | null;
-  error: string | null;
-  screenshots: Screenshot[];
-  events: RunEvent[];
-  turnTokens: TurnToken[];
-}
+// RunDetail from @cua/shared includes: screenshots, events, turnTokens
 
 export default function RunDetailPage() {
   const params = useParams();
   const runId = params.runId as string;
   const [run, setRun] = useState<RunDetail | null>(null);
   const [selectedScreenshot, setSelectedScreenshot] = useState<number>(0);
+  const [prevScreenshotCount, setPrevScreenshotCount] = useState(0);
+  const thumbnailStripRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [aborting, setAborting] = useState(false);
   const [viewMode, setViewMode] = useState<'screenshots' | 'video'>('screenshots');
@@ -106,7 +61,7 @@ export default function RunDetailPage() {
     }
   }, [liveEvents.length, runId]);
 
-  // Poll while active, check for video when completed
+  // Poll run state while active
   useEffect(() => {
     if (!isActive) return;
     const interval = setInterval(async () => {
@@ -114,17 +69,68 @@ export default function RunDetailPage() {
       if (res.ok) {
         const data = await res.json();
         setRun(data);
-        // When run just completed, check for video after a short delay (FFmpeg needs time)
-        if (data.status !== 'running' && data.status !== 'queued') {
-          setTimeout(async () => {
-            const videoRes = await fetch(`${API}/api/runs/${runId}/video`, { method: 'HEAD' });
-            setHasVideo(videoRes.ok);
-          }, 3000);
-        }
       }
     }, 3000);
     return () => clearInterval(interval);
   }, [isActive, runId]);
+
+  // Poll for replay video once the run stops — FFmpeg runs async after the run ends
+  // (also runs after abort, failure, timeout — any terminal state that produces screenshots).
+  // Retries every 2s for up to 60s, or until the video is found, or SSE video_ready event lands.
+  useEffect(() => {
+    if (isActive) return;
+    if (hasVideo) return;
+    if (!run) return;
+
+    // Fire once immediately, then poll
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 30; // 30 * 2s = 60s
+
+    const tick = async () => {
+      if (cancelled) return;
+      attempts++;
+      try {
+        const r = await fetch(`${API}/api/runs/${runId}/video`, { method: 'HEAD' });
+        if (r.ok) {
+          setHasVideo(true);
+          return;
+        }
+      } catch {/* ignore */}
+      if (attempts < MAX_ATTEMPTS) {
+        setTimeout(tick, 2000);
+      }
+    };
+    tick();
+
+    return () => { cancelled = true; };
+  }, [isActive, hasVideo, runId, run?.id]);
+
+  // Any video_ready SSE event → immediately re-check
+  useEffect(() => {
+    if (hasVideo) return;
+    const videoEvent = liveEvents.find((e: any) => e.type === 'video_ready');
+    if (!videoEvent) return;
+    fetch(`${API}/api/runs/${runId}/video`, { method: 'HEAD' }).then(r => setHasVideo(r.ok)).catch(() => {});
+  }, [liveEvents, hasVideo, runId]);
+
+  // Auto-scroll thumbnail strip to latest screenshot when new one arrives
+  const screenshotCount = run?.screenshots?.length ?? 0;
+  useEffect(() => {
+    if (screenshotCount > prevScreenshotCount && screenshotCount > 0) {
+      // New screenshot — auto-select it and scroll strip to end
+      setSelectedScreenshot(screenshotCount - 1);
+      setPrevScreenshotCount(screenshotCount);
+      setTimeout(() => {
+        if (thumbnailStripRef.current) {
+          thumbnailStripRef.current.scrollTo({
+            left: thumbnailStripRef.current.scrollWidth,
+            behavior: 'smooth',
+          });
+        }
+      }, 100);
+    }
+  }, [screenshotCount, prevScreenshotCount]);
 
   if (loading) return <div className="text-gray-500 text-center py-20">Loading...</div>;
   if (!run) return <div className="text-gray-500 text-center py-20">Run not found</div>;
@@ -222,7 +228,7 @@ export default function RunDetailPage() {
               >
                 {rerunning ? 'Starting...' : 'Re-Test'}
               </button>
-              {run.status === 'timeout' && (
+              {(run.status === 'timeout' || run.status === 'error' || run.status === 'aborted') && (
                 <button
                   onClick={async () => {
                     const moreTurns = run.turn_count + 20;
@@ -265,6 +271,8 @@ export default function RunDetailPage() {
                 setAborting(true);
                 try {
                   await fetch(`${API}/api/runs/${runId}/abort`, { method: 'POST' });
+                  // Small delay for DB write, then refetch
+                  await new Promise(r => setTimeout(r, 500));
                   const res = await fetch(`${API}/api/runs/${runId}`);
                   if (res.ok) setRun(await res.json());
                 } catch (err) {
@@ -312,26 +320,42 @@ export default function RunDetailPage() {
           {showTokens && (
             <div className="border-t border-gray-800">
               {/* Summary bar */}
-              <div className="grid grid-cols-4 gap-4 px-5 py-3 bg-gray-800/50">
-                <div>
-                  <div className="text-xs text-gray-500">Total Input</div>
-                  <div className="text-sm font-semibold text-blue-400">{(run.input_tokens / 1000).toFixed(1)}k</div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Total Output</div>
-                  <div className="text-sm font-semibold text-emerald-400">{(run.output_tokens / 1000).toFixed(1)}k</div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Reasoning</div>
-                  <div className="text-sm font-semibold text-amber-400">{(run.reasoning_tokens / 1000).toFixed(1)}k</div>
-                </div>
-                <div>
-                  <div className="text-xs text-gray-500">Avg per Turn</div>
-                  <div className="text-sm font-semibold text-gray-300">
-                    {run.turn_count > 0 ? ((run.input_tokens + run.output_tokens) / run.turn_count / 1000).toFixed(1) + 'k' : '--'}
+              {(() => {
+                const domTurns = run.turnTokens?.filter((t: TurnToken) => !t.mode || t.mode === 'dom') || [];
+                const visionTurns = run.turnTokens?.filter((t: TurnToken) => t.mode === 'vision' || t.mode === 'vision-burst') || [];
+                const domTokens = domTurns.reduce((s: number, t: TurnToken) => s + t.input_tokens + t.output_tokens, 0);
+                const visionTokens = visionTurns.reduce((s: number, t: TurnToken) => s + t.input_tokens + t.output_tokens, 0);
+                return (
+                  <div className="grid grid-cols-6 gap-4 px-5 py-3 bg-gray-800/50">
+                    <div>
+                      <div className="text-xs text-gray-500">Total Input</div>
+                      <div className="text-sm font-semibold text-blue-400">{(run.input_tokens / 1000).toFixed(1)}k</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Total Output</div>
+                      <div className="text-sm font-semibold text-emerald-400">{(run.output_tokens / 1000).toFixed(1)}k</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Reasoning</div>
+                      <div className="text-sm font-semibold text-amber-400">{(run.reasoning_tokens / 1000).toFixed(1)}k</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">DOM Tokens</div>
+                      <div className="text-sm font-semibold text-cyan-400">{(domTokens / 1000).toFixed(1)}k <span className="text-[10px] text-gray-500">({domTurns.length} turns)</span></div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Vision Tokens</div>
+                      <div className="text-sm font-semibold text-purple-400">{(visionTokens / 1000).toFixed(1)}k <span className="text-[10px] text-gray-500">({visionTurns.length} turns)</span></div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500">Avg per Turn</div>
+                      <div className="text-sm font-semibold text-gray-300">
+                        {run.turn_count > 0 ? ((run.input_tokens + run.output_tokens) / run.turn_count / 1000).toFixed(1) + 'k' : '--'}
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
+                );
+              })()}
               {/* Per-turn table */}
               {run.turnTokens?.length > 0 && (
                 <div className="max-h-[300px] overflow-y-auto">
@@ -339,6 +363,7 @@ export default function RunDetailPage() {
                     <thead className="sticky top-0 bg-gray-900">
                       <tr className="text-gray-500 border-b border-gray-800">
                         <th className="text-left py-2 px-4 font-medium">Turn</th>
+                        <th className="text-left py-2 px-4 font-medium">Mode</th>
                         <th className="text-right py-2 px-4 font-medium">Input</th>
                         <th className="text-right py-2 px-4 font-medium">Output</th>
                         <th className="text-right py-2 px-4 font-medium">Reasoning</th>
@@ -348,15 +373,24 @@ export default function RunDetailPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {run.turnTokens.map((tt) => {
+                      {run.turnTokens.map((tt: TurnToken) => {
                         const turnTotal = tt.input_tokens + tt.output_tokens;
                         const cumTotal = tt.cumulative_input + tt.cumulative_output;
-                        // Highlight expensive turns (> 2x average)
                         const avgPerTurn = run.turn_count > 0 ? (run.input_tokens + run.output_tokens) / run.turn_count : 0;
                         const isExpensive = turnTotal > avgPerTurn * 2;
+                        const mode = tt.mode || 'dom';
+                        const modeBadge = mode === 'vision' || mode === 'vision-burst'
+                          ? 'bg-purple-500/20 text-purple-400 border-purple-500/30'
+                          : 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30';
+                        const modeLabel = mode === 'vision-burst' ? 'V-Burst' : mode === 'vision' ? 'Vision' : 'DOM';
                         return (
                           <tr key={tt.id} className={`border-b border-gray-800/50 ${isExpensive ? 'bg-amber-500/5' : 'hover:bg-gray-800/30'}`}>
                             <td className="py-2 px-4 text-gray-300 font-mono">T{tt.turn_number}</td>
+                            <td className="py-2 px-4">
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${modeBadge}`}>
+                                {modeLabel}
+                              </span>
+                            </td>
                             <td className="py-2 px-4 text-right text-blue-400 font-mono">{(tt.input_tokens / 1000).toFixed(1)}k</td>
                             <td className="py-2 px-4 text-right text-emerald-400 font-mono">{(tt.output_tokens / 1000).toFixed(1)}k</td>
                             <td className="py-2 px-4 text-right text-amber-400 font-mono">{tt.reasoning_tokens > 0 ? (tt.reasoning_tokens / 1000).toFixed(1) + 'k' : '-'}</td>
@@ -422,19 +456,21 @@ export default function RunDetailPage() {
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             {currentScreenshot && screenshotFilename ? (
               <>
-                <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
-                  <div className="flex items-center gap-2">
+                <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800 gap-4">
+                  <div className="flex items-center gap-2 shrink-0">
                     <span className={`text-xs px-2 py-0.5 rounded-full ${currentCategory.color}`}>
                       {currentCategory.label}
                     </span>
-                    <span className="text-xs text-gray-500">
-                      Turn {currentScreenshot.turn_number} of {screenshots.length - 1}
+                    <span className="text-xs text-gray-400 font-mono whitespace-nowrap">
+                      Turn {currentScreenshot.turn_number} <span className="text-gray-600">of {screenshots.length - 1}</span>
                     </span>
                   </div>
-                  <div className="flex items-center gap-3 text-xs text-gray-500">
-                    {currentScreenshot.page_title && <span>{currentScreenshot.page_title}</span>}
+                  <div className="flex items-center gap-2 text-xs min-w-0">
+                    {currentScreenshot.page_title && (
+                      <span className="text-gray-400 truncate max-w-[250px]" title={currentScreenshot.page_title}>{currentScreenshot.page_title}</span>
+                    )}
                     {currentScreenshot.page_url && (
-                      <span className="text-gray-600 truncate max-w-xs">{currentScreenshot.page_url}</span>
+                      <span className="text-gray-600 truncate max-w-[300px]" title={currentScreenshot.page_url}>{currentScreenshot.page_url}</span>
                     )}
                   </div>
                 </div>
@@ -453,7 +489,7 @@ export default function RunDetailPage() {
 
           {/* Thumbnail strip */}
           {screenshots.length > 0 && (
-            <div className="flex gap-2 overflow-x-auto pb-2">
+            <div ref={thumbnailStripRef} className="flex gap-2 overflow-x-auto pb-2">
               {screenshots.map((ss, i) => {
                 const fname = ss.file_path.split(/[\\\/]/).pop();
                 const cat = getScreenshotCategory(i, screenshots.length);
@@ -505,19 +541,41 @@ export default function RunDetailPage() {
         </div>
 
         {/* Event Log */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-h-[360px] overflow-y-auto">
-          <h3 className="text-sm font-semibold text-gray-400 mb-4">Event Log</h3>
-          <div className="space-y-3">
-            {events.map(event => (
-              <div key={event.id} className="text-xs">
-                <div className="text-gray-600 font-mono">
-                  {new Date(event.timestamp).toLocaleTimeString()}
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 max-h-[500px] overflow-y-auto" ref={(el) => { if (el && isActive) el.scrollTop = el.scrollHeight; }}>
+          <h3 className="text-sm font-semibold text-gray-400 mb-4">Event Log {events.length > 0 && <span className="text-gray-600 font-normal">({events.length})</span>}</h3>
+          <div className="space-y-2">
+            {events.map(event => {
+              const isError = event.type === 'run_failed' || event.message.includes('error') || event.message.includes('Error');
+              const isComplete = event.type === 'run_completed';
+              const isScreenshot = event.type === 'screenshot_captured';
+              const isTurnStart = event.message.includes('started');
+              const isTurnComplete = event.message.includes('complete') && event.message.includes('API:');
+              const isAction = event.type === 'actions_executed';
+              return (
+                <div key={event.id} className={`text-xs rounded px-2 py-1.5 ${isError ? 'bg-red-500/10 border-l-2 border-red-500' : isComplete ? 'bg-emerald-500/10 border-l-2 border-emerald-500' : isTurnStart ? 'bg-blue-500/5 border-l-2 border-blue-500/40' : ''}`}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-gray-600 font-mono shrink-0">
+                      {new Date(event.timestamp).toLocaleTimeString()}
+                    </span>
+                    <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                      isError ? 'bg-red-500/20 text-red-400' :
+                      isComplete ? 'bg-emerald-500/20 text-emerald-400' :
+                      isScreenshot ? 'bg-purple-500/15 text-purple-400' :
+                      isTurnComplete ? 'bg-cyan-500/15 text-cyan-400' :
+                      isAction ? 'bg-amber-500/15 text-amber-400' :
+                      'bg-gray-800 text-gray-500'
+                    }`}>
+                      {isError ? 'ERROR' : isComplete ? 'DONE' : isScreenshot ? 'SNAP' : isTurnComplete ? 'API' : isAction ? 'ACT' : isTurnStart ? 'TURN' : event.type.split('_')[0].toUpperCase()}
+                    </span>
+                  </div>
+                  <div className={`mt-1 ${isError ? 'text-red-300' : isComplete ? 'text-emerald-300' : 'text-gray-300'}`}>
+                    {event.message}
+                  </div>
                 </div>
-                <div className="text-gray-300 mt-0.5">{event.message}</div>
-              </div>
-            ))}
+              );
+            })}
             {isActive && (
-              <div className="text-xs text-blue-400 animate-pulse">Waiting for events...</div>
+              <div className="text-xs text-blue-400 animate-pulse px-2 py-1">Waiting for events...</div>
             )}
           </div>
         </div>

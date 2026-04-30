@@ -1,30 +1,28 @@
 import { v4 as uuid } from 'uuid';
 import fs from 'fs';
 import path from 'path';
-import { Session, TestRun, Step, Event } from '../db/models/index.js';
+import * as repo from '../db/repo.js';
+import { getDb } from '../db/turso.js';
 
 export async function createSession(total: number) {
-  const session = await Session.create({
-    _id: uuid(),
-    startedAt: new Date(),
-    total,
-  });
-  return session;
+  const id = uuid();
+  await repo.createSession(id, total);
+  return repo.getSession(id);
 }
 
 export async function getSession(sessionId: string) {
-  const session = await Session.findById(sessionId).lean();
+  const session = await repo.getSession(sessionId);
   if (!session) return null;
-  const testRuns = await TestRun.find({ sessionId }).sort({ startedAt: 1 });
-  return { ...session, testRuns: testRuns.map(r => r.toJSON()) };
+  const testRuns = await repo.getTestRunsBySession(sessionId, 'asc');
+  return { ...session, testRuns };
 }
 
 export async function listSessions(limit = 20) {
-  return Session.find().sort({ startedAt: -1 }).limit(limit);
+  return repo.listSessions(limit);
 }
 
 export async function updateSessionStats(sessionId: string) {
-  const runs = await TestRun.find({ sessionId }).lean();
+  const runs = await repo.getTestRunsBySession(sessionId);
   const passed = runs.filter(r => r.status === 'passed').length;
   const failed = runs.filter(r => r.status === 'failed').length;
   const errors = runs.filter(r => r.status === 'error').length;
@@ -32,23 +30,22 @@ export async function updateSessionStats(sessionId: string) {
 
   const allDone = runs.every(r => !['queued', 'running'].includes(r.status));
 
-  await Session.updateOne({ _id: sessionId }, {
-    $set: {
-      passed,
-      failed,
-      errors,
-      timeouts,
-      ...(allDone ? { completedAt: new Date() } : {}),
-    },
+  await repo.updateSession(sessionId, {
+    passed,
+    failed,
+    errors,
+    timeouts,
+    ...(allDone ? { completed_at: new Date().toISOString() } : {}),
   });
 }
 
 export async function resetAll() {
+  const db = getDb();
   await Promise.all([
-    Event.deleteMany({}),
-    Step.deleteMany({}),
-    TestRun.deleteMany({}),
-    Session.deleteMany({}),
+    db.execute('DELETE FROM events'),
+    db.execute('DELETE FROM steps'),
+    db.execute('DELETE FROM test_runs'),
+    db.execute('DELETE FROM sessions'),
   ]);
 
   // Delete screenshots

@@ -1,0 +1,1871 @@
+import type { Page, BrowserContext } from 'playwright';
+import type { ExecutionAdapter, BrowserState, ActionResult, IndexedElement } from './types.js';
+import crypto from 'crypto';
+
+// ── Config ──────────────────────────────────────────────────────
+const BASE_MAX_ELEMENTS = 30;
+const ACTION_TIMEOUT = 5000;
+
+// ── Stable element ID generator ─────────────────────────────────
+// Position is NOT included — only stable attributes that survive scroll/reflow
+function generateElementId(el: { tag: string; text: string; attributes: Record<string, string> }): string {
+  const raw = [
+    el.tag,
+    el.attributes['id'] || '',
+    el.attributes['name'] || '',
+    el.attributes['data-testid'] || '',
+    el.attributes['aria-label'] || '',
+    el.text.slice(0, 20),
+  ].join('|');
+  return crypto.createHash('md5').update(raw).digest('hex').slice(0, 8);
+}
+
+// ── DOM extraction is inlined in PlaywrightAdapter.getState() ──
+// Passed as a proper function to page.evaluate() to avoid template literal issues
+
+// ── PlaywrightAdapter ───────────────────────────────────────────
+// Raw execution only. NO fallback logic. That's in Action Engine.
+
+export class PlaywrightAdapter implements ExecutionAdapter {
+  private page: Page;
+  private activePage: Page;
+  private context: BrowserContext;
+  private _credentials?: { email: string; password: string };
+  public autoLoginCompleted = false;
+  private _filledDropdowns = new Set<string>();
+  private _failedAutoFills = new Set<string>();
+  private _getStateCount = 0;
+
+  constructor(page: Page, credentials?: { email: string; password: string }) {
+    this.page = page;
+    this.activePage = page;
+    this.context = page.context();
+    this._credentials = credentials;
+
+    this.context.on('page', (newPage) => {
+      console.log(`[adapter] New tab: ${newPage.url()}`);
+      this.activePage = newPage;
+      newPage.on('close', () => { this.activePage = this.page; });
+    });
+  }
+
+  private _lastUrl = '';
+
+  async getState(): Promise<BrowserState> {
+    const url = this.activePage.url();
+    const title = await this.activePage.title().catch(() => '');
+
+    // Clear auto-fill caches on URL change (new page = new form fields)
+    // Also clear failed auto-fills periodically to retry fields revealed by scrolling
+    if (url !== this._lastUrl) {
+      this._filledDropdowns.clear();
+      this._failedAutoFills.clear();
+      this._lastUrl = url;
+    }
+    // Clear failed fills every 5 getState calls to retry fields revealed by scrolling
+    if (!this._getStateCount) this._getStateCount = 0;
+    this._getStateCount++;
+    if (this._getStateCount % 5 === 0) {
+      this._failedAutoFills.clear();
+    }
+
+    // Inject persistent CSS to hide chat widgets (survives DOM re-renders)
+    await this.activePage.evaluate(`(() => {
+      if (document.getElementById('__cua_hide_chat')) return;
+      var style = document.createElement('style');
+      style.id = '__cua_hide_chat';
+      style.textContent = '[id*="appy-widget"],[id*="appy-chat"],[class*="appy-widget"],[class*="appy_pie"],[id*="chat-widget"],[id*="chatWidget"],[class*="chat-bubble"],[class*="chat-launcher"],[class*="intercom"],[class*="crisp"],[class*="drift"],[class*="chatbot"]{display:none!important;visibility:hidden!important;pointer-events:none!important;height:0!important;width:0!important;overflow:hidden!important;}';
+      document.head.appendChild(style);
+    })()`).catch(() => {});
+
+    // Dynamic cap: larger viewport = more elements
+    let viewportHeight = 900;
+    try {
+      const vp = this.activePage.viewportSize();
+      if (vp) viewportHeight = vp.height;
+    } catch {}
+    const maxElements = viewportHeight < 800 ? BASE_MAX_ELEMENTS : Math.min(70, BASE_MAX_ELEMENTS + 35);
+
+    const currentUrl = this.activePage.url();
+
+    // Auto-login, auto-click Continue, auto-select account, auto-fill fields, remove DOM traps
+    await this.autoLogin();
+    let autoClickedContinue = await this.autoClickContinue();
+    if (!autoClickedContinue) {
+      autoClickedContinue = await this.autoSelectAccount();
+    }
+    if (autoClickedContinue) {
+      console.log('[adapter] Auto-clicked Continue on account step (/account/ URL) — skipping account setup');
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    await this.autoFillOnOptionsPage(currentUrl);
+    await this.removeDomTraps();
+
+    let rawData: any;
+    try {
+      // IMPORTANT: Use string-based evaluate to avoid tsx/esbuild __name injection
+      // TypeScript compilers add __name helpers to functions, which don't exist in browser context
+      rawData = await this.activePage.evaluate(`(() => {
+        var MAX = ${maxElements};
+        var seen = new Set();
+        var results = [];
+        var selectors = [
+          'input:not([type="hidden"])', 'textarea', 'select', 'button', 'a[href]',
+          '[role="button"]', '[role="tab"]', '[role="link"]', '[contenteditable]',
+          '[onclick]', '[data-testid]',
+          '[role="option"]', '[role="listbox"] li', '[role="menuitem"]', '[role="menuitemradio"]',
+          '[role="combobox"]', '[role="treeitem"]',
+          '.dropdown-item', '.dropdown-menu li', '.dropdown-menu a',
+          '[class*="option"]', '[class*="select-option"]', '[class*="menu-item"]',
+          '[class*="suggestion"]', '[class*="search-result"]', '[class*="list-item"]',
+          '[class*="popover"] li', '[class*="popover"] a', '[class*="popover"] button',
+          '[class*="panel"] li', '[class*="panel"] button',
+          'ul[class*="dropdown"] li', 'div[class*="dropdown"] div[class*="item"]',
+          'li[class*="result"]', 'div[class*="result"]',
+          '[class*="app-card"]', '[class*="app-item"]', '[class*="appCard"]',
+          '[class*="card"][class*="click"]', '[class*="integration"]',
+          'div[style*="cursor: pointer"]', 'div[style*="cursor:pointer"]',
+          '[class*="trigger"] [class*="item"]', '[class*="action"] [class*="item"]',
+          'a[data-track]', '.landing-apps a', '.listingAppsList a',
+          '.listingAppsList li', '[class*="listing"] li', '[class*="listing"] a',
+          '[class*="event"] li', '[class*="event"] a',
+          '[class*="scrollheight"] li', '[class*="scrollheight"] a',
+          '.cdk-overlay-pane li', '.cdk-overlay-pane a', '.cdk-overlay-pane button',
+          '.mat-option', '.mat-menu-item',
+          'label.form-check-label', '.form-checkbox label',
+          '[class*="form-checkbox"] label', '[data-track="select trigger event"]',
+          '[data-track="select action event"]',
+          '.menu_icon-box', '.menu_icon', '.selected_value',
+          '.menu_dropdown li', '.menu_dropdown a', '.menu_dropdown .formcontrol',
+          '.menu_dropdown div[class*="option"]',
+          '[data-track="continue"]', '[data-track="continue with event"]',
+          '.continue button', '.continue a',
+          '.change-btn', '.advanced-mapping-btn'
+        ];
+        var candidates = [];
+        for (var si = 0; si < selectors.length; si++) {
+          try {
+            var els = document.querySelectorAll(selectors[si]);
+            for (var ei = 0; ei < els.length; ei++) {
+              var el = els[ei];
+              if (seen.has(el)) continue;
+              seen.add(el);
+              var rect = el.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              if (rect.top > window.innerHeight + 300) continue;
+              var style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) < 0.1) continue;
+              var tag = el.tagName.toLowerCase();
+              var sc = (tag === 'input' || tag === 'textarea' || tag === 'select') ? 30 : (tag === 'button' ? 20 : (tag === 'a' ? 10 : 5));
+              candidates.push({ el: el, score: sc, top: rect.top });
+            }
+          } catch(e) {}
+        }
+        // Find all <a> tags without href that have meaningful text (Angular app items)
+        document.querySelectorAll('a:not([href])').forEach(function(el) {
+          if (seen.has(el)) return;
+          var rect = el.getBoundingClientRect();
+          if (rect.width < 30 || rect.height < 20) return;
+          if (rect.top > window.innerHeight + 300 || rect.bottom < 0) return;
+          var text = (el.textContent || '').trim();
+          if (text.length < 2 || text.length > 100) return;
+          var style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') return;
+          seen.add(el);
+          candidates.push({ el: el, score: 12, top: rect.top });
+        });
+
+        // Find clickable divs with images (app selection cards in connect editor)
+        document.querySelectorAll('div > img, div > svg').forEach(function(child) {
+          var parent = child.parentElement;
+          if (!parent || seen.has(parent) || parent.tagName !== 'DIV') return;
+          var rect = parent.getBoundingClientRect();
+          if (rect.width < 40 || rect.width > 250 || rect.height < 40 || rect.height > 250) return;
+          if (rect.top > window.innerHeight + 300) return;
+          var style = window.getComputedStyle(parent);
+          if (style.display === 'none' || style.visibility === 'hidden') return;
+          // Check if it looks like a card (has text + image, reasonable size)
+          var text = (parent.textContent || '').trim();
+          if (text.length > 1 && text.length < 100) {
+            seen.add(parent);
+            candidates.push({ el: parent, score: 15, top: rect.top });
+          }
+        });
+
+        candidates.sort(function(a, b) { return b.score - a.score || a.top - b.top; });
+        var limited = candidates.slice(0, MAX);
+        for (var i = 0; i < limited.length; i++) {
+          var el = limited[i].el;
+          var rect = el.getBoundingClientRect();
+          var tag = el.tagName.toLowerCase();
+          var attrs = {};
+          var attrNames = ['id', 'name', 'type', 'data-testid', 'aria-label', 'href', 'role', 'placeholder', 'class', 'contenteditable', 'data-slate-editor', 'data-lexical-editor'];
+          for (var ai = 0; ai < attrNames.length; ai++) {
+            var v = el.getAttribute(attrNames[ai]);
+            if (v) attrs[attrNames[ai]] = v.slice(0, 80);
+          }
+          // Skip expand/fullscreen/maximize buttons and WhatsApp widget
+          var elClass = (el.getAttribute('class') || '').toLowerCase();
+          var elTitle = (el.getAttribute('title') || el.getAttribute('aria-label') || '').toLowerCase();
+          var elTooltip = (el.getAttribute('data-tooltip') || el.getAttribute('data-original-title') || '').toLowerCase();
+          var elText = (el.textContent || '').trim().toLowerCase();
+          if (elClass.includes('expand') || elClass.includes('fullscreen') || elClass.includes('maximize') ||
+              elTitle.includes('expand') || elTitle.includes('fullscreen') || elTitle.includes('maximize') ||
+              elTooltip.includes('expand') || elTooltip.includes('fullscreen') || elTooltip.includes('maximize') ||
+              elClass.includes('whatsapp') || elClass.includes('wa-widget') ||
+              elClass.includes('custom-options-tooltip') ||
+              (tag === 'svg' && el.closest && el.closest('[data-tooltip="Expand"]')) ||
+              (tag === 'svg' && el.closest && el.closest('[class*="expand"]')) ||
+              (tag === 'button' && el.querySelector && el.querySelector('svg polyline[points*="15 3 21 3"]')) ||
+              elClass.includes('step_guide') || el.id === 'step_guide_Btn' ||
+              (el.getAttribute('tooltip') || '').toLowerCase() === 'guide' ||
+              (tag === 'button' && el.querySelector && el.querySelector('.fa-question-circle'))) continue;
+
+          var cssSelector = '';
+          if (el.id) cssSelector = '#' + el.id;
+          else if (el.getAttribute('data-testid')) cssSelector = '[data-testid="' + el.getAttribute('data-testid') + '"]';
+          else if (el.getAttribute('name')) cssSelector = tag + '[name="' + el.getAttribute('name') + '"]';
+          results.push({
+            tag: tag,
+            type: attrs['type'] || '',
+            text: (el.textContent || '').trim().slice(0, 50),
+            value: el.value !== undefined ? String(el.value || '') : (el.getAttribute('contenteditable') ? (el.textContent || '').trim().slice(0, 100) : ''),
+            placeholder: attrs['placeholder'] || '',
+            attributes: attrs,
+            boundingBox: { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
+            isInteractable: !el.disabled,
+            isVisible: true,
+            _cssSelector: cssSelector
+          });
+        }
+        // Cap bypass: include OPTIONS from any open dropdown.
+        // The viewport-bounded slice above (MAX = 30..65) can drop later
+        // dropdown options when other UI competes for slots (dd186b23:
+        // 14 sheet options + sidebar + buttons pushed "Test Sheet" out).
+        // Append visible options inside Appy Pie active dropdowns that
+        // are not already in results. Hard-bounded at +30.
+        try {
+          var activeOptions = document.querySelectorAll(
+            '.editoption-dropmenu.active_menu .menu_dropdown-option, ' +
+            '.menu.menu_active .menu_dropdown-option, ' +
+            '.editoption-dropmenu.active_menu li.choice, ' +
+            '.menu.menu_active li.choice'
+          );
+          var optsAdded = 0;
+          var OPTS_CAP = 30;
+          for (var oi = 0; oi < activeOptions.length && optsAdded < OPTS_CAP; oi++) {
+            var optEl = activeOptions[oi];
+            if (seen.has(optEl)) continue;
+            var optRect = optEl.getBoundingClientRect();
+            // Skip zero-area / off-screen options
+            if (optRect.width === 0 || optRect.height === 0) continue;
+            var optAttrs = {};
+            for (var oai = 0; oai < attrNames.length; oai++) {
+              var ov = optEl.getAttribute(attrNames[oai]);
+              if (ov) optAttrs[attrNames[oai]] = ov.slice(0, 80);
+            }
+            seen.add(optEl);
+            optsAdded++;
+            var optTag = optEl.tagName.toLowerCase();
+            results.push({
+              tag: optTag,
+              type: optAttrs['type'] || '',
+              text: (optEl.textContent || '').trim().slice(0, 50),
+              value: '',
+              placeholder: '',
+              attributes: optAttrs,
+              boundingBox: {
+                x: Math.round(optRect.left),
+                y: Math.round(optRect.top),
+                w: Math.round(optRect.width),
+                h: Math.round(optRect.height)
+              },
+              isInteractable: true,
+              isVisible: true,
+              _cssSelector: ''
+            });
+          }
+        } catch (e) { /* extractor must never throw */ }
+        var keyText = [];
+        var headings = document.querySelectorAll('h1,h2,h3,label');
+        for (var hi = 0; hi < headings.length && keyText.length < 10; hi++) {
+          var t = (headings[hi].textContent || '').trim().slice(0, 60);
+          if (t.length > 2) keyText.push(t);
+        }
+        var overlayEl = document.querySelector('[role="dialog"],[role="alertdialog"],.modal,.overlay');
+        var hasOverlay = !!(overlayEl && overlayEl.offsetParent);
+        var canvasEl = document.querySelector('canvas');
+        var hasCanvas = !!(canvasEl && canvasEl.width > 100);
+        var textMap = {};
+        for (var ri = 0; ri < results.length; ri++) {
+          var txt = results[ri].text.trim();
+          if (txt.length > 2) textMap[txt] = (textMap[txt] || 0) + 1;
+        }
+        var dupCount = 0;
+        for (var k in textMap) { if (textMap[k] > 1) dupCount++; }
+        var errorMessages = [];
+        var errEls = document.querySelectorAll('[role="alert"],.error-message,[class*="alert-danger"]');
+        for (var eei = 0; eei < errEls.length && errorMessages.length < 5; eei++) {
+          var et = (errEls[eei].textContent || '').trim().slice(0, 100);
+          if (et.length > 3 && errEls[eei].offsetParent) errorMessages.push(et);
+        }
+        return { elements: results, keyText: keyText.slice(0, 10), hasOverlay: hasOverlay, hasCanvas: hasCanvas, duplicateTextCount: dupCount, errorMessages: errorMessages.slice(0, 5) };
+      })()`);
+    } catch (err) {
+      console.error('[adapter] DOM extraction failed:', (err as Error).message);
+      return { url, title, elements: [], keyText: [], formValues: {}, domFingerprint: 'error', hasOverlay: false, hasCanvas: false, duplicateTextCount: 0, errorMessages: [] };
+    }
+
+    if (!rawData || !rawData.elements) {
+      console.warn('[adapter] DOM extraction returned empty/undefined');
+      return { url, title, elements: [], keyText: [], formValues: {}, domFingerprint: 'empty', hasOverlay: false, hasCanvas: false, duplicateTextCount: 0, errorMessages: [] };
+    }
+
+    // Assign indices + stable elementId, filter out trap elements
+    const BLOCKED_TEXTS = [
+      'forgot password', 'forgot your password', 'forgot',
+      'sign in with google', 'sign in with apple', 'sign in with facebook', 'sign in with microsoft',
+      'sign up', 'create account', 'register',
+      'guide', 'choose your preferred', 'take a tour', 'watch tutorial', 'help center',
+      'request a demo',
+    ];
+    const elements: IndexedElement[] = rawData.elements
+      .map((el: any, i: number) => ({
+        ...el,
+        index: i,
+        elementId: generateElementId(el),
+      } as IndexedElement))
+      .filter((el: IndexedElement) => {
+        const t = el.text?.toLowerCase() || '';
+        const href = el.attributes?.['href']?.toLowerCase() || '';
+        // Remove "Forgot Password" and social login links — model must never see these
+        if (BLOCKED_TEXTS.some(b => t.includes(b))) return false;
+        if (href.includes('forgotpassword') || href.includes('forgot-password')) return false;
+        return true;
+      });
+
+    // Form values keyed by elementId
+    const formValues: Record<string, string> = {};
+    for (const el of elements) {
+      if (el.value && (el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select')) {
+        formValues[el.elementId] = el.value;
+      }
+    }
+
+    // DOM fingerprint — includes form values + element count for sensitivity
+    const fpParts = [
+      url,
+      String(elements.length),
+      elements.map(e => `${e.tag}:${e.text.slice(0, 15)}:${e.value?.slice(0, 10) || ''}:${e.boundingBox.y}`).join('|'),
+      Object.entries(formValues).map(([k, v]) => `${k}=${v.slice(0, 10)}`).join('|'),
+    ];
+    const domFingerprint = crypto.createHash('md5').update(fpParts.join('||')).digest('hex').slice(0, 12);
+
+    return {
+      url, title, elements,
+      keyText: rawData.keyText || [],
+      formValues,
+      domFingerprint,
+      hasOverlay: rawData.hasOverlay || false,
+      hasCanvas: rawData.hasCanvas || false,
+      duplicateTextCount: rawData.duplicateTextCount || 0,
+      errorMessages: rawData.errorMessages || [],
+    };
+  }
+
+  // ── Private auto-action helpers (extracted from getState) ────
+
+  private async autoLogin(): Promise<void> {
+    if (!this._credentials) return;
+
+    const autoLoggedIn = await this.activePage.evaluate(`(() => {
+      var emailField = document.querySelector('input[type="email"], input[name="email"], input[id*="email"], input[placeholder*="mail"]');
+      var passwordField = document.querySelector('input[type="password"]');
+      if (!emailField || !passwordField) return false;
+      // Both fields visible and empty — this is a login page
+      var eRect = emailField.getBoundingClientRect();
+      var pRect = passwordField.getBoundingClientRect();
+      if (eRect.width < 30 || pRect.width < 30) return false;
+      if (emailField.value && emailField.value.length > 3) return false; // already filled
+      return true;
+    })()`).catch(() => false) as boolean;
+
+    if (!autoLoggedIn) return;
+
+    try {
+      // Fill email
+      const emailSel = 'input[type="email"], input[name="email"], input[id*="email"], input[placeholder*="mail"]';
+      await this.activePage.fill(emailSel, this._credentials!.email, { timeout: 3000 });
+      await new Promise(r => setTimeout(r, 300));
+      // Fill password
+      await this.activePage.fill('input[type="password"]', this._credentials!.password, { timeout: 3000 });
+      await new Promise(r => setTimeout(r, 300));
+      // Click login/submit button
+      const loginClicked = await this.activePage.evaluate(`(() => {
+        var btns = document.querySelectorAll('button[type="submit"], button, input[type="submit"]');
+        for (var i = 0; i < btns.length; i++) {
+          var text = (btns[i].textContent || btns[i].value || '').trim().toLowerCase();
+          if (text === 'log in' || text === 'login' || text === 'sign in' || text === 'submit' || text === 'continue') {
+            btns[i].click();
+            return true;
+          }
+        }
+        return false;
+      })()`).catch(() => false);
+      if (loginClicked) {
+        console.log('[adapter] Auto-login: filled credentials and clicked login — saving ~4 model turns');
+        this.autoLoginCompleted = true;
+        await new Promise(r => setTimeout(r, 3000)); // Wait for redirect
+      }
+    } catch (err) {
+      console.log('[adapter] Auto-login attempted but failed:', (err as Error).message);
+    }
+  }
+
+  private async autoClickContinue(): Promise<boolean> {
+    const currentUrl = this.activePage.url();
+
+    // Only fire on /customeditor/ pages — the evaluate script checks for linked account indicators
+    // before clicking Continue, so it's safe to run on trigger/action config pages too
+    if (!currentUrl.includes('/customeditor/')) return false;
+
+    // Auto-click Continue on account steps — checks if there's a linked account + active Continue
+    const clicked = (await this.activePage.evaluate(`(() => {
+      // Check if there's a linked account visible (green checkmark + account email/name)
+      var hasLinkedAccount = false;
+      document.querySelectorAll('.fa-check-circle, [class*="done-app"], [class*="trgrevent-icon"], [class*="connected-account"], [class*="account-linked"]').forEach(function(el) {
+        hasLinkedAccount = true;
+      });
+      // Also check for "Connect Account" section with a dropdown/selection
+      document.querySelectorAll('span, div, h5, p').forEach(function(el) {
+        var text = (el.textContent || '').trim().toLowerCase();
+        if (text.includes('account:') || text.includes('connected') || text.includes('authenticated') ||
+            (text.includes('@') && text.includes('.'))) {
+          hasLinkedAccount = true;
+        }
+      });
+      if (!hasLinkedAccount) return false;
+
+      // Find Continue button — by data-track first, then by text
+      var btn = document.querySelector('[data-track="continue with account"]');
+      if (!btn) btn = document.querySelector('[data-track*="continue"]:not([data-track*="event"])');
+      if (!btn) {
+        var buttons = document.querySelectorAll('.continue button, .continue a, button.continue-btn, [class*="continue"] button');
+        for (var i = 0; i < buttons.length; i++) {
+          var text = (buttons[i].textContent || '').trim().toLowerCase();
+          if (text === 'continue' || text === 'continue & run test') { btn = buttons[i]; break; }
+        }
+      }
+      // Only click if active and visible
+      if (btn && !btn.disabled && btn.offsetParent !== null &&
+          !btn.classList.contains('disabled') && btn.getAttribute('aria-disabled') !== 'true') {
+        btn.click();
+        return true;
+      }
+      return false;
+    })()`).catch(() => false)) as boolean;
+
+    return clicked;
+  }
+
+  private async autoSelectAccount(): Promise<boolean> {
+    const currentUrl = this.activePage.url();
+
+    // Only fire on /customeditor/ pages
+    if (!currentUrl.includes('/customeditor/')) return false;
+
+    const autoSelected = (await this.activePage.evaluate(`(() => {
+      // Look for "Connect Account" section with a dropdown/select element
+      var accountSection = false;
+      var labels = document.querySelectorAll('h5, h4, label, span, p');
+      for (var i = 0; i < labels.length; i++) {
+        var t = (labels[i].textContent || '').trim().toLowerCase();
+        if (t.includes('connect account') || t.includes('choose your app account') || t.includes('select account') || t.includes('app account')) {
+          accountSection = true;
+          break;
+        }
+      }
+      if (!accountSection) return false;
+
+      // Check if there's an account dropdown (select element or custom dropdown with options)
+      var selectEl = document.querySelector('select');
+      if (selectEl && selectEl.options.length > 1) {
+        // Select the first non-empty option (skip "Select" placeholder)
+        for (var j = 0; j < selectEl.options.length; j++) {
+          var val = selectEl.options[j].value;
+          var text = selectEl.options[j].text.toLowerCase();
+          if (val && text !== 'select' && text !== '' && !text.includes('----select') && !text.includes('add an account') && !text.includes('add account')) {
+            selectEl.selectedIndex = j;
+            selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+            return 'selected: ' + selectEl.options[j].text.slice(0, 40);
+          }
+        }
+      }
+
+      // Also check for custom dropdown with .menu_icon-box that has account options
+      var menuIcons = document.querySelectorAll('.menu_icon-box, [class*="account-select"], [class*="account-dropdown"]');
+      if (menuIcons.length > 0) {
+        // Click the first menu icon to open dropdown
+        var icon = menuIcons[0];
+        var rect = icon.getBoundingClientRect();
+        if (rect.width > 5 && rect.height > 5) {
+          icon.click();
+          return 'opened-dropdown';
+        }
+      }
+
+      return false;
+    })()`).catch(() => false));
+
+    if (autoSelected === 'opened-dropdown') {
+      // Wait for dropdown to open, then select first option
+      await new Promise(r => setTimeout(r, 1500));
+      const picked = await this.activePage.evaluate(`(() => {
+        var dropdowns = document.querySelectorAll('.menu_dropdown, [class*="dropdown-menu"], [class*="select-options"]');
+        for (var d = 0; d < dropdowns.length; d++) {
+          var dd = dropdowns[d];
+          if (dd.classList.contains('hide') || dd.offsetParent === null) continue;
+          var items = dd.querySelectorAll('li, a, div, span');
+          for (var j = 0; j < items.length; j++) {
+            var item = items[j];
+            var text = (item.textContent || '').trim();
+            var lower = text.toLowerCase();
+            if (text.length < 3 || text.length > 200) continue;
+            if (lower.includes('add an account') || lower.includes('add account') || lower === 'select' || lower.includes('search')) continue;
+            var rect = item.getBoundingClientRect();
+            if (rect.width < 20 || rect.height < 12) continue;
+            item.click();
+            return text.slice(0, 40);
+          }
+        }
+        return null;
+      })()`).catch(() => null);
+      if (picked) {
+        console.log(`[adapter] Auto-selected account from dropdown: "${picked}"`);
+        await new Promise(r => setTimeout(r, 2000)); // Wait for Continue to appear
+        // Now try to click Continue
+        await this.activePage.evaluate(`(() => {
+          var btns = document.querySelectorAll('[data-track*="continue"], .continue button, .continue a, button');
+          for (var i = 0; i < btns.length; i++) {
+            var text = (btns[i].textContent || '').trim().toLowerCase();
+            if (text === 'continue' && !btns[i].disabled && btns[i].offsetParent !== null) {
+              btns[i].click();
+              return true;
+            }
+          }
+          return false;
+        })()`).catch(() => false);
+        await new Promise(r => setTimeout(r, 2000));
+        return true;
+      }
+    } else if (autoSelected && typeof autoSelected === 'string' && autoSelected.startsWith('selected:')) {
+      console.log(`[adapter] Auto-selected account: ${autoSelected}`);
+      await new Promise(r => setTimeout(r, 2000)); // Wait for Continue to appear
+      // Click Continue
+      await this.activePage.evaluate(`(() => {
+        var btns = document.querySelectorAll('[data-track*="continue"], .continue button, .continue a, button');
+        for (var i = 0; i < btns.length; i++) {
+          var text = (btns[i].textContent || '').trim().toLowerCase();
+          if (text === 'continue' && !btns[i].disabled && btns[i].offsetParent !== null) {
+            btns[i].click();
+            return true;
+          }
+        }
+        return false;
+      })()`).catch(() => false);
+      await new Promise(r => setTimeout(r, 2000));
+      return true;
+    }
+
+    return false;
+  }
+
+  private async autoFillOnOptionsPage(currentUrl: string): Promise<void> {
+    const isOptionsPage = currentUrl.includes('/customeditor/') && (
+      currentUrl.includes('/options') || currentUrl.includes('/actionoptions') || currentUrl.includes('/config')
+    );
+    if (!isOptionsPage) return;
+
+    // Direct fill: find empty required numeric fields (Quantity, Amount) and type "1"
+    const directFillNumerics = async () => {
+      try {
+        const directFilled = await this.activePage.evaluate(`(() => {
+          var filled = [];
+          var labels = document.querySelectorAll('label');
+          for (var i = 0; i < labels.length; i++) {
+            var lt = (labels[i].textContent || '').trim().toLowerCase();
+            var isNumeric = lt.includes('quantity') || lt.includes('amount') || lt.includes('price');
+            if (!isNumeric) continue;
+            var parent = labels[i].closest('.form-group, [class*="field"], [class*="form"], [class*="row"]') || labels[i].parentElement;
+            if (!parent) continue;
+            var inputs = parent.querySelectorAll('input[type="text"], input[type="number"], input:not([type="hidden"])');
+            for (var j = 0; j < inputs.length; j++) {
+              var inp = inputs[j];
+              if (inp.value && inp.value.trim().length > 0) continue;
+              if (inp.offsetParent === null) continue;
+              inp.focus();
+              inp.value = '1';
+              inp.dispatchEvent(new Event('input', {bubbles:true}));
+              inp.dispatchEvent(new Event('change', {bubbles:true}));
+              filled.push(lt.slice(0, 30));
+            }
+          }
+          return filled;
+        })()`).catch(() => []);
+        if (directFilled && (directFilled as string[]).length > 0) {
+          console.log(`[adapter] Direct-filled numeric fields: ${(directFilled as string[]).join(', ')}`);
+          await new Promise(r => setTimeout(r, 500));
+        }
+      } catch {}
+    };
+
+    await directFillNumerics();
+
+    // ── Multi-pass scroll-and-fill: many fields are below the fold in side panel ──
+    // The Connect builder's options panel often has 6-12 fields stacked vertically.
+    // Without scrolling, autoFillActionFields() only sees fields currently in viewport.
+    // Strategy: fill visible → scroll panel → fill new → repeat (max 5 passes).
+    const MAX_SCROLL_PASSES = 5;
+    let totalFilled = 0;
+    let consecutiveEmptyPasses = 0;
+    for (let pass = 0; pass < MAX_SCROLL_PASSES; pass++) {
+      const passStart = Date.now();
+      try {
+        const fillResult = await this.autoFillActionFields();
+        if (fillResult.filled > 0) {
+          totalFilled += fillResult.filled;
+          consecutiveEmptyPasses = 0;
+          console.log(`[adapter] Pass ${pass + 1}: filled ${fillResult.filled} action fields in ${Date.now() - passStart}ms: ${fillResult.fields.join(', ')}`);
+          await new Promise(r => setTimeout(r, 800));
+          // After filling, also direct-fill any new numeric fields revealed
+          await directFillNumerics();
+        } else {
+          consecutiveEmptyPasses++;
+        }
+      } catch {}
+
+      // Stop if 2 passes in a row found nothing new
+      if (consecutiveEmptyPasses >= 2) break;
+
+      // Scroll the side panel down to reveal more fields below the fold
+      try {
+        const scrolled = await this.scroll('down', 400);
+        if (!scrolled.success || !scrolled.effective) break; // panel can't scroll further
+        await new Promise(r => setTimeout(r, 600)); // wait for layout reflow
+      } catch { break; }
+    }
+    if (totalFilled > 0) {
+      console.log(`[adapter] Multi-pass auto-fill complete: ${totalFilled} field(s) filled across ${MAX_SCROLL_PASSES} passes`);
+    }
+
+    // Only auto-fill custom dropdowns on TRIGGER config pages (simple forms like Spreadsheet/Worksheet)
+    // Skip on action config pages (complex forms like Mindbody where field dependencies matter)
+    const isTriggerOptions = currentUrl.includes('/options/') && !currentUrl.includes('/overview/');
+    const pageHasComplexForm = await this.activePage.evaluate(`(() => {
+      // Detect complex action forms: more than 4 required fields or error messages present
+      var requiredCount = document.querySelectorAll('label').length;
+      var hasErrors = document.querySelector('[class*="error"], [class*="warning"], .text-danger') !== null;
+      var hasHelperText = document.querySelectorAll('[class*="helper"], [class*="help-text"]').length > 2;
+      return requiredCount > 6 || hasErrors || hasHelperText;
+    })()`).catch(() => false) as boolean;
+
+    if (!pageHasComplexForm) {
+      try {
+        const ddStart = Date.now();
+        const dropdownResult = await this.autoFillCustomDropdowns();
+        if (dropdownResult.filled > 0) {
+          console.log(`[adapter] Auto-filled ${dropdownResult.filled} dropdowns in ${Date.now() - ddStart}ms: ${dropdownResult.fields.join(', ')}`);
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      } catch {}
+    }
+  }
+
+  private async removeDomTraps(): Promise<void> {
+    await this.activePage.evaluate(`(() => {
+      // AUTO-RECOVER: If expand was clicked, the Minimize button will be visible — click it to restore layout
+      var minimizeBtn = document.querySelector('[data-tooltip="Minimize"]');
+      if (!minimizeBtn) {
+        // Also check by SVG pattern: polyline points="4 14 10 14 10 20" is the minimize icon
+        document.querySelectorAll('button.rotate-180, button svg polyline').forEach(function(poly) {
+          if ((poly.getAttribute('points') || '').includes('4 14 10 14 10 20')) {
+            minimizeBtn = poly.closest('button');
+          }
+        });
+      }
+      if (!minimizeBtn) {
+        // Check for expanded panel state: panel takes >90% of viewport width
+        var panel = document.querySelector('.halfcolume, [class*="half-column"], [class*="sidebar-content"], [class*="trigger-details"], [class*="action-details"]');
+        if (panel) {
+          var panelRect = panel.getBoundingClientRect();
+          if (panelRect.width > window.innerWidth * 0.85) {
+            // Panel is expanded — find any collapse/minimize button inside it
+            var collapseBtn = panel.querySelector('[data-tooltip="Minimize"], [data-tooltip="Collapse"], button.rotate-180');
+            if (!collapseBtn) {
+              // Try the panel toggle icon at top-right of the panel
+              collapseBtn = panel.querySelector('button:last-child') || panel.querySelector('svg').closest('button');
+            }
+            if (collapseBtn) minimizeBtn = collapseBtn;
+          }
+        }
+      }
+      if (minimizeBtn) {
+        minimizeBtn.click();
+        console.log('[dom-cleanup] Auto-clicked Minimize to restore layout');
+      }
+      // Also remove ALL expand buttons more aggressively
+      document.querySelectorAll('[data-tooltip="Expand"], [data-tooltip="Full Screen"], [data-tooltip="Maximize"], [data-tooltip="Full screen"]').forEach(function(el) { el.remove(); });
+      document.querySelectorAll('button').forEach(function(el) {
+        var tooltip = (el.getAttribute('data-tooltip') || el.getAttribute('title') || el.getAttribute('aria-label') || '').toLowerCase();
+        if (tooltip.includes('expand') || tooltip.includes('full screen') || tooltip.includes('maximize') || tooltip.includes('fullscreen')) el.remove();
+        var svg = el.querySelector('svg polyline[points*="15 3 21 3"]');
+        if (svg) el.remove();
+        // Also catch custom-options-tooltip class
+        if (el.classList.contains('custom-options-tooltip')) el.remove();
+      });
+
+      // Remove forgot password, social login links
+      document.querySelectorAll('a').forEach(function(el) {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        var text = (el.textContent || '').trim().toLowerCase();
+        if (href.includes('forgot') || href.includes('forgotpassword') ||
+            text.includes('forgot password') || text.includes('forgot your password') ||
+            text === 'forgot' ||
+            href.includes('signup') || href.includes('register') ||
+            text.includes('sign in with google') || text.includes('sign in with apple') ||
+            text.includes('sign in with facebook')) {
+          el.remove();
+        }
+      });
+      // (expand buttons already removed above — skip duplicate removal)
+
+      // Remove Guide button (question circle icon) — model must never click it
+      document.querySelectorAll('#step_guide_Btn, .step_guide, [tooltip="Guide"], button[id*="guide"]').forEach(function(el) {
+        el.remove();
+      });
+      // Also remove by icon class pattern
+      document.querySelectorAll('button .fa-question-circle').forEach(function(icon) {
+        var btn = icon.closest('button');
+        if (btn) btn.remove();
+      });
+
+      // Remove "Add an Account" / "Change" buttons — model should only click Continue
+      // Find Continue button by ANY method
+      var continueBtn = null;
+      document.querySelectorAll('button, a, [role="button"]').forEach(function(el) {
+        var text = (el.textContent || '').trim().toLowerCase();
+        var track = (el.getAttribute('data-track') || '').toLowerCase();
+        if (text === 'continue' || text === 'continue & run test' || text === 'skip run test' ||
+            track.includes('continue')) {
+          continueBtn = el;
+        }
+      });
+      // Also check .continue class container
+      if (!continueBtn) continueBtn = document.querySelector('.continue button, [data-track*="continue"]');
+
+      // Remove account-related buttons ONLY when Continue is visible (account already linked)
+      // If Continue is NOT visible, the account needs linking — keep "Add an Account"
+      if (continueBtn) {
+        document.querySelectorAll('button, a, [role="button"]').forEach(function(el) {
+          if (el === continueBtn) return; // keep Continue
+          var text = (el.textContent || '').trim().toLowerCase();
+          var href = (el.getAttribute('href') || '').toLowerCase();
+          var track = (el.getAttribute('data-track') || '').toLowerCase();
+          if (text === 'change' || text === 'add an account' || text === 'add account' ||
+              text === 'connect account' || text === 'connect an account' || text === 'reconnect' ||
+              text.includes('add an account') || text.includes('add account') ||
+              href.includes('/app/auth/') || href.includes('connectauth') ||
+              track.includes('add account') || track.includes('change account') ||
+              track.includes('connect account')) {
+            el.remove();
+          }
+        });
+      }
+      // Always remove "Request a demo" links — these are traps regardless
+      document.querySelectorAll('a').forEach(function(el) {
+        if ((el.textContent || '').trim().toLowerCase().includes('request a demo')) el.remove();
+      });
+
+      // Remove ALL chat/support widgets — they cover buttons like "Continue & Run Test"
+      document.querySelectorAll('#appy-widget, #appy-chat, [id*="appy-widget"], [id*="appy-chat"], [class*="appy-widget"], [class*="appy_pie_chat"], .appy-chat-widget, [id*="chat-widget"], [id*="chatWidget"]').forEach(function(el) { el.remove(); });
+      // Remove chat iframes
+      document.querySelectorAll('iframe').forEach(function(el) {
+        var src = (el.getAttribute('src') || '').toLowerCase();
+        if (src.includes('chat') || src.includes('widget') || src.includes('intercom') || src.includes('crisp') || src.includes('drift') || src.includes('appy')) el.remove();
+      });
+      // Remove any fixed/absolute positioned elements at bottom-right that look like chat
+      document.querySelectorAll('[class*="chat-bubble"], [class*="chat-launcher"], [class*="intercom"], [class*="crisp"], [class*="drift"], [class*="chat-bot"], [class*="chatbot"]').forEach(function(el) { el.remove(); });
+      // Nuclear: remove any fixed-position div in bottom-right corner with "chat" or "Start chat" or "Appy Pie"
+      document.querySelectorAll('div, section, aside').forEach(function(el) {
+        var style = window.getComputedStyle(el);
+        if (style.position !== 'fixed' && style.position !== 'absolute') return;
+        var rect = el.getBoundingClientRect();
+        if (rect.bottom < window.innerHeight - 100 || rect.right < window.innerWidth - 200) return;
+        var text = (el.textContent || '').toLowerCase();
+        if (text.includes('start chat') || text.includes('powered by') || text.includes('appy pie') || text.includes('chat with')) {
+          el.remove();
+        }
+      });
+    })()`).catch(() => {});
+  }
+
+  async getUrl(): Promise<string> { return this.activePage.url(); }
+  async getTitle(): Promise<string> { return this.activePage.title().catch(() => ''); }
+
+  // ── Raw actions (no fallback — Action Engine handles fallback) ──
+
+  async clickBySelector(selector: string): Promise<ActionResult> {
+    try {
+      await this.activePage.click(selector, { timeout: ACTION_TIMEOUT });
+      return { success: true, effective: false }; // effective set by action engine
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async clickByText(text: string, role?: string): Promise<ActionResult> {
+    try {
+      if (role) {
+        await this.activePage.getByRole(role as any, { name: text }).first().click({ timeout: ACTION_TIMEOUT });
+      } else {
+        await this.activePage.getByText(text, { exact: false }).first().click({ timeout: ACTION_TIMEOUT });
+      }
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async clickByCoordinates(x: number, y: number): Promise<ActionResult> {
+    try {
+      // Appy Pie custom dropdowns close via an outside-click handler that races the
+      // option's onClick when we use a native mouse.click at coords. Angular also
+      // re-renders the <ul> on state change, so we can't tag-and-reclick. The fix:
+      // if (x,y) resolves to a dropdown option, commit the click synchronously in JS
+      // (mousedown → mouseup → .click() → click) inside one evaluate — Angular's
+      // handler runs before the outside-click listener can cancel it.
+      const optionClick = await this.activePage.evaluate(`(() => {
+        var el = document.elementFromPoint(${x}, ${y});
+        if (!el) return { isOption: false };
+        var walker = el;
+        var optionEl = null;
+        for (var i = 0; i < 6 && walker; i++) {
+          var cls = '';
+          if (walker.className) {
+            cls = (typeof walker.className === 'string') ? walker.className : (walker.getAttribute && walker.getAttribute('class')) || '';
+          }
+          cls = cls.toLowerCase();
+          var role = walker.getAttribute ? (walker.getAttribute('role') || '').toLowerCase() : '';
+          var insideMenu = !!walker.closest && (!!walker.closest('.menu_dropdown') || !!walker.closest('.custom-editor-mobile-menu') || !!walker.closest('[class*="dropdown"]'));
+          if (role === 'option' || role === 'menuitem' ||
+              /menu_dropdown-option|dropdown-item|dropdown-option|select-option|menu-item|option-item/.test(cls) ||
+              (walker.tagName === 'LI' && insideMenu)) {
+            optionEl = walker;
+            break;
+          }
+          walker = walker.parentElement;
+        }
+        if (!optionEl) return { isOption: false };
+        try {
+          optionEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          optionEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+          optionEl.click();
+          optionEl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        } catch (e) {
+          return { isOption: true, success: false, error: String(e) };
+        }
+        return {
+          isOption: true,
+          success: true,
+          text: (optionEl.textContent || '').trim().slice(0, 60),
+          tag: optionEl.tagName.toLowerCase(),
+        };
+      })()`) as unknown as { isOption: boolean; success?: boolean; text?: string; tag?: string; error?: string } | null;
+
+      if (optionClick?.isOption) {
+        console.log(`[adapter] clickByCoordinates: dropdown-option JS path — ${optionClick.tag || '?'} "${optionClick.text || ''}" success=${optionClick.success}`);
+        if (optionClick.success) {
+          await new Promise(r => setTimeout(r, 200));
+          return { success: true, effective: true };
+        }
+        // JS click threw — fall through to native mouse click
+      }
+
+      await this.activePage.mouse.click(x, y);
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async doubleClickByCoordinates(x: number, y: number): Promise<ActionResult> {
+    try {
+      await this.activePage.mouse.dblclick(x, y);
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async doubleClickByText(text: string): Promise<ActionResult> {
+    try {
+      await this.activePage.getByText(text, { exact: false }).first().dblclick({ timeout: ACTION_TIMEOUT });
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async clickByPanelText(text: string): Promise<ActionResult> {
+    try {
+      // Search entire page for clickable element containing the text
+      // Priority: label (Appy Pie checkboxes) → a → li → button → div → span
+      const clicked = await this.activePage.evaluate(`(() => {
+        var searchText = ${JSON.stringify(text.toLowerCase())};
+        var blocked = ['forgot', 'sign up', 'create account', 'register', 'sign in with', 'google sign', 'apple sign'];
+        var selectors = ['label', '.form-checkbox', 'a', 'li', 'button', 'div', 'span', 'p'];
+        for (var si = 0; si < selectors.length; si++) {
+          var els = document.querySelectorAll(selectors[si]);
+          for (var ei = 0; ei < els.length; ei++) {
+            var el = els[ei];
+            var elText = (el.textContent || '').trim().toLowerCase();
+            if (elText.length < 2 || elText.length > 150) continue;
+            var isBlocked = false;
+            for (var bi = 0; bi < blocked.length; bi++) { if (elText.includes(blocked[bi])) { isBlocked = true; break; } }
+            if (isBlocked) continue;
+            var href = (el.getAttribute('href') || '').toLowerCase();
+            if (href.includes('forgot') || href.includes('signup') || href.includes('register')) continue;
+            if (!elText.includes(searchText) && searchText.length > 3) continue;
+            if (elText === searchText || elText.startsWith(searchText) || elText.includes(searchText)) {
+              var rect = el.getBoundingClientRect();
+              if (rect.width < 10 || rect.height < 10) continue;
+              var style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden') continue;
+              if (rect.top < 0 || rect.top > window.innerHeight + 100) continue;
+              var labelFor = el.tagName === 'LABEL' ? (el.getAttribute('for') || '') : '';
+              return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), text: elText.slice(0, 40), labelFor: labelFor };
+            }
+          }
+        }
+        return null;
+      })()`);
+
+      if (clicked) {
+        const c = clicked as { x: number; y: number; text: string; labelFor?: string };
+
+        // Strategy 1: If it's a label with `for` attribute → toggle checkbox via JS
+        if (c.labelFor) {
+          await this.activePage.evaluate(`(() => {
+            var el = document.getElementById(${JSON.stringify(c.labelFor)});
+            if (el) {
+              var wasDisabled = el.disabled;
+              el.disabled = false;
+              el.checked = !el.checked;
+              el.click();
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              if (wasDisabled) el.disabled = true;
+            }
+          })()`);
+          console.log(`[adapter] Panel text click (label+checkbox JS): "${c.text}" for="${c.labelFor}"`);
+        } else {
+          // Strategy 2: Click by coordinates
+          await this.activePage.mouse.click(c.x, c.y);
+          console.log(`[adapter] Panel text click: "${c.text}" at (${c.x}, ${c.y})`);
+
+          // Strategy 3: Also try to find and click any nearby checkbox/radio via JS
+          await this.activePage.evaluate(`(() => {
+            var searchText = ${JSON.stringify(c.text.toLowerCase())};
+            var labels = document.querySelectorAll('label');
+            for (var i = 0; i < labels.length; i++) {
+              var lt = (labels[i].textContent || '').trim().toLowerCase();
+              if (lt.includes(searchText)) {
+                var forId = labels[i].getAttribute('for');
+                if (forId) {
+                  var inp = document.getElementById(forId);
+                  if (inp) {
+                    var wasDisabled = inp.disabled;
+                    inp.disabled = false;
+                    inp.checked = true;
+                    inp.click();
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (wasDisabled) inp.disabled = true;
+                    return;
+                  }
+                }
+                // Also try clicking the label itself
+                labels[i].click();
+                return;
+              }
+            }
+          })()`);
+        }
+        // Delay for Angular to process
+        await new Promise(r => setTimeout(r, 500));
+        return { success: true, effective: false };
+      }
+      return { success: false, effective: false, error: `No visible element found with text "${text.slice(0, 30)}"` };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  // Select an event from Appy Pie's checkbox-based event list + click Continue
+  async selectAppyPieEvent(eventText: string): Promise<ActionResult> {
+    try {
+      const result = await this.activePage.evaluate(`(() => {
+        var target = ${JSON.stringify(eventText.toLowerCase())};
+        // Find all form-checkbox containers
+        var checkboxes = document.querySelectorAll('.form-checkbox, [class*="form-check"]');
+        for (var i = 0; i < checkboxes.length; i++) {
+          var box = checkboxes[i];
+          var text = (box.textContent || '').trim().toLowerCase();
+          if (text.includes(target)) {
+            // Found the event — click the checkbox input
+            var input = box.querySelector('input[type="checkbox"], input[type="radio"]');
+            if (input) {
+              input.disabled = false;
+              input.checked = true;
+              input.click();
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            // Also click the label
+            var label = box.querySelector('label');
+            if (label) label.click();
+            return { success: true, text: text.slice(0, 50) };
+          }
+        }
+        // Also try matching by span/h5 text inside any container
+        var spans = document.querySelectorAll('.dropdown_menu_body_event span, .choose-trigger-event span, .scrollheight span');
+        for (var j = 0; j < spans.length; j++) {
+          var st = (spans[j].textContent || '').trim().toLowerCase();
+          if (st.includes(target) && !st.includes('(')) {
+            var parentCheck = spans[j].closest('.form-checkbox, [class*="form-check"]');
+            if (parentCheck) {
+              var inp = parentCheck.querySelector('input');
+              if (inp) {
+                inp.disabled = false;
+                inp.checked = true;
+                inp.click();
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              var lbl = parentCheck.querySelector('label');
+              if (lbl) lbl.click();
+              return { success: true, text: st.slice(0, 50) };
+            }
+            // Click the span itself
+            spans[j].click();
+            return { success: true, text: st.slice(0, 50) };
+          }
+        }
+        return { success: false, error: 'Event not found: ' + target };
+      })()`);
+
+      const r = result as any;
+      if (r?.success) {
+        console.log(`[adapter] Selected Appy Pie event: "${r.text}"`);
+        await new Promise(res => setTimeout(res, 1000));
+
+        // Now click Continue button
+        const continueClicked = await this.activePage.evaluate(`(() => {
+          var btns = document.querySelectorAll('[data-track="continue with event"], [data-track="continue"], .continue a, .continue button');
+          for (var i = 0; i < btns.length; i++) {
+            var btn = btns[i];
+            var rect = btn.getBoundingClientRect();
+            if (rect.width > 20 && rect.height > 20) {
+              btn.removeAttribute('aria-disabled');
+              btn.removeAttribute('disabled');
+              btn.classList.remove('disabled');
+              btn.click();
+              return { clicked: true, text: (btn.textContent||'').trim().slice(0,30) };
+            }
+          }
+          return { clicked: false };
+        })()`);
+
+        const cr = continueClicked as any;
+        if (cr?.clicked) {
+          console.log(`[adapter] Clicked Continue: "${cr.text}"`);
+          await new Promise(res => setTimeout(res, 1500));
+        }
+
+        return { success: true, effective: true };
+      }
+      return { success: false, effective: false, error: r?.error || 'Event selection failed' };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async openAndSelectDropdown(dropdownLabel: string, optionText: string): Promise<ActionResult> {
+    try {
+      // Appy Pie custom dropdown flow:
+      // 1. Find the dropdown by label text (e.g., "Spreadsheet", "Worksheet")
+      // 2. Click the menu_icon-box to open it
+      // 3. Wait for options to load
+      // 4. Click the matching option
+      const result = await this.activePage.evaluate(`(async () => {
+        var label = ${JSON.stringify(dropdownLabel.toLowerCase())};
+        var option = ${JSON.stringify(optionText.toLowerCase())};
+
+        // Find all labels, match by text
+        var labels = document.querySelectorAll('label');
+        var targetMenu = null;
+        for (var i = 0; i < labels.length; i++) {
+          var lt = (labels[i].textContent || '').trim().toLowerCase();
+          if (lt.includes(label)) {
+            // Found label — find the sibling .menu container
+            var parent = labels[i].closest('.form-check') || labels[i].closest('.multiple-menu') || labels[i].parentElement;
+            if (parent) {
+              targetMenu = parent.querySelector('.menu_icon-box') || parent.querySelector('.menu_icon') || parent.querySelector('.menu');
+            }
+            break;
+          }
+        }
+        if (!targetMenu) return { success: false, error: 'Dropdown label not found: ' + label };
+
+        // Click to open dropdown
+        targetMenu.click();
+
+        // Wait for AJAX-loaded options with retry (some dropdowns load async)
+        var openDropdown = null;
+        for (var attempt = 0; attempt < 3; attempt++) {
+          await new Promise(r => setTimeout(r, 1500));
+          var dropdowns = document.querySelectorAll('.menu_dropdown, [class*="formcontrol"], [class*="dropdown-list"], [class*="select-options"]');
+          for (var d = 0; d < dropdowns.length; d++) {
+            var dd = dropdowns[d];
+            if (!dd.classList.contains('hide') && dd.offsetParent !== null) {
+              openDropdown = dd;
+              break;
+            }
+          }
+          // Also try visible ones by size
+          if (!openDropdown) {
+            for (var d = 0; d < dropdowns.length; d++) {
+              var dd = dropdowns[d];
+              var rect = dd.getBoundingClientRect();
+              if (rect.height > 10 && rect.width > 10) {
+                openDropdown = dd;
+                break;
+              }
+            }
+          }
+          if (openDropdown) break;
+        }
+        if (!openDropdown) return { success: false, error: 'Dropdown did not open after 3 attempts' };
+
+        // Look for options — they could be li, a, div, span with text
+        var allItems = openDropdown.querySelectorAll('li, a, div, span, label');
+        var bestMatch = null;
+        var bestScore = 0;
+        for (var j = 0; j < allItems.length; j++) {
+          var item = allItems[j];
+          var itemText = (item.textContent || '').trim().toLowerCase();
+          if (itemText.length < 2 || itemText.length > 200) continue;
+          var rect = item.getBoundingClientRect();
+          if (rect.width < 20 || rect.height < 15) continue;
+
+          // Exact match
+          if (itemText === option || itemText.startsWith(option)) {
+            bestMatch = item;
+            bestScore = 100;
+            break;
+          }
+          // Partial match
+          if (itemText.includes(option) && bestScore < 50) {
+            bestMatch = item;
+            bestScore = 50;
+          }
+        }
+
+        if (bestMatch) {
+          var r = bestMatch.getBoundingClientRect();
+          return { success: true, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), text: (bestMatch.textContent||'').trim().slice(0,40) };
+        }
+
+        // If no option text match, select the first available option
+        if (option === '' || option === 'first') {
+          for (var j = 0; j < allItems.length; j++) {
+            var item = allItems[j];
+            var itemText = (item.textContent || '').trim();
+            var itemLower = itemText.toLowerCase();
+            if (itemText.length > 2 && itemText.length < 100 && !itemText.includes('Search') && !itemText.includes('Refresh') && !itemLower.includes('----select') && !itemLower.includes('--select--') && itemLower !== 'select' && itemLower !== 'select...' && itemLower !== 'choose') {
+              var r = item.getBoundingClientRect();
+              if (r.width > 20 && r.height > 15) {
+                return { success: true, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), text: itemText.slice(0,40) };
+              }
+            }
+          }
+        }
+
+        return { success: false, error: 'Option not found in dropdown: ' + option };
+      })()`);
+
+      const r = result as any;
+      if (r && r.success && r.x) {
+        await this.activePage.mouse.click(r.x, r.y);
+        await new Promise(res => setTimeout(res, 500));
+        console.log(`[adapter] Dropdown select: "${dropdownLabel}" → "${r.text}" at (${r.x}, ${r.y})`);
+        return { success: true, effective: true };
+      }
+      return { success: false, effective: false, error: r?.error || 'Dropdown interaction failed' };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async insertVariableToken(fieldLabel: string, tokenText: string): Promise<ActionResult> {
+    try {
+      const result = await this.activePage.evaluate(`(async () => {
+        var label = ${JSON.stringify(fieldLabel.toLowerCase())};
+        var token = ${JSON.stringify(tokenText.toLowerCase())};
+
+        // Step 1: Find the field row by label text
+        var rows = document.querySelectorAll('.form-group, .field-row, .input-row, [class*="field"], [class*="form"]');
+        var targetRow = null;
+        for (var i = 0; i < rows.length; i++) {
+          var t = (rows[i].textContent || '').toLowerCase();
+          if (t.includes(label)) { targetRow = rows[i]; break; }
+        }
+        // Fallback: search all labels
+        if (!targetRow) {
+          var allLabels = document.querySelectorAll('label, .label, [class*="label"]');
+          for (var i = 0; i < allLabels.length; i++) {
+            if ((allLabels[i].textContent || '').toLowerCase().includes(label)) {
+              targetRow = allLabels[i].closest('.form-group') || allLabels[i].parentElement;
+              break;
+            }
+          }
+        }
+        if (!targetRow) return { success: false, error: 'Field not found: ' + label };
+
+        // Step 2: Click the "+ Add or Select" button in that row
+        var addBtn = targetRow.querySelector('[class*="add"], [class*="select"], button, a');
+        if (!addBtn) {
+          var els = targetRow.querySelectorAll('*');
+          for (var i = 0; i < els.length; i++) {
+            var t = (els[i].textContent || '').trim().toLowerCase();
+            if ((t.includes('add') || t.includes('select')) && t.length < 30) {
+              addBtn = els[i]; break;
+            }
+          }
+        }
+        if (!addBtn) return { success: false, error: 'Add/Select button not found in field row' };
+        addBtn.click();
+        await new Promise(function(r) { setTimeout(r, 1500); });
+
+        // Step 3: Find the opened variable picker modal/dropdown
+        var picker = null;
+        var candidates = document.querySelectorAll('[class*="picker"], [class*="modal"], [class*="dropdown"], [class*="variable"], [class*="data-field"], [class*="mapping"]');
+        for (var i = 0; i < candidates.length; i++) {
+          var c = candidates[i];
+          var cRect = c.getBoundingClientRect();
+          if (cRect.width > 100 && cRect.height > 50 && cRect.top >= 0) {
+            picker = c; break;
+          }
+        }
+        if (!picker) return { success: false, error: 'Variable picker did not open' };
+
+        // Step 4: Find matching token option
+        var items = picker.querySelectorAll('li, a, div, span, label, [class*="option"], [class*="item"]');
+        var bestMatch = null;
+        for (var i = 0; i < items.length; i++) {
+          var itemText = (items[i].textContent || '').trim().toLowerCase();
+          if (itemText.length < 2 || itemText.length > 200) continue;
+          var iRect = items[i].getBoundingClientRect();
+          if (iRect.width < 20 || iRect.height < 10) continue;
+          if (itemText.includes(token) || token.includes(itemText.slice(0, 15))) {
+            bestMatch = items[i]; break;
+          }
+        }
+        // Fallback: first available item
+        if (!bestMatch && (token === '' || token === 'first')) {
+          for (var i = 0; i < items.length; i++) {
+            var iRect = items[i].getBoundingClientRect();
+            if (iRect.width > 20 && iRect.height > 10) { bestMatch = items[i]; break; }
+          }
+        }
+        if (!bestMatch) return { success: false, error: 'Token not found in picker: ' + token };
+
+        var r = bestMatch.getBoundingClientRect();
+        return { success: true, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), text: (bestMatch.textContent||'').trim().slice(0,50) };
+      })()`);
+
+      const r = result as any;
+      if (r?.success && r.x) {
+        await this.activePage.mouse.click(r.x, r.y);
+        await new Promise(res => setTimeout(res, 500));
+        console.log(`[adapter] Variable token: "${fieldLabel}" → "${r.text}"`);
+        return { success: true, effective: true };
+      }
+      return { success: false, effective: false, error: r?.error || 'Variable token insertion failed' };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async autoFillActionFields(): Promise<{ filled: number; fields: string[] }> {
+    // Proactively fill ALL empty fields that have "+ Add or Select" buttons on the action options page.
+    // For each field: click its "Add or Select" button → wait for picker → click first token item.
+    try {
+      // Step 1: Find all "+ Add or Select" buttons on the page
+      const fieldButtons = await this.activePage.evaluate(`(() => {
+        var results = [];
+        var seen = {};
+        // Look for "add or select" / "+ add" text in the side panel
+        var allEls = document.querySelectorAll('a, button, span, div');
+        for (var i = 0; i < allEls.length; i++) {
+          var el = allEls[i];
+          var t = (el.textContent || '').trim().toLowerCase();
+          if (!(t.includes('add or select') || t.includes('+ add') || (t === '+ add or select'))) continue;
+          if (t.length > 40) continue;
+          var rect = el.getBoundingClientRect();
+          if (rect.width < 10 || rect.height < 10 || rect.top < 0) continue;
+          // Find the parent field label
+          var parent = el.closest('.form-group, [class*="field"], [class*="form"], [class*="row"]') || el.parentElement;
+          var label = '';
+          if (parent) {
+            var labelEl = parent.querySelector('label, .label, [class*="label"]');
+            if (labelEl) label = (labelEl.textContent || '').trim();
+          }
+          if (!label) {
+            var prev = el.parentElement;
+            while (prev && !label) {
+              var lbl = prev.querySelector('label');
+              if (lbl) label = (lbl.textContent || '').trim();
+              prev = prev.parentElement;
+            }
+          }
+          // Check if the field already has a value (token already inserted)
+          var hasValue = false;
+          if (parent) {
+            var chips = parent.querySelectorAll('[class*="chip"], [class*="tag"], [class*="token"], [class*="badge"]');
+            if (chips.length > 0) hasValue = true;
+            var inputs = parent.querySelectorAll('input, textarea');
+            for (var j = 0; j < inputs.length; j++) {
+              if (inputs[j].value && inputs[j].value.trim().length > 0) hasValue = true;
+            }
+          }
+          var key = label || ('btn-' + i);
+          if (!seen[key] && !hasValue) {
+            seen[key] = true;
+            results.push({ label: label || 'field-' + i, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2) });
+          }
+        }
+        return results;
+      })()`);
+
+      const buttons = (fieldButtons as Array<{ label: string; x: number; y: number }>)
+        .filter(btn => !this._failedAutoFills.has(btn.label) && !this._filledDropdowns.has(btn.label));
+      if (!buttons || buttons.length === 0) return { filled: 0, fields: [] };
+
+      const filledFields: string[] = [];
+
+      for (const btn of buttons) {
+        try {
+          // Click the "+ Add or Select" button
+          await this.activePage.mouse.click(btn.x, btn.y);
+          await new Promise(r => setTimeout(r, 1500));
+
+          // Find the picker that opened and click the first available token
+          const tokenResult = await this.activePage.evaluate(`(() => {
+            // Find opened picker/dropdown/modal
+            var picker = null;
+            var candidates = document.querySelectorAll('[class*="picker"], [class*="dropdown-menu"], [class*="popup"], [class*="popover"], [class*="modal-body"], [class*="mapping"], [class*="field-list"], [class*="searchable"], [class*="tokenlist"], [class*="variablelist"], [class*="field-mapping"], [class*="token-list"], [class*="variable-list"], [class*="select-list"]');
+            for (var i = 0; i < candidates.length; i++) {
+              var c = candidates[i];
+              var rect = c.getBoundingClientRect();
+              if (rect.width > 80 && rect.height > 40 && rect.top >= 0 && c.offsetParent !== null) {
+                picker = c; break;
+              }
+            }
+            // Fallback: any recently-visible popup/dropdown
+            if (!picker) {
+              var allDivs = document.querySelectorAll('div, ul');
+              for (var i = 0; i < allDivs.length; i++) {
+                var d = allDivs[i];
+                var cls = (d.className || '').toLowerCase();
+                var style = d.style;
+                if ((cls.includes('show') || cls.includes('open') || cls.includes('active') || cls.includes('visible')) &&
+                    (cls.includes('drop') || cls.includes('pick') || cls.includes('list') || cls.includes('pop'))) {
+                  var rect = d.getBoundingClientRect();
+                  if (rect.width > 80 && rect.height > 40) { picker = d; break; }
+                }
+              }
+            }
+            if (!picker) return { success: false, error: 'picker not found' };
+
+            // Find clickable items inside picker (skip search inputs, headers)
+            var items = picker.querySelectorAll('li, a, [class*="option"], [class*="item"], [class*="field-name"], [role="option"]');
+            for (var i = 0; i < items.length; i++) {
+              var item = items[i];
+              var text = (item.textContent || '').trim();
+              if (text.length < 2 || text.length > 200) continue;
+              if (item.tagName === 'INPUT' || item.tagName === 'LABEL') continue;
+              var rect = item.getBoundingClientRect();
+              if (rect.width < 20 || rect.height < 8) continue;
+              // Skip search box text
+              if (text.toLowerCase().includes('search')) continue;
+              return { success: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text.slice(0, 50) };
+            }
+            // Second pass: any div/span that looks clickable
+            var spans = picker.querySelectorAll('div, span');
+            for (var i = 0; i < spans.length; i++) {
+              var sp = spans[i];
+              var text = (sp.textContent || '').trim();
+              if (text.length < 3 || text.length > 100) continue;
+              if (sp.children.length > 3) continue; // skip containers
+              var rect = sp.getBoundingClientRect();
+              if (rect.width < 30 || rect.height < 12) continue;
+              if (text.toLowerCase().includes('search') || text.toLowerCase().includes('select')) continue;
+              return { success: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text.slice(0, 50) };
+            }
+            return { success: false, error: 'no clickable items in picker' };
+          })()`);
+
+          const token = tokenResult as any;
+          if (token?.success && token.x) {
+            await this.activePage.mouse.click(token.x, token.y);
+            await new Promise(r => setTimeout(r, 800));
+            console.log(`[adapter] Auto-filled "${btn.label}" → "${token.text}"`);
+            filledFields.push(btn.label);
+          } else {
+            // Picker opened but no items — try typing a default value for numeric fields
+            await this.activePage.keyboard.press('Escape');
+            await new Promise(r => setTimeout(r, 300));
+            const labelLower = btn.label.toLowerCase();
+            const isNumericField = labelLower.includes('quantity') || labelLower.includes('amount') || labelLower.includes('price') || labelLower.includes('count');
+            if (isNumericField) {
+              // Try to find and fill the input directly
+              const filled = await this.activePage.evaluate(`(() => {
+                var label = ${JSON.stringify(btn.label.toLowerCase())};
+                var labels = document.querySelectorAll('label');
+                for (var i = 0; i < labels.length; i++) {
+                  if ((labels[i].textContent || '').trim().toLowerCase().includes(label.split(' ')[0])) {
+                    var parent = labels[i].closest('.form-group, [class*="field"], [class*="form"]') || labels[i].parentElement;
+                    if (parent) {
+                      var input = parent.querySelector('input[type="text"], input[type="number"], input:not([type="hidden"])');
+                      if (input) { input.value = '1'; input.dispatchEvent(new Event('input', {bubbles:true})); input.dispatchEvent(new Event('change', {bubbles:true})); return true; }
+                    }
+                  }
+                }
+                return false;
+              })()`).catch(() => false);
+              if (filled) {
+                console.log(`[adapter] Auto-typed "1" into numeric field "${btn.label}"`);
+                filledFields.push(btn.label);
+                continue;
+              }
+            }
+            this._failedAutoFills.add(btn.label);
+            console.log(`[adapter] Auto-fill "${btn.label}" failed: ${token?.error}`);
+          }
+        } catch (err) {
+          console.log(`[adapter] Auto-fill "${btn.label}" error: ${(err as Error).message}`);
+        }
+      }
+
+      return { filled: filledFields.length, fields: filledFields };
+    } catch (err) {
+      console.log(`[adapter] autoFillActionFields error: ${(err as Error).message}`);
+      return { filled: 0, fields: [] };
+    }
+  }
+
+  async autoFillCustomDropdowns(): Promise<{ filled: number; fields: string[] }> {
+    // Auto-fill Appy Pie's custom dropdowns (.menu_icon-box) that are empty and required
+    // These are used for Spreadsheet, Worksheet, and similar fields on trigger/action config pages
+    try {
+      // Step 1: Find all custom dropdown fields that are empty (have a required label but no selected value)
+      const emptyDropdowns = await this.activePage.evaluate(`(() => {
+        var results = [];
+        // Find all .menu_icon-box or menu icon containers
+        var menuIcons = document.querySelectorAll('.menu_icon-box, .menu_icon, [class*="menu-icon"]');
+        for (var i = 0; i < menuIcons.length; i++) {
+          var icon = menuIcons[i];
+          var rect = icon.getBoundingClientRect();
+          if (rect.width < 5 || rect.height < 5 || rect.top < 0) continue;
+          // Find parent form group
+          var parent = icon.closest('.form-check, .multiple-menu, .form-group, [class*="field"], [class*="row"]') || icon.parentElement;
+          if (!parent) continue;
+          // Get label
+          var label = '';
+          var labelEl = parent.querySelector('label, .label, [class*="label"]');
+          if (labelEl) label = (labelEl.textContent || '').trim();
+          // Check if required (has asterisk)
+          var isRequired = label.includes('*');
+          // Check if already has a value
+          var hasValue = false;
+          var valueEls = parent.querySelectorAll('[class*="chip"], [class*="tag"], [class*="selected"], .formcontrol span, .menu_dropdown_selected');
+          if (valueEls.length > 0) {
+            for (var v = 0; v < valueEls.length; v++) {
+              var vText = (valueEls[v].textContent || '').trim();
+              if (vText.length > 0 && vText !== 'Select' && !vText.includes('Refresh')) { hasValue = true; break; }
+            }
+          }
+          // Also check the formcontrol text
+          var formCtrl = parent.querySelector('.formcontrol, [class*="form-control"]');
+          if (formCtrl) {
+            var ctrlText = (formCtrl.textContent || '').trim().toLowerCase();
+            if (ctrlText && ctrlText !== 'select' && ctrlText !== '' && !ctrlText.includes('refresh') && ctrlText.length > 1) hasValue = true;
+          }
+          if (!hasValue) {
+            results.push({ label: label || 'dropdown-' + i, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), required: isRequired });
+          }
+        }
+        return results;
+      })()`);
+
+      const dropdowns = (emptyDropdowns as Array<{ label: string; x: number; y: number; required: boolean }>)
+        .filter(dd => {
+          const key = dd.label.replace(/\s*\*\s*$/, '').trim().toLowerCase();
+          return !this._filledDropdowns.has(dd.label) && !this._filledDropdowns.has(key) &&
+                 !this._failedAutoFills.has(dd.label) && !this._failedAutoFills.has(key);
+        });
+      if (!dropdowns || dropdowns.length === 0) return { filled: 0, fields: [] };
+
+      const filledFields: string[] = [];
+
+      for (const dd of dropdowns) {
+        try {
+          // Click the menu icon to open the dropdown
+          await this.activePage.mouse.click(dd.x, dd.y);
+          await new Promise(r => setTimeout(r, 2000)); // Wait for AJAX-loaded options
+
+          // Find and click the first option in the opened dropdown
+          const optionResult = await this.activePage.evaluate(`(() => {
+            var dropdowns = document.querySelectorAll('.menu_dropdown, [class*="formcontrol"], [class*="dropdown-list"], [class*="select-options"]');
+            var openDD = null;
+            for (var d = 0; d < dropdowns.length; d++) {
+              var dd = dropdowns[d];
+              if (!dd.classList.contains('hide') && dd.offsetParent !== null) {
+                var rect = dd.getBoundingClientRect();
+                if (rect.height > 10 && rect.width > 10) { openDD = dd; break; }
+              }
+            }
+            if (!openDD) return { success: false, error: 'dropdown not open' };
+            // Find first clickable option (skip Search, Refresh, headers)
+            var items = openDD.querySelectorAll('li, a, div, span, label, [class*="option"], [role="option"]');
+            for (var j = 0; j < items.length; j++) {
+              var item = items[j];
+              var text = (item.textContent || '').trim();
+              if (text.length < 2 || text.length > 200) continue;
+              if (item.tagName === 'INPUT') continue;
+              var lower = text.toLowerCase();
+              if (lower.includes('search') || lower === 'refresh' || lower === 'select' || lower.includes('----select') || lower.includes('--select--') || lower === '----select---' || lower === 'select...' || lower === 'choose' || lower.includes('error') || lower.includes('invalid') || lower.startsWith('400') || lower.startsWith('500')) continue;
+              var rect = item.getBoundingClientRect();
+              if (rect.width < 20 || rect.height < 12) continue;
+              // Skip container divs that have too many children
+              if (item.children.length > 4) continue;
+              return { success: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text.slice(0, 50) };
+            }
+            return { success: false, error: 'no options in dropdown' };
+          })()`);
+
+          const opt = optionResult as any;
+          if (opt?.success && opt.x) {
+            await this.activePage.mouse.click(opt.x, opt.y);
+            await new Promise(r => setTimeout(r, 1000));
+            console.log(`[adapter] Auto-filled dropdown "${dd.label}" → "${opt.text}"`);
+            filledFields.push(dd.label);
+            this._filledDropdowns.add(dd.label);
+            this._filledDropdowns.add(dd.label.replace(/\s*\*\s*$/, '').trim().toLowerCase());
+          } else {
+            await this.activePage.keyboard.press('Escape');
+            await new Promise(r => setTimeout(r, 300));
+            this._failedAutoFills.add(dd.label);
+            this._failedAutoFills.add(dd.label.replace(/\s*\*\s*$/, '').trim().toLowerCase());
+          }
+        } catch (err) {
+          this._failedAutoFills.add(dd.label);
+          console.log(`[adapter] Auto-fill dropdown "${dd.label}" error: ${(err as Error).message}`);
+        }
+      }
+
+      return { filled: filledFields.length, fields: filledFields };
+    } catch (err) {
+      console.log(`[adapter] autoFillCustomDropdowns error: ${(err as Error).message}`);
+      return { filled: 0, fields: [] };
+    }
+  }
+
+  async clickContinueRunTest(): Promise<ActionResult> {
+    try {
+      // Wait up to 10s for "Continue & Run Test" (or "Skip Run Test") to become enabled
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const result = await this.activePage.evaluate(`(() => {
+          var btns = document.querySelectorAll('button, a, [role="button"]');
+          for (var i = 0; i < btns.length; i++) {
+            var btn = btns[i];
+            var text = (btn.textContent || '').trim().toLowerCase();
+            var track = (btn.getAttribute('data-track') || '').toLowerCase();
+            var isContinueBtn = text === 'continue & run test' || text === 'skip run test' ||
+                                track.includes('continue & run') || track.includes('skip run');
+            if (!isContinueBtn) continue;
+            var isDisabled = btn.disabled || btn.classList.contains('disabled') ||
+                             btn.getAttribute('aria-disabled') === 'true' ||
+                             btn.hasAttribute('disabled');
+            if (isDisabled) return { found: true, enabled: false };
+            var rect = btn.getBoundingClientRect();
+            if (rect.width < 20) return { found: true, enabled: false };
+            return { found: true, enabled: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text };
+          }
+          return { found: false };
+        })()`);
+
+        const r = result as any;
+        if (r?.found && r?.enabled && r?.x) {
+          await this.activePage.mouse.click(r.x, r.y);
+          console.log(`[adapter] Clicked "${r.text}" at (${r.x}, ${r.y})`);
+          await new Promise(res => setTimeout(res, 1500));
+          return { success: true, effective: true };
+        }
+        if (!r?.found) break; // button not on page at all
+        // Button found but disabled — wait 1s and retry
+        await new Promise(res => setTimeout(res, 1000));
+      }
+      return { success: false, effective: false, error: 'Continue & Run Test button not found or stayed disabled' };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async typeBySelector(selector: string, text: string): Promise<ActionResult> {
+    try {
+      await this.activePage.fill(selector, text, { timeout: ACTION_TIMEOUT });
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async typeByContentEditable(selector: string, text: string): Promise<ActionResult> {
+    try {
+      const el = this.activePage.locator(selector).first();
+      await el.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
+      await el.click({ timeout: ACTION_TIMEOUT });
+      // Select all existing content and replace with new text
+      await this.activePage.keyboard.press('Control+A');
+      await this.activePage.keyboard.type(text, { delay: 20 });
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async typeByCoordinates(x: number, y: number, text: string): Promise<ActionResult> {
+    try {
+      await this.activePage.mouse.click(x, y);
+      await this.activePage.keyboard.press('Control+A');
+      await this.activePage.keyboard.type(text, { delay: 30 });
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async selectBySelector(selector: string, value: string): Promise<ActionResult> {
+    try {
+      await this.activePage.selectOption(selector, { label: value }, { timeout: ACTION_TIMEOUT });
+      return { success: true, effective: false };
+    } catch {
+      try {
+        await this.activePage.selectOption(selector, value, { timeout: ACTION_TIMEOUT });
+        return { success: true, effective: false };
+      } catch (err) {
+        return { success: false, effective: false, error: (err as Error).message };
+      }
+    }
+  }
+
+  async scroll(direction: 'up' | 'down', amount: number = 300): Promise<ActionResult> {
+    try {
+      const delta = direction === 'down' ? amount : -amount;
+
+      // Strategy 1: Find and scroll the side panel overflow container directly
+      const scrolledPanel = await this.activePage.evaluate(`(() => {
+        var delta = ${delta};
+        // Try specific Appy Pie side panel selectors first
+        var selectors = [
+          '.halfcolume', '[class*="half-column"]', '[class*="sidebar-content"]',
+          '[class*="action-detail"]', '[class*="trigger-detail"]', '[class*="panel-body"]',
+          '[class*="side-panel"]', '[class*="detail-panel"]', '[class*="options-panel"]',
+          '[class*="scrollbar"]', '[class*="scroll-area"]', '[class*="overflow"]',
+        ];
+        for (var si = 0; si < selectors.length; si++) {
+          var els = document.querySelectorAll(selectors[si]);
+          for (var ei = 0; ei < els.length; ei++) {
+            var el = els[ei];
+            if (el.scrollHeight > el.clientHeight + 20) {
+              var before = el.scrollTop;
+              el.scrollTop += delta;
+              if (el.scrollTop !== before) return 'selector';
+            }
+          }
+        }
+        // Try any div in right half that can scroll
+        var allDivs = document.querySelectorAll('div');
+        for (var j = 0; j < allDivs.length; j++) {
+          var d = allDivs[j];
+          var rect = d.getBoundingClientRect();
+          if (rect.left > window.innerWidth * 0.35 && d.scrollHeight > d.clientHeight + 20 && rect.height > 100) {
+            var before = d.scrollTop;
+            d.scrollTop += delta;
+            if (d.scrollTop !== before) return 'div';
+          }
+        }
+        return null;
+      })()`).catch(() => null);
+
+      if (scrolledPanel) {
+        await new Promise(r => setTimeout(r, 300));
+        return { success: true, effective: true };
+      }
+
+      // Strategy 2: Move mouse to right side of screen and use wheel (scrolls whatever is under cursor)
+      const vp = this.activePage.viewportSize() || { width: 1440, height: 900 };
+      const panelX = Math.round(vp.width * 0.75); // Right side where panel is
+      const panelY = Math.round(vp.height * 0.5);  // Middle of screen
+      await this.activePage.mouse.move(panelX, panelY);
+      await this.activePage.mouse.wheel(0, delta);
+      await new Promise(r => setTimeout(r, 300));
+      return { success: true, effective: true };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async navigate(url: string): Promise<ActionResult> {
+    let lastErr: Error | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+        return { success: true, effective: true, newUrl: this.activePage.url() };
+      } catch (err) {
+        lastErr = err as Error;
+        console.warn(`[adapter] navigate attempt ${attempt + 1} failed: ${lastErr.message}`);
+        if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    return { success: false, effective: false, error: lastErr!.message };
+  }
+
+  async keypress(key: string): Promise<ActionResult> {
+    // Normalize key names — Playwright is case-sensitive
+    const KEY_MAP: Record<string, string> = {
+      'HOME': 'Home', 'END': 'End',
+      'PAGEUP': 'PageUp', 'PAGEDOWN': 'PageDown',
+      'ENTER': 'Enter', 'RETURN': 'Enter',
+      'TAB': 'Tab', 'ESC': 'Escape', 'ESCAPE': 'Escape',
+      'SPACE': 'Space', 'DEL': 'Delete', 'DELETE': 'Delete',
+      'BACKSPACE': 'Backspace',
+      'ARROWUP': 'ArrowUp', 'ARROWDOWN': 'ArrowDown',
+      'ARROWLEFT': 'ArrowLeft', 'ARROWRIGHT': 'ArrowRight',
+      'UP': 'ArrowUp', 'DOWN': 'ArrowDown',
+      'LEFT': 'ArrowLeft', 'RIGHT': 'ArrowRight',
+    };
+    // Modifier map for combo keys (e.g. "Ctrl+R", "Ctrl+Shift+N")
+    const MODIFIER_MAP: Record<string, string> = {
+      'CTRL': 'Control', 'CONTROL': 'Control',
+      'ALT': 'Alt', 'SHIFT': 'Shift',
+      'META': 'Meta', 'CMD': 'Meta', 'WIN': 'Meta', 'SUPER': 'Meta',
+    };
+    let normalizedKey: string;
+    if (key.includes('+')) {
+      // Combo key: normalize each part separately
+      const parts = key.split('+');
+      normalizedKey = parts.map((p, i) => {
+        const upper = p.trim().toUpperCase();
+        if (MODIFIER_MAP[upper]) return MODIFIER_MAP[upper];
+        // Last part is the actual key (not a modifier) — lowercase single chars
+        const mapped = KEY_MAP[upper];
+        if (mapped) return mapped;
+        return p.trim().length === 1 ? p.trim().toLowerCase() : p.trim();
+      }).join('+');
+    } else {
+      normalizedKey = KEY_MAP[key.toUpperCase()] ?? key;
+    }
+    try {
+      await this.activePage.keyboard.press(normalizedKey);
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async wait(ms: number): Promise<ActionResult> {
+    await new Promise(r => setTimeout(r, Math.min(ms, 5000)));
+    return { success: true, effective: false };
+  }
+
+  /**
+   * Predicate-driven wait. Polls a JS expression in the page until it returns
+   * truthy. Replaces blind `wait(3000)` with deterministic "wait for X to be true".
+   *
+   *   await adapter.waitUntil('document.querySelectorAll("input").length > 0');
+   *   await adapter.waitUntil('!document.querySelector(".loader")', { timeoutMs: 8000 });
+   *
+   * Returns:
+   *   success=true,  effective=true  → predicate eventually returned truthy
+   *   success=true,  effective=false → predicate was already truthy on first check
+   *   success=false                  → timed out
+   */
+  async waitUntil(
+    predicate: string,
+    options?: { timeoutMs?: number; pollMs?: number },
+  ): Promise<ActionResult> {
+    const timeoutMs = Math.min(options?.timeoutMs ?? 8000, 15000);
+    const pollMs = Math.max(options?.pollMs ?? 200, 100);
+    const start = Date.now();
+    let attempts = 0;
+    try {
+      while (Date.now() - start < timeoutMs) {
+        attempts++;
+        // Wrap in IIFE so callers can pass either an expression OR a statement block.
+        const result = await this.activePage.evaluate(`(() => { try { return !!(${predicate}); } catch (e) { return false; } })()`)
+          .catch(() => false);
+        if (result) {
+          return { success: true, effective: attempts > 1 };
+        }
+        await new Promise(r => setTimeout(r, pollMs));
+      }
+      return {
+        success: false,
+        effective: false,
+        error: `waitUntil timed out after ${timeoutMs}ms (${attempts} attempts) — predicate: ${predicate.slice(0, 60)}`,
+      };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  /**
+   * Evaluate a JS expression in-page. Wraps in an IIFE + try/catch so a
+   * throwing expression returns undefined instead of crashing the engine.
+   * Used by the state-aware execution layer for single-shot state probes.
+   */
+  async evaluateExpr<T = unknown>(expr: string): Promise<T | undefined> {
+    try {
+      return await this.activePage.evaluate(
+        `(() => { try { return (${expr}); } catch (e) { return undefined; } })()`,
+      ) as T;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async screenshot(filePath: string): Promise<void> {
+    await this.activePage.screenshot({ path: filePath });
+  }
+
+  async screenshotJPEG(): Promise<string> {
+    const buffer = await this.activePage.screenshot({ type: 'jpeg', quality: 50 });
+    return `data:image/jpeg;base64,${buffer.toString('base64')}`;
+  }
+
+  async close(): Promise<void> {}
+
+  getActivePage(): Page { return this.activePage; }
+}

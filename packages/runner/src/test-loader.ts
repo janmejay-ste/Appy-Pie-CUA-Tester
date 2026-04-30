@@ -39,6 +39,18 @@ function loadTest(filePath: string): TestDefinition {
   const parentDir = path.basename(path.dirname(filePath));
   const page = parentDir !== 'tests' ? parentDir : undefined;
 
+  // Validation rules — optional YAML block. Each entry must be
+  // { type, value, label? }. Anything malformed is silently dropped.
+  const validation: TestDefinition['validation'] = Array.isArray(parsed.validation)
+    ? parsed.validation
+        .filter((r: any) => r && typeof r === 'object' && typeof r.type === 'string' && typeof r.value === 'string')
+        .map((r: any) => ({
+          type: r.type,
+          value: r.value,
+          label: typeof r.label === 'string' ? r.label : undefined,
+        }))
+    : undefined;
+
   return {
     id,
     name: parsed.name ?? id,
@@ -52,5 +64,6 @@ function loadTest(filePath: string): TestDefinition {
     max_turns: parsed.max_turns ?? undefined,
     requires_auth: parsed.requires_auth ?? false,
     page,
+    validation,
   };
 }

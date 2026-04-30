@@ -1,0 +1,17 @@
+# Local dev infrastructure for AppyPie CUA Tester.
+# Start with: docker compose up -d
+# Runner and dashboard are NOT included — run those with `pnpm dev`.
+# Database: Turso/SQLite (no container needed — uses local file or cloud).
+
+services:
+  redis:
+    image: redis:7
+    container_name: cua-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

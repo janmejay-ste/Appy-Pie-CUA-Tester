@@ -14,6 +14,9 @@ instructions: |
      - User profile icon or account menu is visible in the top-right corner
      - No authentication error messages are displayed
   7. Verify the navigation shows authenticated state (e.g., profile icon, logout option, Create Connect button)
+  NOTE: After login, the page may redirect to different URLs (e.g., /connects, /dashboard, or the homepage). Any of these is acceptable.
+  If the dashboard shows an empty state, a "Create Connect" prompt, or no existing connects listed, that is acceptable — verify that authenticated UI elements (profile icon, navigation, logout option) are present regardless of content.
+  If any page shows a 503 error or empty state, wait 3 seconds and retry. Empty states (no existing data) are acceptable — proceed with the test flow.
 timeout: 120000
 expected_outcome: "User logs in successfully, Connect dashboard loads with authenticated UI elements (profile icon, navigation, connect list), no error messages displayed"
 tags:
@@ -22,3 +25,16 @@ tags:
   - auth
   - e2e
   - automate
+# Hard-verification rules — checked AFTER the model emits its verdict.
+# Final verdict = model PASS AND all rules pass. Soft-matched (substring,
+# case-insensitive). Keep to 2-5 strong signals; more is noise.
+validation:
+  - type: url
+    value: /connects
+    label: "Reached Connect dashboard URL"
+  - type: text
+    value: "Create Connect"
+    label: "Authenticated CTA visible"
+  - type: not_text
+    value: "Sign in with"
+    label: "Login form NOT shown post-auth"

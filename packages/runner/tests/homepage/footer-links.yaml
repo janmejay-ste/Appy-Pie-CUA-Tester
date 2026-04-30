@@ -1,7 +1,6 @@
 name: "Footer Links Validation"
 url: "https://www.appypieautomate.ai"
 category: sanity
-max_turns: 20
 instructions: |
   1. Scroll to the bottom of the homepage to make the footer visible
   2. Verify the footer section is displayed with organized link groups

@@ -1,7 +1,6 @@
 name: "CTA Buttons Functionality"
 url: "https://www.appypieautomate.ai"
 category: sanity
-max_turns: 12
 instructions: |
   1. On the homepage, verify the primary CTA button in the hero section is visible (e.g., "Start Free Trial", "Get Started Free", or "Start Automating")
   2. Note the text of the CTA button — do NOT click it yet

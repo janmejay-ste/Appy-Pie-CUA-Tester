@@ -1,8 +1,8 @@
 name: "Integrations Explorer"
-url: "https://www.appypieautomate.ai/integrations"
+url: "https://www.appypieautomate.ai/integrate"
 category: regression
 instructions: |
-  1. Navigate to the integrations or explore page
+  1. Navigate to the features or explore page
   2. Verify the page loads with a list or grid of available app integrations
   3. Look for categories or filters (e.g., CRM, Marketing, Productivity, Communication)
   4. Browse through at least 2-3 categories and verify integrations update

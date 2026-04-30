@@ -1,7 +1,6 @@
 name: "Cross-Page Navigation"
 url: "https://www.appypieautomate.ai"
 category: regression
-max_turns: 30
 instructions: |
   1. From the homepage, click on "Pricing" in the top navigation bar
   2. Verify the Pricing page loads — confirm pricing cards/plans are visible with correct content

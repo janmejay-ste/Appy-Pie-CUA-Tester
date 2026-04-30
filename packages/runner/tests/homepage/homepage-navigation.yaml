@@ -5,9 +5,14 @@ instructions: |
   1. Verify the homepage loads completely
   2. Check that the main navigation bar is visible with links (Features, Explore, MCP Server, Pricing, Blog, Contact Sales, Sign Up, Log In)
   3. Scroll down and verify major sections are present: hero section, popular integrations, how-it-works steps, footer
-  4. Check that the primary CTA button (e.g. "Get Started Free", "Try it Free", or "Start Automating") is visible above the fold
-  5. Click the primary CTA button and verify it navigates to a signup or account creation page
-  6. Go back to the homepage
+  4. Check that the primary CTA button (e.g. "Get Started Free", "Try it Free", "Start Free Trial", or "Start Automating") is visible above the fold
+  5. Click the primary CTA button and verify the URL changes — it should navigate to a signup, registration, or account creation page
+     - IMPORTANT: After clicking, just verify the URL changed to a signup/register page. Do NOT interact with the signup form, do NOT try to login, do NOT fill any fields
+     - Simply confirm: "CTA button navigated to signup page" and move on
+  6. Navigate back to the homepage by going to https://www.appypieautomate.ai
+     - Do NOT use the browser back button (it may not work cross-domain)
+     - Do NOT try to login on the signup page
+  7. Verify the homepage loads correctly after returning — hero section and navigation bar visible
 timeout: 120000
-expected_outcome: "Homepage loads with visible navigation, hero section, integrations, how-it-works, and footer are present, CTA button leads to signup page"
+expected_outcome: "Homepage loads with visible navigation, hero section, integrations, how-it-works, and footer are present, CTA button leads to signup page, homepage loads correctly after returning"
 tags: ["homepage", "navigation", "cta", "automate"]

@@ -6,14 +6,26 @@ instructions: |
   1. Log in using the test account credentials
   2. After successful login, navigate to the user dashboard / connects page
   3. Verify the dashboard loads completely with:
-     - Sidebar or top navigation with sections (Connects, History, Apps, Account)
-     - User profile information or avatar visible
+     - Sidebar or top navigation with sections (My Connects, Task History, Linked Accounts, MCP, Tools, Help, User Management)
+     - User profile information or avatar visible in the top-right corner
      - Any existing connects/workflows listed (or empty state with "Create Connect" prompt)
-  4. Click through at least 3 different sidebar/navigation items to verify they load
-  5. Check that the "Create Connect" or "New Workflow" action is accessible
-  6. Verify the account/profile settings page is reachable
-  7. Check for any broken UI elements, missing images, or console errors
-  8. Test the logout flow: find and click logout, verify you return to the public homepage
-timeout: 180000
-expected_outcome: "Dashboard loads after login, navigation works, all sections accessible, logout returns to homepage"
-tags: ["dashboard", "auth", "navigation", "e2e", "automate"]
+     - "Create Connect" button visible in the sidebar
+  4. Click on "My Connects" in the sidebar — verify the connects list loads with columns: Name, ID, Apps, Created On, Last edit, Actions
+  5. Click on "Task History" in the sidebar — verify it loads with a list/table of past task executions
+     - if it displaying null ignore it but report if it shows a empty page not 503 error
+  6. Click on "Linked Accounts" in the sidebar — verify it shows connected app accounts
+  7. Click on "MCP" in the sidebar — verify the MCP page loads if it displaying null ignore it but report if it shows a empty page not 503 error
+  8. Click on "Tools" in the sidebar — verify the Tools page loads if it displaying null ignore it but report if it shows a empty page not 503 error
+  9. Verify the "Create Connect" button is clickable (click it but do NOT proceed with creating a connect — just verify it opens the builder, then navigate back)
+  10. Click on the user profile icon/avatar in the top-right corner — verify a dropdown/menu appears with options like Profile, Billing, Logout
+  11. Click on "Profile" or "Account Settings" — verify the profile/account page loads with user information
+  12. Navigate back to the dashboard
+  13. Test the logout flow:
+      - Click on the user profile icon/avatar again
+      - Click "Logout" or "Sign Out"
+      - Verify you are redirected to the login page or public homepage (NOT to a /null or error page)
+      - Verify the login page loads correctly with the login form visible
+  14. Report any 503 errors, broken navigation, or unexpected redirects (like /null) as issues
+timeout: 240000
+expected_outcome: "Dashboard loads after login with sidebar navigation visible, My Connects shows list, Task History loads, Linked Accounts accessible, MCP and Tools pages load, Create Connect button works, profile/account page reachable, logout redirects to login page (not /null), no 503 errors on main pages"
+tags: ["dashboard", "auth", "navigation", "e2e", "automate", "sidebar", "profile", "logout"]

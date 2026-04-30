@@ -252,7 +252,18 @@ export async function executeModelAction(
       case 'navigate': {
         const url = action.value;
         if (!url) return { success: false, error: 'No URL for navigate', description: 'navigate: no URL' };
-        await page.goto(url, { waitUntil: 'load', timeout: 15000 });
+        let lastNavErr: Error | null = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+            lastNavErr = null;
+            break;
+          } catch (err) {
+            lastNavErr = err as Error;
+            if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+          }
+        }
+        if (lastNavErr) return { success: false, error: lastNavErr.message, description: `navigate failed: ${url.slice(0, 60)}` };
         return { success: true, description: `navigated to ${url.slice(0, 60)}` };
       }
 

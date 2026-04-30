@@ -1,13 +1,41 @@
 name: "Error Page Handling (404)"
 url: "https://www.appypieautomate.ai/this-page-does-not-exist-12345"
 category: regression
-max_turns: 20
 instructions: |
+  PART 1 — Standard 404 Page
   1. Verify the page loads and shows a custom error page (may display 404, 410, or similar error code)
-  2. Confirm the error page is branded and user-friendly — not a raw server error or blank white page
-  3. Check for a "HOME" button or link to return to the homepage
+  2. Confirm the error page is branded and user-friendly — not a raw server error, blank white page, or default browser error
+  3. Check for these elements on the error page:
+     - Appy Pie branding/logo visible
+     - Error illustration or image (not broken)
+     - Clear error message text (e.g. "Page not found", "This page doesn't exist")
+     - Navigation options: "HOME", "START FREE TRIAL", "LOG IN" buttons/links
   4. Click the HOME button and verify it navigates back to the homepage correctly
   5. Verify the homepage loads with the hero section and navigation bar visible
-timeout: 90000
-expected_outcome: "Invalid URL shows a branded error page with a HOME button that successfully navigates back to the homepage"
-tags: ["error", "404", "error-handling", "automate"]
+
+  PART 2 — Deep Invalid URL
+  6. Navigate to https://www.appypieautomate.ai/integrations/this-app-does-not-exist-xyz
+  7. Verify this also shows a proper error page (not a blank page or raw 500 error)
+  8. Check if the error page is the same branded page or a different one
+  9. Navigate back to homepage using the HOME button or logo
+
+  PART 3 — Invalid Connect Cloud URL (authenticated area)
+  10. Navigate to https://connectcloud.appypie.com/invalid-route-12345
+  11. Verify the response — it should either:
+      - Show a branded error page, OR
+      - Redirect to login page, OR
+      - Redirect to the dashboard
+  12. It should NOT show a raw server error, blank page, or crash
+
+  PART 4 — Special Characters in URL
+  13. Navigate to https://www.appypieautomate.ai/<script>alert(1)</script>
+  14. Verify the page handles special characters safely — no JavaScript execution, no raw HTML rendering
+  15. The page should show an error page or redirect to homepage
+
+  PART 5 — Empty/Root Path Verification
+  16. Navigate to https://www.appypieautomate.ai/
+  17. Verify the homepage loads correctly (this confirms navigation recovery after error pages)
+  18. Check that the header, hero section, and footer are all intact
+timeout: 180000
+expected_outcome: "All invalid URLs show branded error pages with navigation options. Deep invalid URLs and special characters are handled safely. No raw server errors, blank pages, or XSS vulnerabilities. Homepage loads correctly after visiting error pages."
+tags: ["error", "404", "error-handling", "security", "xss", "regression", "automate"]

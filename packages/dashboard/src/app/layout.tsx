@@ -5,6 +5,9 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'AppyPie CUA Tester',
   description: 'QA Testing Dashboard for Appy Pie Automate',
+  icons: {
+    icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="%234F46E5"/><text x="50%25" y="55%25" dominant-baseline="middle" text-anchor="middle" font-family="Arial,sans-serif" font-weight="bold" font-size="14" fill="white">AP</text></svg>',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
