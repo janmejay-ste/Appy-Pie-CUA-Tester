@@ -210,7 +210,7 @@ router.get('/report/latest', async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QA Dashboard Report</title>
+<title>Automate CUA Dashboard</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; line-height: 1.6; padding: 40px; }
@@ -236,7 +236,7 @@ router.get('/report/latest', async (_req, res) => {
 <body>
 <div class="container">
   <div class="header">
-    <h1>QA Dashboard Report</h1>
+    <h1>Automate CUA Dashboard Report</h1>
     <div class="meta">
       <span>Latest results per test case (aggregated across all runs)</span>
       <span>Generated: ${new Date().toLocaleString()}</span>
@@ -271,7 +271,7 @@ router.get('/report/latest', async (_req, res) => {
   </div>
 
   <div class="footer">
-    Generated on ${new Date().toLocaleString()} &bull; CUA Test Runner &mdash; QA Dashboard Report
+    Generated on ${new Date().toLocaleString()} &bull; CUA Test Runner &mdash; Automate CUA Dashboard Report
   </div>
 </div>
 </body>
