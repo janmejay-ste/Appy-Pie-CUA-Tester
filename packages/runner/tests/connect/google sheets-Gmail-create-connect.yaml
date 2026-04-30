@@ -3,19 +3,69 @@ url: "https://connectcloud.appypie.com/connects"
 requires_auth: true
 category: e2e
 instructions: |
+  ── CANVAS DUAL-LOADER RULE — applies to EVERY canvas operation without exception ────────
+  The connect editor canvas fires TWO loaders sequentially on EVERY interaction:
+  opening the editor, clicking Continue, selecting an app, clicking "Add Action App",
+  activating the connect — everything. The first loader has a visible spinner. The second
+  loader fires silently the moment the first one clears, with no spinner, but it locks all
+  interactive elements on the canvas. Acting between the two loaders causes failed clicks,
+  missing buttons, and wasted turns.
+
+  MANDATORY DUAL-LOADER WAIT PATTERN — execute this after EVERY action on the canvas:
+    Step A: Wait 2000ms immediately after the action (3000ms for Continue/test actions).
+    Step B: Take a screenshot.
+            — If any spinner, overlay, or loading indicator is visible: wait 2000ms more,
+              take another screenshot, repeat until the canvas looks visually clean.
+            — If the canvas already looks clean: continue to Step C immediately.
+    Step C: Wait an ADDITIONAL 1500ms unconditionally. This is the gap that absorbs the
+            silent second loader. Do NOT skip this step even when the canvas looks ready.
+            There is no visual cue for the second loader — you must always wait for it.
+    Step D: Take a final screenshot and verify the expected element is present and the
+            canvas is fully interactive before performing any further action.
+            If the expected element is still absent, repeat Step C + Step D once more.
+
+  HOW TO KNOW BOTH LOADERS ARE DONE — the "+" circle button:
+  The round "+" circle button (data-tooltip="Add New Step") below any canvas node is the
+  definitive signal that BOTH loaders have finished and the canvas is interactive.
+  • Unconfigured trigger: grey "+" button visible below "Trigger Application" node
+  • Configured trigger: BLUE "+" button + the three-button row (Add Action App | Add AI Agent | Add Flow)
+  If "+" is absent after Step C → second loader is still running → wait 1500ms more.
+  Never attempt to click canvas elements before the "+" circle is visible.
+  ══════════════════════════════════════════════════════════════════════════════════════════
+
   IMPORTANT UI PATTERN: This app uses a canvas + side panel layout. The main area shows workflow cards (trigger/action). Clicking a card opens a SIDE PANEL on the right with configuration details. If the side panel closes after clicking Continue, you MUST click the card again to re-open it. Configuration fields (dropdowns, inputs) are ONLY in the side panel — never on the canvas itself. If you cannot find expected fields, click the relevant card to open its panel.
 
   1. If redirected to a login page, log in exactly as follows: enter the test account email in the email input field, enter the test account password in the password input field, then click the "Log In" or "Sign In" submit button. Do NOT click any other links on the login page.
   2. On the /connects page, click "Create Connect". Dismiss any onboarding overlay or "Support Available" modal if they appear.
-  3. TRIGGER SETUP — In the side panel:
-     - Type "Google Sheets" in the search bar and select it from the app list
-     - Select trigger event: "New Spreadsheet Row"
-     - When the "Continue" button appears, click it immediately — do NOT click any other button like Guide or question mark icons
+     → Apply the CANVAS DUAL-LOADER WAIT PATTERN after clicking Create Connect.
+       Step D: confirm ALL of these before acting:
+               • URL contains /customeditor/
+               • "Trigger Application" node is visible on the canvas
+               • A round "+" circle button is visible directly below the Trigger Application node
+       The "+" button is the reliable signal that BOTH loaders have completed. If "+" is
+       absent, the second loader is still running — wait 1500ms more and check again.
+  3. TRIGGER SETUP — selecting the trigger app:
+     - Click on the search/input field in the Trigger app selection area
+     - Type "Google Sheets" in the search field, then press Enter to trigger the search
+     - WAIT 2000ms after pressing Enter, then confirm the grid has filtered to show Google Sheets results
+     - Look for "Google Sheets" in the filtered results and CLICK on it
+     - If no results appear, wait 1 more second and check again before retrying
+     → Apply DUAL-LOADER WAIT PATTERN after clicking Google Sheets, then confirm "Select Trigger Event" appears
+     - Click on the "Select Trigger Event" dropdown/button to open it
+     → Apply DUAL-LOADER WAIT PATTERN, then confirm the event list is visible
+     - CLICK on "New Spreadsheet Row" in the list
+     - Verify it is selected (checkbox checked or highlighted)
+     - Click the "Continue" button at the bottom of the event list panel — do NOT click any other button like Guide or question mark icons
+     → Apply DUAL-LOADER WAIT PATTERN after clicking Continue, then confirm the account connection section has appeared
   4. GOOGLE SHEETS ACCOUNT — In the side panel:
-     - If a "Continue" button is visible, click it immediately — the account is already linked
-     - If no "Continue" button is visible but "Add an Account" or a dropdown is visible, click "Add an Account" or select the account from the dropdown to link it
+     - Confirm the account section has loaded before acting
+     - FIRST check if there is a dropdown/select to choose an existing connected account — if so,
+       select the first available account, then click Continue
+     - If a linked account is already shown with a Continue button, click Continue immediately
+     - ONLY if no account dropdown AND no Continue button exist, click "Add an Account"
+     - IMPORTANT: Do NOT click "Add an Account" if an existing account is already selectable
      - Do NOT click "Change", "Reconnect", "Guide", or any question mark icons
-     - After clicking Continue, the side panel may close. If so, click the panel toggle icon (◁▏) at the top-right corner to re-open it
+     → Apply DUAL-LOADER WAIT PATTERN after clicking Continue, then confirm the next panel (trigger fields) has loaded
   5. SPREADSHEET SELECTION — In the side panel (click the trigger card if panel is closed):
      - IGNORE the "guide" / "Example" toggle section — do NOT click it
 
@@ -38,7 +88,26 @@ instructions: |
        - First check: does the Worksheet field already show a green chip? If YES, skip to step 6. Only proceed if the field is empty.
        - Wait 4-5 seconds AFTER Spreadsheet is set — the Worksheet options load from Google Sheets after Spreadsheet selection
        - Scroll down if Worksheet field is not visible
-       - Click the Worksheet dropdown arrow — this is a DIFFERENT elementId from the Spreadsheet opener. Do NOT reuse the Spreadsheet's opener elementId. If the DOM shows the same opener id for both, use coordinates/text to target the Worksheet one specifically.
+
+       ══ WORKSHEET SEARCH BOX WARNING ══
+       When you click the Worksheet dropdown arrow, a SEARCH BOX may appear inside the
+       dropdown. This search box has a placeholder label like "worksheet *" or "Search...".
+       CRITICAL: Do NOT type the word "worksheet" — that is the FIELD LABEL, not a tab name.
+       Do NOT type anything at all if the search box is empty and waiting for options.
+       CORRECT BEHAVIOUR:
+         Step 1: Click the Worksheet dropdown arrow (the ▼ arrow next to the "Worksheet *" label).
+                 This is a DIFFERENT element from the Spreadsheet dropdown — scroll to find the
+                 SECOND dropdown below the "Test sheet" chip.
+         Step 2: Wait 2-3 seconds. The dropdown will load actual worksheet tab names
+                 (short names like "Sheet1", "Sheet 2", "Tab 1" — NOT spreadsheet titles).
+                 If only a blank search box appears and nothing else, wait 2 more seconds.
+         Step 3: When tab names appear in the list, click the FIRST one (e.g. "Sheet1").
+                 Do NOT type anything — just click the first option in the list.
+         Step 4: If a search box is visible and no options appear after 5 seconds,
+                 type ONLY "Sheet" (not "worksheet") to help filter, then click the first result.
+       WRONG: typing "worksheet", "Worksheet", or the full field label → finds nothing → stuck.
+       ══════════════════════════════════
+
        - Wait 2-3 seconds for worksheet tab names (like "Sheet1", "Tab 1") to appear. If you see spreadsheet names (like "Demand Genration"), the Worksheet options have not loaded yet — wait longer. These names are SPREADSHEETS, not worksheets.
        - Select the first available worksheet
        - Verify: a green chip appears inside the Worksheet field. Once visible, proceed to step 6 — do not revisit Worksheet.
@@ -47,12 +116,32 @@ instructions: |
      - After BOTH chips are visible (Spreadsheet chip + Worksheet chip), click "Continue & Run Test"
   6. Click "Continue & Run Test" in the side panel:
      - Wait for the test to complete with a success message
-     - If a "view record" link appears, click it to verify data, then click Continue
-     - IMPORTANT: After clicking Continue or after test completes, the side panel will close and you will see the canvas with just the Google Sheets trigger card and "Add Action App" / "Add AI Agent" / "Add Flow" buttons at the bottom
-     - When the side panel closes, do NOT click the connect title/name at the top (e.g. "Google Sheets Integration") — clicking it activates a text input which hides the action buttons
-     - Do NOT click anywhere on the canvas background — look only for the "Add Action App" button at the bottom
-     - If you need to re-check test results, click the Google Sheets trigger CARD (not the title bar) to reopen the side panel
-  7. ACTION SETUP — Click the "Add Action App" or "+" button at the bottom of the canvas:
+     - Do NOT click "View Record" — ignore it completely even if it appears
+
+     ══ CRITICAL — PANEL DISMISSAL BEFORE ADD ACTION APP ══
+     After the trigger test succeeds, the Trigger Details panel remains OPEN showing green
+     checkmarks and a blue "Continue" button at the bottom. You MUST click this "Continue"
+     button to CLOSE the panel. Do NOT attempt to click "Add Action App" while this panel
+     is still open — the panel covers the canvas and the click will ALWAYS fail silently.
+     The correct sequence is:
+       1. See "Run Test is Successful" → click the "Continue" button in the panel
+       2. Panel closes → canvas becomes fully visible with "Add Action App" row
+       3. ONLY THEN click "Add Action App"
+     ══════════════════════════════════════════════════════
+
+     - Click the "Continue" button at the bottom of the Trigger Details panel to close it
+     → Take a screenshot to verify the panel is closed and the canvas is visible:
+       • Trigger node shows "Google Sheets" (configured, blue node)
+       • The three-button row "Add Action App | Add AI Agent | Add Flow" is visible below it
+       If the panel is still open, click "Continue" again. If "Add Action App" is not yet
+       visible, wait 1500ms more (second canvas loader) then check again.
+     - When the panel closes, do NOT click the connect title/name at the top (e.g. "Google Sheets Integration") — clicking it hides the action buttons
+     - Do NOT scroll the canvas. Do NOT click anywhere on the canvas background.
+  7. ACTION SETUP — ONLY after the panel is fully closed, click "Add Action App" from the three-button row below the trigger node:
+     → Apply the CANVAS DUAL-LOADER WAIT PATTERN after clicking Add Action App:
+       Step A: Wait 2000ms. Step B: screenshot — if spinner visible, wait 2000ms more.
+       Step C: wait an additional 1500ms after canvas first looks clean (second loader).
+       Step D: confirm the Action app search panel has opened on the right side.
      - Search for "Gmail" and select it
      - Select action event: "Create Draft"
      - Click Continue

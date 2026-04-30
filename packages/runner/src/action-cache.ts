@@ -39,10 +39,15 @@ interface CachedSingleAction extends CachedAction {
 export interface CachedSequence {
   actions: CachedAction[];
   successCount: number;
+  failureCount: number;          // resets on successful re-recording (current run streak)
+  totalHistoricalFailures: number; // never resets — drives escalating cooldowns
   lastUsed: number;
+  disabledUntil?: number; // soft-disable: epoch ms after which the sequence is eligible again
   urlPattern: string;
   pageTitle: string;
   description: string;  // e.g. "login flow", "form fill: 5 fields"
+  /** Weakest validation confidence across all actions in the sequence at record time. */
+  confidenceLevel?: 'strong' | 'medium' | 'weak';
 }
 
 interface ActionCacheV2 {
@@ -60,14 +65,88 @@ const MAX_SEQUENCE_ENTRIES = 200;
 const MIN_CONFIDENCE = 0.80;           // lowered from 0.85 — more actions get cached
 const MIN_SUCCESS_TO_USE_SINGLE = 3;   // ← raised from 1 — proven-3x before replaying from cache
 const MIN_SUCCESS_TO_USE_SEQUENCE = 1; // sequences are high-value, trust after 1
-const MAX_FAILURES_BEFORE_DELETE = 2;  // ← NEW: drop entry after 2 effective-failures on replay
+const MAX_FAILURES_BEFORE_DELETE = 2;  // drop single-action entry after 2 effective-failures
+const MAX_SEQUENCE_FAILURES_BEFORE_DISABLE = 2; // soft-disable sequence after 2 replay failures in a streak
+const SEQUENCE_COOLDOWN_BASE_MS = 5 * 60 * 1000;  // 5 min base; doubles per totalHistoricalFailures tier
+const SEQUENCE_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000; // 24h cap — after this, sequence is effectively dead
 const STALE_DAYS = 30;                 // raised from 7 — cache lasts longer
 const MAX_SEQUENCE_LENGTH = 8;         // don't cache huge sequences
+// Confidence scoring thresholds for sequence classification (Fix 5 — named, not magic numbers).
+// Empirical tuning guidance: if sequences classified 'strong' still fail often, raise the threshold;
+// if too few sequences qualify as 'strong', lower it. Start values calibrated for typical web flows.
+const CONFIDENCE_STRONG_THRESHOLD = 0.9; // weighted-avg score → 'strong' (~90% of actions must be strong)
+const CONFIDENCE_MEDIUM_THRESHOLD = 0.7; // weighted-avg score → 'medium'; below → 'weak'
+// Loop guard: how long to block the same sequence from re-replaying (prevents SPA-sequence loops).
+const SEQUENCE_REPLAY_COOLDOWN_MS = 30_000; // 30s — long enough to survive a SPA turn cycle
 
 let cache: ActionCacheV2 | null = null;
 let dirty = false;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let dirCreated = false;
+
+// ── Per-run volatile state ──────────────────────────────────────
+// These are reset at the start of each test run (via resetRunVolatileState).
+// NOT persisted to disk — they exist only to guard against intra-run replay loops.
+
+/** Timestamp of the last replay per sequence key — time-based cooldown. */
+const _sequenceLastReplayedAt = new Map<string, number>();
+/**
+ * DOM fingerprint at the time the sequence was last replayed.
+ * If the fingerprint is the same on the next lookup, the sequence had no effect — disable it.
+ * Time-based cooldown alone is insufficient: same DOM 31s later still means no progress.
+ */
+const _sequenceReplayDomState = new Map<string, string>();
+
+/**
+ * Shadow-stat tracker: records weak-confidence signal count AND last timestamp per url+action key.
+ * Storing the timestamp lets us discount stale signals — an action that was flaky 20 minutes
+ * ago but succeeded reliably since then should not still be penalised today.
+ */
+const _shadowStats = new Map<string, { count: number; lastTs: number }>();
+
+/** Signals older than this are considered stale and discounted (not removed — still observable). */
+const SHADOW_RECENCY_MS = 10 * 60 * 1000; // 10 minutes
+
+/** Reset per-run volatile state. Call at run start alongside resetOverlayStreak(). */
+export function resetSequenceReplayGuard(): void {
+  _sequenceLastReplayedAt.clear();
+  _sequenceReplayDomState.clear();
+}
+
+/** Reset shadow stats (per-run). */
+export function resetShadowStats(): void {
+  _shadowStats.clear();
+}
+
+/**
+ * Return shadow patterns that fired 3+ times this run AND whose last signal is recent
+ * (within SHADOW_RECENCY_MS). Stale patterns are excluded — an action that was flaky
+ * ten minutes ago but succeeded cleanly since then should not surface as a warning.
+ */
+export function getShadowPatterns(): Array<{ key: string; count: number }> {
+  const now = Date.now();
+  return [..._shadowStats.entries()]
+    .filter(([, stat]) => stat.count >= 3 && now - stat.lastTs <= SHADOW_RECENCY_MS)
+    .map(([key, stat]) => ({ key, count: stat.count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+// ── Sequence health helpers ─────────────────────────────────────
+
+function sequenceHealth(seq: CachedSequence): number {
+  // Weight successCount by confidence quality: strong=1.0, medium=0.8, weak=0.5.
+  // Sequences built on weak heuristics score lower and are replaced more easily.
+  const confWeight = seq.confidenceLevel === 'strong' ? 1.0
+    : seq.confidenceLevel === 'weak' ? 0.5
+    : 0.8; // 'medium' or legacy entries without confidenceLevel
+  return (seq.successCount * confWeight) - (seq.failureCount * 2);
+}
+
+function sequenceCooldownMs(totalHistoricalFailures: number): number {
+  // Exponential backoff: 5m → 10m → 20m → ... capped at 24h
+  const exponent = Math.max(0, totalHistoricalFailures - MAX_SEQUENCE_FAILURES_BEFORE_DISABLE);
+  return Math.min(SEQUENCE_COOLDOWN_BASE_MS * Math.pow(2, exponent), SEQUENCE_COOLDOWN_MAX_MS);
+}
 
 // ── Persistence ────────────────────────────────────────────────
 
@@ -77,10 +156,15 @@ function loadCache(): ActionCacheV2 {
     if (fs.existsSync(CACHE_FILE)) {
       const raw = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8'));
       if (raw && raw.version === 2) {
-        // Backfill failureCount=0 on legacy entries that predate this field.
+        // Backfill failureCount=0 on legacy entries that predate these fields.
         // Additive-only migration — no version bump required.
         for (const entry of Object.values(raw.singles || {}) as CachedSingleAction[]) {
           if (typeof entry.failureCount !== 'number') entry.failureCount = 0;
+        }
+        for (const entry of Object.values(raw.sequences || {}) as CachedSequence[]) {
+          if (typeof entry.failureCount !== 'number') entry.failureCount = 0;
+          if (typeof entry.totalHistoricalFailures !== 'number') entry.totalHistoricalFailures = entry.failureCount;
+          if (!entry.confidenceLevel) entry.confidenceLevel = 'medium'; // legacy entries treated as medium
         }
         cache = raw;
         return cache!;
@@ -308,6 +392,8 @@ export interface DOMElement {
   elementId: string;
   placeholder?: string;
   type?: string;
+  isVisible?: boolean;      // from IndexedElement — present when called from adapter
+  isInteractable?: boolean; // from IndexedElement — present when called from adapter
 }
 
 /**
@@ -429,6 +515,25 @@ export function getCachedAction(
     return null;
   }
 
+  // Shadow downgrade: if this url+action has produced 3+ *recent* weak-confidence signals
+  // this run, it is a repeatedly unreliable target. Require double the normal success count
+  // before trusting the cached action — prevents known-flaky actions from replaying.
+  // "Recent" = within SHADOW_RECENCY_MS so that actions corrected long ago are not
+  // still penalised for an earlier fluke.
+  const targetKey = (entry.targetText || '').toLowerCase().slice(0, 30);
+  const shadowKey = `${entry.action}:${normalizeUrlPattern(url)}:${targetKey}`;
+  const shadowStat = _shadowStats.get(shadowKey);
+  const shadowCount = (shadowStat && Date.now() - shadowStat.lastTs <= SHADOW_RECENCY_MS)
+    ? shadowStat.count : 0;
+  if (shadowCount >= 3) {
+    const shadowFloor = effectiveSuccessFloorForPage(pageKey, url) * 2;
+    if (entry.successCount < shadowFloor) {
+      logger.debug({ tag: 'cache', event: 'shadow-downgrade', shadowKey, shadowCount, required: shadowFloor, have: entry.successCount });
+      incrementCacheReject('shadowDowngrade');
+      return null;
+    }
+  }
+
   // Resolve target text to current DOM elementId
   const resolvedTarget = entry.targetTag
     ? resolveTarget(entry.targetText, entry.targetTag, elements)
@@ -440,6 +545,8 @@ export function getCachedAction(
 
 /**
  * Record a successful single action.
+ * validationConfidence='weak' actions are not recorded — heuristic signals
+ * cannot be trusted as ground truth for cache decisions.
  */
 export function recordSuccessfulAction(
   url: string,
@@ -448,8 +555,27 @@ export function recordSuccessfulAction(
   action: { action: string; target: string; value: string; confidence: number },
   description: string,
   effective: boolean,
+  validationConfidence?: 'strong' | 'medium' | 'weak',
 ): void {
   if (!effective) return;
+  if (validationConfidence === 'weak') {
+    // Shadow-log: preserve the observation for diagnostics but don't cache it.
+    // UI timing issues and partial DOM updates produce weak signals that can
+    // harden into strong evidence on retry — discarding them silently loses that signal.
+    const targetKey = (action.target || '').toLowerCase().slice(0, 30);
+    const shadowKey = `${action.action}:${normalizeUrlPattern(url)}:${targetKey}`;
+    const existing = _shadowStats.get(shadowKey);
+    const shadowCount = (existing?.count ?? 0) + 1;
+    _shadowStats.set(shadowKey, { count: shadowCount, lastTs: Date.now() });
+    if (shadowCount >= 3) {
+      // Repeated weak signal on the same url+action — likely a UI timing/flicker issue.
+      // Surface as warn so it's visible in logs without being buried in debug noise.
+      logger.warn({ tag: 'cache', event: 'shadow-pattern', shadowKey, count: shadowCount, reason: 'repeatedWeakSignal — possible UI timing issue or wrong target' });
+    } else {
+      logger.debug({ tag: 'cache', event: 'shadow', action: action.action, url, confidence: action.confidence, count: shadowCount });
+    }
+    return;
+  }
   if (action.confidence < MIN_CONFIDENCE) return;
   if (action.action === 'wait' || action.action === 'done') return;
 
@@ -549,83 +675,201 @@ function evictSingles(c: ActionCacheV2): void {
 /**
  * Look up a cached action sequence for the current page.
  * Returns ordered actions to replay, or null.
+ *
+ * Sequences use a stateless key (url+title only). Unlike single-action cache,
+ * sequences represent full flows that must apply regardless of minor page-state
+ * variance. Target resolution (resolveTarget) acts as the applicability gate.
  */
 export function getCachedSequence(
   url: string,
   title: string,
   elements: DOMElement[],
+  progressSignature?: string,
 ): { actions: Array<CachedAction & { resolvedTarget: string | null }>; description: string } | null {
-  // Sequences replay 4-8 actions at once — a single bad sequence wastes more
-  // turns than a bad single-action cache hit. Sequences require tier=full
-  // FOR THIS SPECIFIC PAGE (per-page tier).
-  const pageState: PageKeyState = {
-    elementCount: elements.length,
-    hasOverlay: detectOverlayFromElements(elements),
-    primaryCTAHash: computePrimaryCTAHash(elements),
-  };
-  const pageKey = generatePageKey(url, title, pageState);
+  const pageKey = generatePageKey(url, title); // stateless — flow-level, not state-level
   if (tierForPage(pageKey, url) !== 'full') return null;
   const c = loadCache();
   const seq = c.sequences[pageKey];
 
   if (!seq) return null;
-  if (seq.successCount < MIN_SUCCESS_TO_USE_SEQUENCE) return null;
+  if (seq.successCount < MIN_SUCCESS_TO_USE_SEQUENCE) {
+    logger.debug({ tag: 'seq-cache', event: 'reject', reason: 'lowSuccess', key: pageKey, successCount: seq.successCount });
+    return null;
+  }
+  if (seq.disabledUntil && Date.now() < seq.disabledUntil) {
+    logger.info({ tag: 'seq-cache', event: 'reject', reason: 'cooldown', key: pageKey, totalHistoricalFailures: seq.totalHistoricalFailures, resumesAt: new Date(seq.disabledUntil).toISOString() });
+    return null;
+  }
   if (Date.now() - seq.lastUsed > staleMs) {
+    logger.debug({ tag: 'seq-cache', event: 'evict', reason: 'stale', key: pageKey });
     delete c.sequences[pageKey];
+    scheduleSave();
+    return null;
+  }
+  // Medium-confidence sequences with any failure are not reliable enough to replay.
+  // Strong sequences have deterministic evidence and survive one failure.
+  if (seq.confidenceLevel === 'medium' && (seq.failureCount ?? 0) > 0) {
+    logger.info({ tag: 'seq-cache', event: 'reject', reason: 'mediumConfidenceWithFailure', key: pageKey, failureCount: seq.failureCount });
+    return null;
+  }
+  // Loop guard — two layers:
+  // Layer 1 (state): if the semantic progress signature (url + visible headings) is identical
+  // to when this sequence last ran, the sequence made no meaningful progress. This is a stronger
+  // signal than a raw DOM hash: URL + key headings reflects what the user actually sees, not
+  // ephemeral rendering artifacts. Same signature after replay → disable with cooldown.
+  if (progressSignature) {
+    const lastSig = _sequenceReplayDomState.get(pageKey);
+    if (lastSig !== undefined && lastSig === progressSignature) {
+      seq.failureCount = (seq.failureCount ?? 0) + 1;
+      seq.totalHistoricalFailures = (seq.totalHistoricalFailures ?? 0) + 1;
+      const cooldown = sequenceCooldownMs(seq.totalHistoricalFailures);
+      if (seq.failureCount >= MAX_SEQUENCE_FAILURES_BEFORE_DISABLE) {
+        seq.disabledUntil = Date.now() + cooldown;
+        logger.warn({ tag: 'seq-cache', event: 'state-loop-disable', key: pageKey, reason: 'same progress signature after replay — sequence had no semantic effect', progressSignature, cooldownMin: Math.round(cooldown / 60_000), totalHistoricalFailures: seq.totalHistoricalFailures });
+      } else {
+        logger.info({ tag: 'seq-cache', event: 'state-loop-penalize', key: pageKey, failureCount: seq.failureCount, progressSignature });
+      }
+      scheduleSave();
+      return null;
+    }
+  }
+  // Layer 2 (time): block fast re-replay even when progressSignature is not available.
+  const nowMs = Date.now();
+  const lastReplay = _sequenceLastReplayedAt.get(pageKey);
+  if (lastReplay !== undefined && nowMs - lastReplay < SEQUENCE_REPLAY_COOLDOWN_MS) {
+    logger.debug({ tag: 'seq-cache', event: 'reject', reason: 'recentReplay', key: pageKey, cooldownRemainMs: SEQUENCE_REPLAY_COOLDOWN_MS - (nowMs - lastReplay) });
     return null;
   }
 
-  // Resolve all targets — if ANY target can't be resolved, sequence is invalid
+  // Resolve all targets — if ANY required target can't be found or looks non-interactable, reject.
+  // Also strip wait/scroll from stored sequences (legacy entries may contain them).
   const resolved: Array<CachedAction & { resolvedTarget: string | null }> = [];
-  for (const a of seq.actions) {
+  for (const a of seq.actions.filter(a => a.action !== 'wait' && a.action !== 'scroll')) {
     const resolvedTarget = resolveTarget(a.targetText, a.targetTag, elements);
-    // For actions that don't need a target (scroll, wait, navigate), null is OK
     const needsTarget = ['click', 'type', 'select', 'keypress'].includes(a.action);
     if (needsTarget && !resolvedTarget) {
-      // Can't resolve a required target — sequence doesn't apply
+      logger.info({ tag: 'seq-cache', event: 'reject', reason: 'targetMiss', key: pageKey, missingTarget: a.targetText, action: a.action });
       return null;
+    }
+    // Interactability gate: reject sequence if the resolved element is known to be
+    // non-visible or non-interactable (uses adapter-supplied fields when available,
+    // falls back to text/tag heuristic for older call sites).
+    if (resolvedTarget && needsTarget) {
+      const el = elements.find(e => e.elementId === resolvedTarget);
+      if (el) {
+        const interactable =
+          el.isInteractable !== undefined ? el.isInteractable :
+          el.isVisible !== undefined ? el.isVisible :
+          // Heuristic fallback when adapter fields absent: inputs/textareas/selects
+          // are always candidates; others need visible text.
+          el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select' ||
+          (el.text || '').trim().length > 0 || (el.placeholder || '').trim().length > 0;
+        if (!interactable) {
+          logger.info({ tag: 'seq-cache', event: 'reject', reason: 'notInteractable', key: pageKey, targetTag: el.tag, targetText: a.targetText });
+          return null;
+        }
+      }
     }
     resolved.push({ ...a, resolvedTarget });
   }
 
+  // Mark replay state before returning so both guards fire on the NEXT lookup.
+  _sequenceLastReplayedAt.set(pageKey, Date.now());
+  if (progressSignature) {
+    _sequenceReplayDomState.set(pageKey, progressSignature);
+  }
+  logger.info({ tag: 'seq-cache', event: 'hit', key: pageKey, description: seq.description, actions: seq.actions.length, successCount: seq.successCount, confidenceLevel: seq.confidenceLevel });
+  incrementCacheHit('sequence');
   return { actions: resolved, description: seq.description };
 }
 
 /**
  * Record a successful action sequence for future replay.
  * Called after a batch of actions all succeeded on a page.
+ *
+ * Sequences are stored under a stateless key (url+title only) so they are
+ * found by getCachedSequence regardless of minor page-state variation between
+ * runs. Target resolution inside getCachedSequence is the applicability gate.
  */
 export function recordSequence(
   url: string,
   title: string,
-  actions: Array<{ action: string; targetText: string; targetTag: string; value: string; confidence: number }>,
+  rawActions: Array<{ action: string; targetText: string; targetTag: string; value: string; confidence: number; validationConfidence?: 'strong' | 'medium' | 'weak' }>,
   description: string,
+  elements?: DOMElement[], // kept for API compat — no longer used for key generation
 ): void {
+  // Strip wait/scroll — timing artifacts that cause replay loops (e.g. login stuck on wait 0ms).
+  const actions = rawActions.filter(a => a.action !== 'wait' && a.action !== 'scroll');
   if (actions.length < 2 || actions.length > MAX_SEQUENCE_LENGTH) return;
-  // Don't cache sequences with low-confidence actions
   if (actions.some(a => a.confidence < MIN_CONFIDENCE)) return;
-  // Don't cache sequences that are just waits
-  if (actions.every(a => a.action === 'wait' || a.action === 'scroll')) return;
+  // Fix 1: reject sequences with any weak-confidence action — heuristic evidence
+  // poisons the replay cache and was the original cause of corrupt recordings.
+  if (actions.some(a => a.validationConfidence === 'weak')) {
+    logger.debug({ tag: 'seq-cache', event: 'skip', reason: 'weakConfidence', url });
+    return;
+  }
+  // Derive weakest confidence level to store on the sequence (used by sequenceHealth weighting).
+  // Fix 3: weighted-average confidence instead of min.
+  // Min penalizes the entire sequence for one uncertain action (e.g. 5 strong + 1 medium → medium).
+  // Average is fairer: mostly-strong sequences stay 'strong' even with one medium step.
+  // Thresholds: >= 0.9 → strong (requires ~90% strong actions), >= 0.7 → medium, else weak.
+  // Actions without validationConfidence (legacy callers) contribute as 'medium' (0.8).
+  const confScore = actions.reduce((sum, a) => {
+    const w = a.validationConfidence === 'strong' ? 1.0
+      : a.validationConfidence === 'medium' ? 0.8
+      : 0.8; // no validationConfidence = treat as medium (legacy callers, weak already blocked)
+    return sum + w;
+  }, 0) / actions.length;
+  // Fix 4: adaptive thresholds — when the cache is degraded (many entries failing), the system
+  // needs MORE alternatives, not fewer. Lower the 'strong' bar so more sequences survive
+  // as 'strong' and get one extra failure tolerance before being discarded.
+  // WRONG direction (old): failure ↑ → threshold ↑ → fewer 'strong' → more rigidity → more loops.
+  // CORRECT direction: failure ↑ → threshold ↓ → more 'strong' → more alternatives → recovery.
+  const health = getCacheHealth();
+  const failureRatio = health.total > 0 ? health.rejectedTooManyFailures / health.total : 0;
+  const thresholdAdjust = failureRatio > 0.3 ? -0.05 : 0; // LOWER bar when >30% entries are failing
+  const adaptiveStrong = Math.max(0.80, CONFIDENCE_STRONG_THRESHOLD + thresholdAdjust);
+  const confidenceLevel: 'strong' | 'medium' | 'weak' =
+    confScore >= adaptiveStrong ? 'strong'
+    : confScore >= CONFIDENCE_MEDIUM_THRESHOLD ? 'medium'
+    : 'weak';
 
   const c = loadCache();
-  const pageKey = generatePageKey(url, title);
+  const pageKey = generatePageKey(url, title); // stateless — matches getCachedSequence
   const urlPattern = normalizeUrlPattern(url);
 
   const existing = c.sequences[pageKey];
   if (existing && existing.actions.length === actions.length) {
-    // Same page, same length — increment
+    // Same page, same length — reinforce. Clear current-run failure streak and cooldown,
+    // but preserve totalHistoricalFailures so escalating cooldowns remain in effect.
     existing.successCount++;
+    existing.failureCount = 0;
+    existing.disabledUntil = undefined;
     existing.lastUsed = Date.now();
-    existing.actions = actions; // update with latest targets
+    existing.actions = actions;
+    existing.confidenceLevel = confidenceLevel; // update to reflect latest recording's quality
+    logger.info({ tag: 'seq-cache', event: 'reinforce', key: pageKey, successCount: existing.successCount, totalHistoricalFailures: existing.totalHistoricalFailures, confidenceLevel, description });
   } else {
-    c.sequences[pageKey] = {
-      actions,
-      successCount: 1,
-      lastUsed: Date.now(),
-      urlPattern,
-      pageTitle: normalizeTitle(title),
-      description,
-    };
+    const existingHealth = existing ? sequenceHealth(existing) : -Infinity;
+    if (existing && existingHealth > 1) {
+      // Healthy sequence (health score > 1 = net positive record). Protect from
+      // replacement by a weaker first-time recording.
+      logger.info({ tag: 'seq-cache', event: 'overwrite-blocked', key: pageKey, health: existingHealth, newLength: actions.length });
+    } else {
+      // No existing sequence, or existing is degraded (health <= 1) — allow fresh recording.
+      c.sequences[pageKey] = {
+        actions,
+        successCount: 1,
+        failureCount: 0,
+        totalHistoricalFailures: existing?.totalHistoricalFailures ?? 0, // carry forward history
+        lastUsed: Date.now(),
+        urlPattern,
+        pageTitle: normalizeTitle(title),
+        description,
+        confidenceLevel,
+      };
+      logger.info({ tag: 'seq-cache', event: 'record', key: pageKey, actions: actions.length, totalHistoricalFailures: existing?.totalHistoricalFailures ?? 0, confidenceLevel, description });
+    }
   }
 
   evictSequences(c);
@@ -635,13 +879,28 @@ export function recordSequence(
 /**
  * Penalize a failed sequence (e.g., one of the actions in the sequence failed on replay).
  */
-export function recordFailedSequence(url: string, title: string): void {
+export function recordFailedSequence(url: string, title: string, elements?: DOMElement[]): void {
   const c = loadCache();
-  const pageKey = generatePageKey(url, title);
+  const pageKey = generatePageKey(url, title); // stateless — matches recordSequence/getCachedSequence
   const seq = c.sequences[pageKey];
   if (seq) {
-    seq.successCount = Math.max(0, seq.successCount - 1);
-    if (seq.successCount <= 0) delete c.sequences[pageKey];
+    seq.failureCount = (seq.failureCount ?? 0) + 1;
+    seq.totalHistoricalFailures = (seq.totalHistoricalFailures ?? 0) + 1;
+    if (seq.failureCount >= MAX_SEQUENCE_FAILURES_BEFORE_DISABLE) {
+      // Exponential soft-disable: cooldown doubles with each historical failure tier.
+      // totalHistoricalFailures never resets, so repeated bad sequences get longer
+      // cooldowns even after a temporary recovery.
+      const cooldown = sequenceCooldownMs(seq.totalHistoricalFailures);
+      seq.disabledUntil = Date.now() + cooldown;
+      logger.warn({
+        tag: 'seq-cache', event: 'soft-disable', key: pageKey,
+        failureCount: seq.failureCount, totalHistoricalFailures: seq.totalHistoricalFailures,
+        cooldownMin: Math.round(cooldown / 60000), resumesAt: new Date(seq.disabledUntil).toISOString(),
+        description: seq.description,
+      });
+    } else {
+      logger.info({ tag: 'seq-cache', event: 'penalize', key: pageKey, failureCount: seq.failureCount, totalHistoricalFailures: seq.totalHistoricalFailures, description: seq.description });
+    }
     scheduleSave();
   }
 }
@@ -839,9 +1098,10 @@ export interface RunCacheCounters {
     lowSuccess: number;
     tooManyFailures: number;
     stale: number;
-    loopGuard: number;   // consecutiveCacheHits hit MAX
-    afterGPT: number;    // lastTurnWasGPT skip
-    notEligible: number; // mode / failures / stuckContext
+    loopGuard: number;     // consecutiveCacheHits hit MAX
+    afterGPT: number;      // lastTurnWasGPT skip
+    notEligible: number;   // mode / failures / stuckContext
+    shadowDowngrade: number; // repeated weak-confidence signals downgraded the entry
   };
   recordedSuccess: number;
   recordedFailure: number;
@@ -853,7 +1113,7 @@ function freshCounters(): RunCacheCounters {
   return {
     hitsSingle: 0,
     hitsSequence: 0,
-    rejects: { lowSuccess: 0, tooManyFailures: 0, stale: 0, loopGuard: 0, afterGPT: 0, notEligible: 0 },
+    rejects: { lowSuccess: 0, tooManyFailures: 0, stale: 0, loopGuard: 0, afterGPT: 0, notEligible: 0, shadowDowngrade: 0 },
     recordedSuccess: 0,
     recordedFailure: 0,
   };
