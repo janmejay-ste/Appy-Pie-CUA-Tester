@@ -1,8 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { Skeleton } from 'boneyard-js/react';
+import '../bones/registry';
 
 const API = process.env.NEXT_PUBLIC_API_URL || '';
+const PYTHON_API = process.env.NEXT_PUBLIC_PYTHON_API_URL || '';
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -70,6 +73,16 @@ interface TestAccount {
   passwordMasked: string;
 }
 
+interface PythonServiceInfo {
+  name: string;
+  version: string;
+  runtime: string;
+  status: string;
+  port: number;
+  capabilities: string[];
+  timestamp: string;
+}
+
 type TabId = 'overview' | 'results' | 'failures' | 'logs' | 'tests' | 'config';
 
 function statusBadge(status: string) {
@@ -96,10 +109,12 @@ function categoryBadgeClass(cat: string) {
 // ── Main Page ────────────────────────────────────────────────────
 
 export default function DashboardPage() {
+  const [initialLoading, setInitialLoading] = useState(true);
   const [tests, setTests] = useState<TestDefinition[]>([]);
   const [latestSuite, setLatestSuite] = useState<SuiteRun | null>(null);
   const [testRuns, setTestRuns] = useState<TestRun[]>([]);
   const [running, setRunning] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [activeSuiteId, setActiveSuiteId] = useState<string | null>(null);
   const activeSuiteIdRef = useRef<string | null>(null);
   useEffect(() => { activeSuiteIdRef.current = activeSuiteId; }, [activeSuiteId]);
@@ -164,6 +179,7 @@ export default function DashboardPage() {
   // Settings state
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [pythonService, setPythonService] = useState<PythonServiceInfo | null>(null);
 
   // Modal state
   const [showResetModal, setShowResetModal] = useState(false);
@@ -196,16 +212,25 @@ export default function DashboardPage() {
   // Load initial data + detect active suites
   const loadData = useCallback(async () => {
     try {
-      const [testsRes, accountRes, settingsRes] = await Promise.all([
+      const [testsRes, accountRes, settingsRes, pythonRes] = await Promise.all([
         fetch(`${API}/api/tests`),
         fetch(`${API}/api/config/account`),
         fetch(`${API}/api/settings`),
+        fetch(`${PYTHON_API}/python-api/service-info`),
       ]);
-      setTests(await testsRes.json());
-      setAccount(await accountRes.json());
-      setSettings(await settingsRes.json());
+      if (testsRes.ok) setTests(await testsRes.json());
+      if (accountRes.ok) setAccount(await accountRes.json());
+      if (settingsRes.ok) setSettings(await settingsRes.json());
+      if (pythonRes.ok) {
+        setPythonService(await pythonRes.json());
+      } else {
+        setPythonService(null);
+      }
     } catch (err) {
       console.error('Failed to load data:', err);
+      setPythonService(null);
+    } finally {
+      setInitialLoading(false);
     }
   }, []);
 
@@ -223,6 +248,7 @@ export default function DashboardPage() {
           fetch(`${API}/api/runs/latest`),
           fetch(`${API}/api/suites?limit=1`),
         ]);
+        if (!latestRunsRes.ok || !suitesRes.ok) return;
         const latestRuns = await latestRunsRes.json();
         const suitesData = await suitesRes.json();
         const baseRuns: TestRun[] = Array.isArray(latestRuns) ? latestRuns : [];
@@ -251,6 +277,7 @@ export default function DashboardPage() {
         const currentSuiteId = activeSuiteIdRef.current;
         if (currentSuiteId) {
           const suiteRes = await fetch(`${API}/api/suites/${currentSuiteId}`);
+          if (!suiteRes.ok) return;
           const suiteData = await suiteRes.json();
           if (!isMounted) return;
           setLatestSuite(suiteData);
@@ -273,8 +300,10 @@ export default function DashboardPage() {
           const activeRun = suiteRuns.find((r: TestRun) => r.status === 'running');
           if (activeRun) {
             const runRes = await fetch(`${API}/api/runs/${activeRun.id}`);
-            const runData = await runRes.json();
-            if (isMounted) setLogEvents(runData.events ?? []);
+            if (runRes.ok) {
+              const runData = await runRes.json();
+              if (isMounted) setLogEvents(runData.events ?? []);
+            }
           }
         }
       } catch { /* ignore */ }
@@ -354,6 +383,7 @@ export default function DashboardPage() {
   };
 
   const stopTests = async () => {
+    setStopping(true);
     try {
       if (activeSuiteId) {
         await fetch(`${API}/api/suites/${activeSuiteId}/abort`, { method: 'POST' });
@@ -364,12 +394,25 @@ export default function DashboardPage() {
           await fetch(`${API}/api/runs/${run.id}/abort`, { method: 'POST' });
         }
       }
+      // Poll until all runs leave 'running' state (worker sets them to 'aborted')
+      for (let attempt = 0; attempt < 30; attempt++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const res = await fetch(`${API}/api/runs?limit=20`);
+        if (res.ok) {
+          const data = await res.json();
+          const runs: any[] = data.runs ?? data ?? [];
+          const stillRunning = runs.some((r: any) => r.status === 'running');
+          if (!stillRunning) break;
+        }
+      }
       setRunning(false);
       setActiveSuiteId(null);
       showToast('Tests stopped', 'info');
-      setTimeout(loadData, 1000);
+      await loadData();
     } catch (err) {
       console.error('Failed to abort:', err);
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -741,6 +784,7 @@ export default function DashboardPage() {
   const selectClasses = "px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-300 focus:outline-none focus:border-indigo-500 cursor-pointer appearance-none";
 
   return (
+    <Skeleton name="dashboard" loading={initialLoading} animate="pulse" color="rgba(255,255,255,0.04)" darkColor="rgba(255,255,255,0.04)">
     <div className="space-y-4">
       {/* ── Header Bar ──────────────────────────────────────────── */}
       <div className="flex items-center justify-between flex-wrap gap-3">
@@ -854,9 +898,16 @@ export default function DashboardPage() {
           {running && (
             <button
               onClick={stopTests}
-              className="px-5 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg text-sm transition-colors"
+              disabled={stopping}
+              className="px-5 py-2 bg-red-600 hover:bg-red-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg text-sm transition-colors flex items-center gap-2"
             >
-              Stop Test
+              {stopping && (
+                <svg className="animate-spin h-3.5 w-3.5 text-gray-300" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                </svg>
+              )}
+              {stopping ? 'Stopping...' : 'Stop Test'}
             </button>
           )}
 
@@ -1706,6 +1757,51 @@ export default function DashboardPage() {
       {/* CONFIG/SETTINGS TAB */}
       {activeTab === 'config' && (
         <div className="space-y-6">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div className={`w-2.5 h-2.5 rounded-full ${pythonService ? 'bg-emerald-400' : 'bg-red-400'}`} />
+                <h3 className="font-semibold text-gray-50 text-sm">Python Service</h3>
+              </div>
+              <span className="text-xs px-2.5 py-1 rounded-md border border-gray-700 bg-gray-800 text-gray-300">
+                {pythonService ? pythonService.status : 'offline'}
+              </span>
+            </div>
+
+            {pythonService ? (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+                <div>
+                  <span className="text-xs text-gray-500">Service</span>
+                  <p className="text-gray-200 font-mono mt-0.5">{pythonService.name}</p>
+                </div>
+                <div>
+                  <span className="text-xs text-gray-500">Runtime</span>
+                  <p className="text-gray-200 font-mono mt-0.5">{pythonService.runtime}</p>
+                </div>
+                <div>
+                  <span className="text-xs text-gray-500">Version</span>
+                  <p className="text-gray-200 font-mono mt-0.5">{pythonService.version}</p>
+                </div>
+                <div>
+                  <span className="text-xs text-gray-500">Port</span>
+                  <p className="text-gray-200 font-mono mt-0.5">{pythonService.port}</p>
+                </div>
+                <div>
+                  <span className="text-xs text-gray-500">Last Check</span>
+                  <p className="text-gray-200 font-mono mt-0.5">{new Date(pythonService.timestamp).toLocaleString()}</p>
+                </div>
+                <div>
+                  <span className="text-xs text-gray-500">Capabilities</span>
+                  <p className="text-gray-200 mt-0.5">{pythonService.capabilities.join(', ')}</p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">
+                Dashboard could not reach the Python service at <span className="font-mono">/python-api/service-info</span>.
+              </p>
+            )}
+          </div>
+
           {/* System Settings */}
           {settings && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
@@ -1971,5 +2067,6 @@ export default function DashboardPage() {
         </div>
       )}
     </div>
+    </Skeleton>
   );
 }

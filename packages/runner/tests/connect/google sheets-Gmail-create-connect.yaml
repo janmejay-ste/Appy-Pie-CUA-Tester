@@ -25,8 +25,12 @@ instructions: |
      - After both dropdowns are filled, click "Continue & Run Test"
   6. Click "Continue & Run Test" in the side panel:
      - Wait for the test to complete with a success message
-     - Click "view record" to verify data, then click Continue to move to the action step
-  7. ACTION SETUP — Click the "Add Action App" or "+" button on the canvas:
+     - If a "view record" link appears, click it to verify data, then click Continue
+     - IMPORTANT: After clicking Continue or after test completes, the side panel will close and you will see the canvas with just the Google Sheets trigger card and "Add Action App" / "Add AI Agent" / "Add Flow" buttons at the bottom
+     - When the side panel closes, do NOT click the connect title/name at the top (e.g. "Google Sheets Integration") — clicking it activates a text input which hides the action buttons
+     - Do NOT click anywhere on the canvas background — look only for the "Add Action App" button at the bottom
+     - If you need to re-check test results, click the Google Sheets trigger CARD (not the title bar) to reopen the side panel
+  7. ACTION SETUP — Click the "Add Action App" or "+" button at the bottom of the canvas:
      - Search for "Gmail" and select it
      - Select action event: "Create Draft"
      - Click Continue
@@ -35,10 +39,11 @@ instructions: |
      - Do NOT click "Add an Account", "Change", "Guide", or any other button
      - If no Continue button is visible, report an error that the Gmail account is not linked
   9. CONFIGURE DRAFT FIELDS — In the side panel:
-     - Enter "Test" in the "Subject" field
-     - Enter "This is a test email body" in the "Email Body" field
-     - If continue button is disabled, try clicking the "Advance Mode" button to reveal the "To Email" field
-     - Enter a value for "To Email" (e.g., test@example.com)
+     - Fields with "+ Add or Select" buttons are auto-filled with dynamic variable tokens from the trigger output. Check if Subject and Email Body already have green token chips (tags showing trigger data like spreadsheet values). If they do, skip to clicking "Continue & Run Test".
+     - If Subject is still empty: click the "+ Add or Select" link next to the Subject label — a picker will appear with available data fields from the trigger. Click the FIRST available item in the picker list.
+     - If Email Body is still empty: do the same for the Email Body field.
+     - If no picker appears or the fields don't accept tokens, type "Test Subject" and "Test email body" directly.
+     - If the Continue button is disabled, try clicking the "Advance Mode" button to reveal the "To Email" field and enter test@example.com
      - Click "Continue & Run Test"
   10. Click "Activate Connect" button in the top-right corner:
       - If an "Upgrade Plan" popup appears, note the exact message and report it as a blocking issue
@@ -49,8 +54,9 @@ instructions: |
       - Action: Gmail / Create Draft
 
   NOTE: If a 503 error or empty state appears, wait 3 seconds and retry once.
+  IMPORTANT: Transient 503/400/network errors on background requests (images, analytics, CDN) are NOT blocking issues. If the workflow was successfully created and activated, report PASS even if background network errors were observed. Only report FAIL if the workflow itself could not be created or activated.
 timeout: 300000
-expected_outcome: "A connect workflow is created successfully where Trigger is Google Sheets (New Spreadsheet Row) and Action is Gmail (Create Draft). The workflow appears in the connects list with an active/ON status."
+expected_outcome: "A connect workflow is created successfully where Trigger is Google Sheets (New Spreadsheet Row) and Action is Gmail (Create Draft). The workflow appears in the connects list with an active/ON status. Transient 503 or network errors on background requests should not affect the verdict — only the final workflow activation state matters."
 tags:
   - workflow
   - integration

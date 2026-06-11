@@ -56,6 +56,7 @@ The system operates in two modes:
 |-------|-----------|
 | Frontend | Next.js 15, React 19, Tailwind CSS |
 | API Server | Express.js, TypeScript (ESM) |
+| Python Service | FastAPI, Uvicorn |
 | Database | MongoDB 8 (Mongoose) |
 | Queue | BullMQ + Redis/Memurai |
 | Browser | Playwright (Chromium) |
@@ -70,6 +71,7 @@ The system operates in two modes:
 ### Prerequisites
 
 - Node.js 20+
+- Python 3.11+
 - MongoDB (running on port 27017)
 - Redis or Memurai (running on port 6379)
 - FFmpeg (for replay videos)
@@ -107,14 +109,16 @@ DEFAULT_TEST_PASSWORD=your-test-password
 ### Run
 
 ```bash
-# Terminal 1 — Runner (API + Worker)
-pnpm --filter runner dev
+# Install Python dependencies once
+pip install -r packages/python-service/requirements.txt
 
-# Terminal 2 — Dashboard
-pnpm --filter dashboard dev
+# Start runner, Python service, and dashboard together
+pnpm dev
 ```
 
 Open http://localhost:3002
+
+The Python companion service runs on `http://localhost:3003` and is proxied through the dashboard as `/python-api/*`.
 
 ---
 
@@ -144,6 +148,10 @@ appypie-cua-tester/
 │   │       ├── navigation/        # Cross-page navigation (2)
 │   │       ├── pricing/           # Pricing page (1)
 │   │       └── help/              # Help & docs (1)
+│   │
+│   ├── python-service/            # Companion Python API
+│   │   ├── src/main.py            # FastAPI entry point
+│   │   └── requirements.txt       # Python dependencies
 │   │
 │   └── dashboard/                 # Frontend
 │       └── src/app/

@@ -69,7 +69,11 @@ export interface ExecutionAdapter {
   clickByPanelText(text: string): Promise<ActionResult>;  // search entire page for text match & click
   selectAppyPieEvent(eventText: string): Promise<ActionResult>;  // select event from checkbox list + click Continue
   openAndSelectDropdown(dropdownLabel: string, optionText: string): Promise<ActionResult>;  // open Appy Pie custom dropdown → select option
+  insertVariableToken(fieldLabel: string, tokenText: string): Promise<ActionResult>;  // click "+ Add or Select" → pick variable from picker modal
+  autoFillActionFields(): Promise<{ filled: number; fields: string[] }>;  // proactively fill all empty "+ Add or Select" fields on options page
+  clickContinueRunTest(): Promise<ActionResult>;  // wait for "Continue & Run Test" to enable, then click
   typeBySelector(selector: string, text: string): Promise<ActionResult>;
+  typeByContentEditable(selector: string, text: string): Promise<ActionResult>;
   typeByCoordinates(x: number, y: number, text: string): Promise<ActionResult>;
   selectBySelector(selector: string, value: string): Promise<ActionResult>;
   scroll(direction: 'up' | 'down', amount?: number): Promise<ActionResult>;

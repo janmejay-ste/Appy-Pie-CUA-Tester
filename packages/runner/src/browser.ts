@@ -43,7 +43,20 @@ export async function launchBrowser(
 
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
-  await page.goto(url, { waitUntil: 'load', timeout: 30_000 });
+  // Use domcontentloaded — faster than 'load' on SPAs, retried up to 2x on timeout
+  let lastGotoErr: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      lastGotoErr = null;
+      break;
+    } catch (err) {
+      lastGotoErr = err as Error;
+      console.warn(`[browser] page.goto attempt ${attempt + 1} failed: ${(err as Error).message}`);
+      if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  if (lastGotoErr) throw lastGotoErr;
 
   return {
     browser,

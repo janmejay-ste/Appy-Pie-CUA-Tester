@@ -8,13 +8,13 @@
     "start": "node --env-file=../../.env dist/index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^12.8.0",
     "bullmq": "^5.71.0",
     "cors": "^2.8.5",
     "express": "^4.21.0",
     "express-rate-limit": "^8.3.1",
     "helmet": "^8.1.0",
     "ioredis": "^5.10.0",
-    "mongoose": "^9.3.0",
     "openai": "^4.87.0",
     "playwright": "^1.52.0",
     "uuid": "^11.1.0",
@@ -22,6 +22,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.2",
     "@types/ioredis": "^5.0.0",

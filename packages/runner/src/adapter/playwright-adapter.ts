@@ -55,6 +55,66 @@ export class PlaywrightAdapter implements ExecutionAdapter {
     } catch {}
     const maxElements = viewportHeight < 800 ? BASE_MAX_ELEMENTS : Math.min(70, BASE_MAX_ELEMENTS + 35);
 
+    // AUTO-CLICK CONTINUE on account steps — prevents OAuth redirect entirely
+    // If URL contains /account/ on customeditor, click Continue immediately — skip account check
+    const currentUrl = this.activePage.url();
+    let autoClickedContinue = false;
+
+    if (currentUrl.includes('/customeditor/')) {
+      // Auto-click Continue on account steps — checks if there's a linked account + active Continue
+      autoClickedContinue = (await this.activePage.evaluate(`(() => {
+        // Check if there's a linked account visible (green checkmark + account email/name)
+        var hasLinkedAccount = false;
+        document.querySelectorAll('.fa-check-circle, [class*="done-app"], [class*="trgrevent-icon"]').forEach(function(el) {
+          hasLinkedAccount = true;
+        });
+        // Also check for "Connect Account" section with a dropdown/selection
+        document.querySelectorAll('span, div, h5').forEach(function(el) {
+          var text = (el.textContent || '').trim().toLowerCase();
+          if (text.includes('account:') || text.includes('connected') ||
+              (text.includes('@') && text.includes('.'))) {
+            hasLinkedAccount = true;
+          }
+        });
+        if (!hasLinkedAccount) return false;
+
+        // Find Continue button — by data-track first, then by text
+        var btn = document.querySelector('[data-track="continue with account"]');
+        if (!btn) btn = document.querySelector('[data-track*="continue"]:not([data-track*="event"])');
+        if (!btn) {
+          var buttons = document.querySelectorAll('.continue button, .continue a');
+          for (var i = 0; i < buttons.length; i++) {
+            var text = (buttons[i].textContent || '').trim().toLowerCase();
+            if (text === 'continue' || text === 'continue & run test') { btn = buttons[i]; break; }
+          }
+        }
+        // Only click if active
+        if (btn && !btn.disabled && btn.offsetParent !== null &&
+            !btn.classList.contains('disabled') && btn.getAttribute('aria-disabled') !== 'true') {
+          btn.click();
+          return true;
+        }
+        return false;
+      })()`).catch(() => false)) as boolean;
+    }
+
+    if (autoClickedContinue) {
+      console.log('[adapter] Auto-clicked Continue on account step (/account/ URL) — skipping account setup');
+      // Wait for page to process the click
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // AUTO-FILL: On action options/config page, proactively fill empty "+ Add or Select" fields
+    if (currentUrl.includes('/customeditor/') && currentUrl.includes('/options/')) {
+      try {
+        const fillResult = await this.autoFillActionFields();
+        if (fillResult.filled > 0) {
+          console.log(`[adapter] Auto-filled ${fillResult.filled} fields: ${fillResult.fields.join(', ')}`);
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      } catch {}
+    }
+
     // Remove trap elements + auto-recover from expanded layout
     await this.activePage.evaluate(`(() => {
       // AUTO-RECOVER: If expand was clicked, the Minimize button will be visible — click it to restore layout
@@ -266,7 +326,7 @@ export class PlaywrightAdapter implements ExecutionAdapter {
           var rect = el.getBoundingClientRect();
           var tag = el.tagName.toLowerCase();
           var attrs = {};
-          var attrNames = ['id', 'name', 'type', 'data-testid', 'aria-label', 'href', 'role', 'placeholder', 'class'];
+          var attrNames = ['id', 'name', 'type', 'data-testid', 'aria-label', 'href', 'role', 'placeholder', 'class', 'contenteditable', 'data-slate-editor', 'data-lexical-editor'];
           for (var ai = 0; ai < attrNames.length; ai++) {
             var v = el.getAttribute(attrNames[ai]);
             if (v) attrs[attrNames[ai]] = v.slice(0, 80);
@@ -296,7 +356,7 @@ export class PlaywrightAdapter implements ExecutionAdapter {
             tag: tag,
             type: attrs['type'] || '',
             text: (el.textContent || '').trim().slice(0, 50),
-            value: el.value !== undefined ? String(el.value || '') : '',
+            value: el.value !== undefined ? String(el.value || '') : (el.getAttribute('contenteditable') ? (el.textContent || '').trim().slice(0, 100) : ''),
             placeholder: attrs['placeholder'] || '',
             attributes: attrs,
             boundingBox: { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
@@ -390,6 +450,29 @@ export class PlaywrightAdapter implements ExecutionAdapter {
       duplicateTextCount: rawData.duplicateTextCount || 0,
       errorMessages: rawData.errorMessages || [],
     };
+  }
+
+  async dismissTitleEdit(): Promise<boolean> {
+    try {
+      const dismissed = await this.activePage.evaluate(`(() => {
+        var focused = document.activeElement;
+        if (!focused || focused.tagName !== 'INPUT') return false;
+        var val = (focused.value || '').toLowerCase();
+        var cls = (focused.className || '').toLowerCase();
+        if (val.includes('integration') || val.includes('connect') || val.includes('workflow') ||
+            val.includes('google') || val.includes('gmail') || val.includes('sheets') ||
+            cls.includes('name') || cls.includes('title') || cls.includes('editable')) {
+          focused.blur();
+          return true;
+        }
+        return false;
+      })()`);
+      if (dismissed) {
+        await this.activePage.keyboard.press('Escape');
+        await new Promise(r => setTimeout(r, 300));
+      }
+      return !!dismissed;
+    } catch { return false; }
   }
 
   async getUrl(): Promise<string> { return this.activePage.url(); }
@@ -742,9 +825,296 @@ export class PlaywrightAdapter implements ExecutionAdapter {
     }
   }
 
+  async insertVariableToken(fieldLabel: string, tokenText: string): Promise<ActionResult> {
+    try {
+      const result = await this.activePage.evaluate(`(async () => {
+        var label = ${JSON.stringify(fieldLabel.toLowerCase())};
+        var token = ${JSON.stringify(tokenText.toLowerCase())};
+
+        // Step 1: Find the field row by label text
+        var rows = document.querySelectorAll('.form-group, .field-row, .input-row, [class*="field"], [class*="form"]');
+        var targetRow = null;
+        for (var i = 0; i < rows.length; i++) {
+          var t = (rows[i].textContent || '').toLowerCase();
+          if (t.includes(label)) { targetRow = rows[i]; break; }
+        }
+        // Fallback: search all labels
+        if (!targetRow) {
+          var allLabels = document.querySelectorAll('label, .label, [class*="label"]');
+          for (var i = 0; i < allLabels.length; i++) {
+            if ((allLabels[i].textContent || '').toLowerCase().includes(label)) {
+              targetRow = allLabels[i].closest('.form-group') || allLabels[i].parentElement;
+              break;
+            }
+          }
+        }
+        if (!targetRow) return { success: false, error: 'Field not found: ' + label };
+
+        // Step 2: Click the "+ Add or Select" button in that row
+        var addBtn = targetRow.querySelector('[class*="add"], [class*="select"], button, a');
+        if (!addBtn) {
+          var els = targetRow.querySelectorAll('*');
+          for (var i = 0; i < els.length; i++) {
+            var t = (els[i].textContent || '').trim().toLowerCase();
+            if ((t.includes('add') || t.includes('select')) && t.length < 30) {
+              addBtn = els[i]; break;
+            }
+          }
+        }
+        if (!addBtn) return { success: false, error: 'Add/Select button not found in field row' };
+        addBtn.click();
+        await new Promise(function(r) { setTimeout(r, 1500); });
+
+        // Step 3: Find the opened variable picker modal/dropdown
+        var picker = null;
+        var candidates = document.querySelectorAll('[class*="picker"], [class*="modal"], [class*="dropdown"], [class*="variable"], [class*="data-field"], [class*="mapping"]');
+        for (var i = 0; i < candidates.length; i++) {
+          var c = candidates[i];
+          var cRect = c.getBoundingClientRect();
+          if (cRect.width > 100 && cRect.height > 50 && cRect.top >= 0) {
+            picker = c; break;
+          }
+        }
+        if (!picker) return { success: false, error: 'Variable picker did not open' };
+
+        // Step 4: Find matching token option
+        var items = picker.querySelectorAll('li, a, div, span, label, [class*="option"], [class*="item"]');
+        var bestMatch = null;
+        for (var i = 0; i < items.length; i++) {
+          var itemText = (items[i].textContent || '').trim().toLowerCase();
+          if (itemText.length < 2 || itemText.length > 200) continue;
+          var iRect = items[i].getBoundingClientRect();
+          if (iRect.width < 20 || iRect.height < 10) continue;
+          if (itemText.includes(token) || token.includes(itemText.slice(0, 15))) {
+            bestMatch = items[i]; break;
+          }
+        }
+        // Fallback: first available item
+        if (!bestMatch && (token === '' || token === 'first')) {
+          for (var i = 0; i < items.length; i++) {
+            var iRect = items[i].getBoundingClientRect();
+            if (iRect.width > 20 && iRect.height > 10) { bestMatch = items[i]; break; }
+          }
+        }
+        if (!bestMatch) return { success: false, error: 'Token not found in picker: ' + token };
+
+        var r = bestMatch.getBoundingClientRect();
+        return { success: true, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2), text: (bestMatch.textContent||'').trim().slice(0,50) };
+      })()`);
+
+      const r = result as any;
+      if (r?.success && r.x) {
+        await this.activePage.mouse.click(r.x, r.y);
+        await new Promise(res => setTimeout(res, 500));
+        console.log(`[adapter] Variable token: "${fieldLabel}" → "${r.text}"`);
+        return { success: true, effective: true };
+      }
+      return { success: false, effective: false, error: r?.error || 'Variable token insertion failed' };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async autoFillActionFields(): Promise<{ filled: number; fields: string[] }> {
+    // Proactively fill ALL empty fields that have "+ Add or Select" buttons on the action options page.
+    // For each field: click its "Add or Select" button → wait for picker → click first token item.
+    try {
+      // Step 1: Find all "+ Add or Select" buttons on the page
+      const fieldButtons = await this.activePage.evaluate(`(() => {
+        var results = [];
+        var seen = {};
+        // Look for "add or select" / "+ add" text in the side panel
+        var allEls = document.querySelectorAll('a, button, span, div');
+        for (var i = 0; i < allEls.length; i++) {
+          var el = allEls[i];
+          var t = (el.textContent || '').trim().toLowerCase();
+          if (!(t.includes('add or select') || t.includes('+ add') || (t === '+ add or select'))) continue;
+          if (t.length > 40) continue;
+          var rect = el.getBoundingClientRect();
+          if (rect.width < 10 || rect.height < 10 || rect.top < 0) continue;
+          // Find the parent field label
+          var parent = el.closest('.form-group, [class*="field"], [class*="form"], [class*="row"]') || el.parentElement;
+          var label = '';
+          if (parent) {
+            var labelEl = parent.querySelector('label, .label, [class*="label"]');
+            if (labelEl) label = (labelEl.textContent || '').trim();
+          }
+          if (!label) {
+            var prev = el.parentElement;
+            while (prev && !label) {
+              var lbl = prev.querySelector('label');
+              if (lbl) label = (lbl.textContent || '').trim();
+              prev = prev.parentElement;
+            }
+          }
+          // Check if the field already has a value (token already inserted)
+          var hasValue = false;
+          if (parent) {
+            var chips = parent.querySelectorAll('[class*="chip"], [class*="tag"], [class*="token"], [class*="badge"]');
+            if (chips.length > 0) hasValue = true;
+            var inputs = parent.querySelectorAll('input, textarea');
+            for (var j = 0; j < inputs.length; j++) {
+              if (inputs[j].value && inputs[j].value.trim().length > 0) hasValue = true;
+            }
+          }
+          var key = label || ('btn-' + i);
+          if (!seen[key] && !hasValue) {
+            seen[key] = true;
+            results.push({ label: label || 'field-' + i, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2) });
+          }
+        }
+        return results;
+      })()`);
+
+      const buttons = fieldButtons as Array<{ label: string; x: number; y: number }>;
+      if (!buttons || buttons.length === 0) return { filled: 0, fields: [] };
+
+      const filledFields: string[] = [];
+
+      for (const btn of buttons) {
+        try {
+          // Click the "+ Add or Select" button
+          await this.activePage.mouse.click(btn.x, btn.y);
+          await new Promise(r => setTimeout(r, 1500));
+
+          // Find the picker that opened and click the first available token
+          const tokenResult = await this.activePage.evaluate(`(() => {
+            // Find opened picker/dropdown/modal
+            var picker = null;
+            var candidates = document.querySelectorAll('[class*="picker"], [class*="dropdown-menu"], [class*="popup"], [class*="popover"], [class*="modal-body"], [class*="mapping"], [class*="field-list"], [class*="searchable"]');
+            for (var i = 0; i < candidates.length; i++) {
+              var c = candidates[i];
+              var rect = c.getBoundingClientRect();
+              if (rect.width > 80 && rect.height > 40 && rect.top >= 0 && c.offsetParent !== null) {
+                picker = c; break;
+              }
+            }
+            // Fallback: any recently-visible popup/dropdown
+            if (!picker) {
+              var allDivs = document.querySelectorAll('div, ul');
+              for (var i = 0; i < allDivs.length; i++) {
+                var d = allDivs[i];
+                var cls = (d.className || '').toLowerCase();
+                var style = d.style;
+                if ((cls.includes('show') || cls.includes('open') || cls.includes('active') || cls.includes('visible')) &&
+                    (cls.includes('drop') || cls.includes('pick') || cls.includes('list') || cls.includes('pop'))) {
+                  var rect = d.getBoundingClientRect();
+                  if (rect.width > 80 && rect.height > 40) { picker = d; break; }
+                }
+              }
+            }
+            if (!picker) return { success: false, error: 'picker not found' };
+
+            // Find clickable items inside picker (skip search inputs, headers)
+            var items = picker.querySelectorAll('li, a, [class*="option"], [class*="item"], [class*="field-name"], [role="option"]');
+            for (var i = 0; i < items.length; i++) {
+              var item = items[i];
+              var text = (item.textContent || '').trim();
+              if (text.length < 2 || text.length > 200) continue;
+              if (item.tagName === 'INPUT' || item.tagName === 'LABEL') continue;
+              var rect = item.getBoundingClientRect();
+              if (rect.width < 20 || rect.height < 8) continue;
+              // Skip search box text
+              if (text.toLowerCase().includes('search')) continue;
+              return { success: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text.slice(0, 50) };
+            }
+            // Second pass: any div/span that looks clickable
+            var spans = picker.querySelectorAll('div, span');
+            for (var i = 0; i < spans.length; i++) {
+              var sp = spans[i];
+              var text = (sp.textContent || '').trim();
+              if (text.length < 3 || text.length > 100) continue;
+              if (sp.children.length > 3) continue; // skip containers
+              var rect = sp.getBoundingClientRect();
+              if (rect.width < 30 || rect.height < 12) continue;
+              if (text.toLowerCase().includes('search') || text.toLowerCase().includes('select')) continue;
+              return { success: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text.slice(0, 50) };
+            }
+            return { success: false, error: 'no clickable items in picker' };
+          })()`);
+
+          const token = tokenResult as any;
+          if (token?.success && token.x) {
+            await this.activePage.mouse.click(token.x, token.y);
+            await new Promise(r => setTimeout(r, 800));
+            console.log(`[adapter] Auto-filled "${btn.label}" → "${token.text}"`);
+            filledFields.push(btn.label);
+          } else {
+            // Close picker if we couldn't select anything
+            await this.activePage.keyboard.press('Escape');
+            await new Promise(r => setTimeout(r, 300));
+            console.log(`[adapter] Auto-fill "${btn.label}" failed: ${token?.error}`);
+          }
+        } catch (err) {
+          console.log(`[adapter] Auto-fill "${btn.label}" error: ${(err as Error).message}`);
+        }
+      }
+
+      return { filled: filledFields.length, fields: filledFields };
+    } catch (err) {
+      console.log(`[adapter] autoFillActionFields error: ${(err as Error).message}`);
+      return { filled: 0, fields: [] };
+    }
+  }
+
+  async clickContinueRunTest(): Promise<ActionResult> {
+    try {
+      // Wait up to 10s for "Continue & Run Test" (or "Skip Run Test") to become enabled
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const result = await this.activePage.evaluate(`(() => {
+          var btns = document.querySelectorAll('button, a, [role="button"]');
+          for (var i = 0; i < btns.length; i++) {
+            var btn = btns[i];
+            var text = (btn.textContent || '').trim().toLowerCase();
+            var track = (btn.getAttribute('data-track') || '').toLowerCase();
+            var isContinueBtn = text === 'continue & run test' || text === 'skip run test' ||
+                                track.includes('continue & run') || track.includes('skip run');
+            if (!isContinueBtn) continue;
+            var isDisabled = btn.disabled || btn.classList.contains('disabled') ||
+                             btn.getAttribute('aria-disabled') === 'true' ||
+                             btn.getAttribute('disabled') !== null;
+            if (isDisabled) return { found: true, enabled: false };
+            var rect = btn.getBoundingClientRect();
+            if (rect.width < 20) return { found: true, enabled: false };
+            return { found: true, enabled: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), text: text };
+          }
+          return { found: false };
+        })()`);
+
+        const r = result as any;
+        if (r?.found && r?.enabled && r?.x) {
+          await this.activePage.mouse.click(r.x, r.y);
+          console.log(`[adapter] Clicked "${r.text}" at (${r.x}, ${r.y})`);
+          await new Promise(res => setTimeout(res, 1500));
+          return { success: true, effective: true };
+        }
+        if (!r?.found) break; // button not on page at all
+        // Button found but disabled — wait 1s and retry
+        await new Promise(res => setTimeout(res, 1000));
+      }
+      return { success: false, effective: false, error: 'Continue & Run Test button not found or stayed disabled' };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
   async typeBySelector(selector: string, text: string): Promise<ActionResult> {
     try {
       await this.activePage.fill(selector, text, { timeout: ACTION_TIMEOUT });
+      return { success: true, effective: false };
+    } catch (err) {
+      return { success: false, effective: false, error: (err as Error).message };
+    }
+  }
+
+  async typeByContentEditable(selector: string, text: string): Promise<ActionResult> {
+    try {
+      const el = this.activePage.locator(selector).first();
+      await el.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT });
+      await el.click({ timeout: ACTION_TIMEOUT });
+      // Select all existing content and replace with new text
+      await this.activePage.keyboard.press('Control+A');
+      await this.activePage.keyboard.type(text, { delay: 20 });
       return { success: true, effective: false };
     } catch (err) {
       return { success: false, effective: false, error: (err as Error).message };
@@ -787,17 +1157,57 @@ export class PlaywrightAdapter implements ExecutionAdapter {
   }
 
   async navigate(url: string): Promise<ActionResult> {
-    try {
-      await this.activePage.goto(url, { waitUntil: 'load', timeout: 15000 });
-      return { success: true, effective: true, newUrl: this.activePage.url() };
-    } catch (err) {
-      return { success: false, effective: false, error: (err as Error).message };
+    let lastErr: Error | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+        return { success: true, effective: true, newUrl: this.activePage.url() };
+      } catch (err) {
+        lastErr = err as Error;
+        console.warn(`[adapter] navigate attempt ${attempt + 1} failed: ${lastErr.message}`);
+        if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+      }
     }
+    return { success: false, effective: false, error: lastErr!.message };
   }
 
   async keypress(key: string): Promise<ActionResult> {
+    // Normalize key names — Playwright is case-sensitive
+    const KEY_MAP: Record<string, string> = {
+      'HOME': 'Home', 'END': 'End',
+      'PAGEUP': 'PageUp', 'PAGEDOWN': 'PageDown',
+      'ENTER': 'Enter', 'RETURN': 'Enter',
+      'TAB': 'Tab', 'ESC': 'Escape', 'ESCAPE': 'Escape',
+      'SPACE': 'Space', 'DEL': 'Delete', 'DELETE': 'Delete',
+      'BACKSPACE': 'Backspace',
+      'ARROWUP': 'ArrowUp', 'ARROWDOWN': 'ArrowDown',
+      'ARROWLEFT': 'ArrowLeft', 'ARROWRIGHT': 'ArrowRight',
+      'UP': 'ArrowUp', 'DOWN': 'ArrowDown',
+      'LEFT': 'ArrowLeft', 'RIGHT': 'ArrowRight',
+    };
+    // Modifier map for combo keys (e.g. "Ctrl+R", "Ctrl+Shift+N")
+    const MODIFIER_MAP: Record<string, string> = {
+      'CTRL': 'Control', 'CONTROL': 'Control',
+      'ALT': 'Alt', 'SHIFT': 'Shift',
+      'META': 'Meta', 'CMD': 'Meta', 'WIN': 'Meta', 'SUPER': 'Meta',
+    };
+    let normalizedKey: string;
+    if (key.includes('+')) {
+      // Combo key: normalize each part separately
+      const parts = key.split('+');
+      normalizedKey = parts.map((p, i) => {
+        const upper = p.trim().toUpperCase();
+        if (MODIFIER_MAP[upper]) return MODIFIER_MAP[upper];
+        // Last part is the actual key (not a modifier) — lowercase single chars
+        const mapped = KEY_MAP[upper];
+        if (mapped) return mapped;
+        return p.trim().length === 1 ? p.trim().toLowerCase() : p.trim();
+      }).join('+');
+    } else {
+      normalizedKey = KEY_MAP[key.toUpperCase()] ?? key;
+    }
     try {
-      await this.activePage.keyboard.press(key);
+      await this.activePage.keyboard.press(normalizedKey);
       return { success: true, effective: false };
     } catch (err) {
       return { success: false, effective: false, error: (err as Error).message };

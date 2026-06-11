@@ -4,7 +4,7 @@ import OpenAI from 'openai';
 import path from 'path';
 import { v4 as uuid } from 'uuid';
 import IORedis from 'ioredis';
-import { connectMongo } from '../db/mongo.js';
+import { connectSQLite } from '../db/sqlite.js';
 import { deadLetterQueue, testExecutionQueue, type TestJobData } from './queue.js';
 import { runCUALoop } from '../cua-loop.js';
 import { launchBrowser } from '../browser.js';
@@ -461,7 +461,7 @@ async function recoverStuckRuns() {
 }
 
 export async function startWorker() {
-  await connectMongo();
+  await connectSQLite();
 
   // Recover any runs stuck in 'running' from a previous crash
   await recoverStuckRuns();

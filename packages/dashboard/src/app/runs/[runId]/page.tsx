@@ -3,6 +3,8 @@
 import { useEffect, useState, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import { useSSE } from '@/lib/use-sse';
+import { Skeleton } from 'boneyard-js/react';
+import '../../../bones/registry';
 
 const API = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -147,8 +149,31 @@ export default function RunDetailPage() {
     }
   }, [screenshotCount, prevScreenshotCount]);
 
-  if (loading) return <div className="text-gray-500 text-center py-20">Loading...</div>;
-  if (!run) return <div className="text-gray-500 text-center py-20">Run not found</div>;
+  if (!run && !loading) return <div className="text-gray-500 text-center py-20">Run not found</div>;
+  if (loading || !run) return (
+    <Skeleton name="run-detail" loading={true} animate="pulse" color="rgba(255,255,255,0.04)" darkColor="rgba(255,255,255,0.04)">
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <span className="text-gray-700 text-sm">&larr; Back</span>
+          <h2 className="text-xl font-bold text-gray-50">Loading test run...</h2>
+          <span className="text-xs px-3 py-1 rounded-full bg-gray-700">...</span>
+        </div>
+        <div className="grid grid-cols-[1fr_320px] gap-6">
+          <div className="space-y-4">
+            <div className="aspect-video bg-gray-800 rounded-xl" />
+            <div className="flex gap-2">{[...Array(6)].map((_, i) => <div key={i} className="w-24 h-16 bg-gray-800 rounded-lg" />)}</div>
+          </div>
+          <div className="space-y-4">
+            <div className="h-8 w-full bg-gray-800 rounded-lg" />
+            <div className="h-6 w-3/4 bg-gray-800 rounded" />
+            <div className="h-6 w-1/2 bg-gray-800 rounded" />
+            <div className="h-20 w-full bg-gray-800 rounded-lg" />
+          </div>
+        </div>
+        <div className="space-y-2">{[...Array(5)].map((_, i) => <div key={i} className="h-8 bg-gray-800 rounded" />)}</div>
+      </div>
+    </Skeleton>
+  );
 
   const screenshots = run.screenshots ?? [];
   const events = run.events ?? [];

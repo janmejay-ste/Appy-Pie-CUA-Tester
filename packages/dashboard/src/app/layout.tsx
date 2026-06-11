@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import './globals.css';
 
+
 export const metadata: Metadata = {
   title: 'AppyPie CUA Tester',
   description: 'QA Testing Dashboard for Appy Pie Automate',

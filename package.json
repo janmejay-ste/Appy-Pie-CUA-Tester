@@ -1,7 +1,8 @@
 {
   "private": true,
   "scripts": {
-    "dev": "concurrently -k -n runner,dash -c blue,green \"pnpm --filter runner dev\" \"pnpm --filter dashboard dev\"",
+    "dev": "concurrently -k -n runner,python,dash -c blue,yellow,green \"pnpm --filter runner dev\" \"pnpm dev:python\" \"pnpm --filter dashboard dev\"",
+    "dev:python": "python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 3003 --app-dir packages/python-service",
     "build": "pnpm --filter runner build && pnpm --filter dashboard build"
   },
   "devDependencies": {
@@ -10,7 +11,8 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild",
-      "sharp"
+      "sharp",
+      "better-sqlite3"
     ]
   }
 }

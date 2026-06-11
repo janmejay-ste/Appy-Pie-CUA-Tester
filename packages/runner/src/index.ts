@@ -1,4 +1,4 @@
-import { connectMongo } from './db/mongo.js';
+import { connectSQLite } from './db/sqlite.js';
 import { startWorker } from './queue/worker.js';
 import { createServer } from './server.js';
 import { startCleanupScheduler } from './services/cleanup.service.js';
@@ -7,8 +7,8 @@ import { startMetricsScheduler } from './services/metrics.service.js';
 const PORT = parseInt(process.env.RUNNER_PORT || '3001', 10);
 
 async function main() {
-  // 1. Connect to MongoDB
-  await connectMongo();
+  // 1. Connect to SQLite
+  await connectSQLite();
 
   // 2. Start BullMQ worker (processes test execution jobs)
   await startWorker();
@@ -25,7 +25,7 @@ async function main() {
     console.log(`  Health:   http://localhost:${PORT}/health`);
     console.log(`  Tests:    http://localhost:${PORT}/api/tests`);
     console.log(`  Metrics:  http://localhost:${PORT}/api/metrics`);
-    console.log(`  MongoDB + Redis + BullMQ + Cleanup ready\n`);
+    console.log(`  SQLite + Redis + BullMQ + Cleanup ready\n`);
   });
 }
 

@@ -9,12 +9,24 @@ const nextConfig: NextConfig = {
         source: '/api/:path*',
         destination: 'http://localhost:3001/api/:path*',
       },
+      {
+        source: '/python-api/:path*',
+        destination: 'http://localhost:3003/:path*',
+      },
     ];
   },
   async headers() {
     return [
       {
         source: '/api/:path*',
+        headers: [
+          { key: 'Access-Control-Allow-Origin', value: '*' },
+          { key: 'Access-Control-Allow-Methods', value: 'GET,POST,PUT,DELETE,OPTIONS' },
+          { key: 'Access-Control-Allow-Headers', value: 'Content-Type, x-api-key' },
+        ],
+      },
+      {
+        source: '/python-api/:path*',
         headers: [
           { key: 'Access-Control-Allow-Origin', value: '*' },
           { key: 'Access-Control-Allow-Methods', value: 'GET,POST,PUT,DELETE,OPTIONS' },

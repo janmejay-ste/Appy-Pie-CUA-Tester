@@ -5,13 +5,72 @@ import path from 'path';
 import { v4 as uuid } from 'uuid';
 import { PlaywrightAdapter, executeValidatedAction } from './adapter/index.js';
 import type { ActionStep, BrowserState } from './adapter/types.js';
-import type { ValidatedResult } from './adapter/action-engine.js';
+import type { ValidatedResult, ExecutionStrategy } from './adapter/action-engine.js';
 import type { CUALoopCallbacks, TurnTokenUsage, CUALoopResult, PageState, ScreenshotRecord, TestAccountConfig } from './types.js';
 import { VisionDecisionEngine } from './vision-decision.js';
 import type { VisionBrowserState, VisionActionResult, VisionDecision } from './vision-decision.js';
 
 // Re-export for backward compatibility
 export type { CUALoopCallbacks, TurnTokenUsage, CUALoopResult, PageState };
+
+// ── State Machine Types ─────────────────────────────────────────
+type Mode = 'DOM_NORMAL' | 'DOM_WITH_VISION' | 'VISION_BURST';
+
+type FailureType =
+  | 'ELEMENT_NOT_FOUND'
+  | 'NO_EFFECT_WRONG_TARGET'       // clicked/typed but nothing reacted — wrong element
+  | 'NO_EFFECT_CLICK_BLOCKED'      // something intercepted the click (overlay, pointer-events)
+  | 'NO_EFFECT_NOT_INTERACTABLE'   // element exists but is disabled/non-interactive
+  | 'ACTION_FAILED'                // action returned success=false, element exists
+  | 'VALIDATION_ERROR'             // form/page error appeared after action
+  | 'STRATEGY_FAILURE'             // same failure type across 3+ different targets
+  | 'BLOCKED_REPEAT'               // hard-blocked by guard
+  | 'UNKNOWN';
+
+interface FailedAction {
+  action: string;
+  target: string;
+  error: string;
+  type: FailureType;
+  strategy: ExecutionStrategy;
+}
+
+// Maps failure type → suggested next strategy to try
+function suggestStrategy(type: FailureType): ExecutionStrategy | null {
+  switch (type) {
+    case 'ELEMENT_NOT_FOUND':          return 'text';
+    case 'NO_EFFECT_CLICK_BLOCKED':    return 'coordinates';
+    case 'NO_EFFECT_NOT_INTERACTABLE': return 'text';
+    case 'NO_EFFECT_WRONG_TARGET':     return 'coordinates';
+    case 'STRATEGY_FAILURE':           return 'coordinates';
+    case 'VALIDATION_ERROR':           return null; // input problem — strategy won't help
+    default:                           return null;
+  }
+}
+
+interface StuckContext {
+  goal: string;
+  url: string;
+  trigger: string;
+  failedActions: FailedAction[];
+}
+
+function classifyFailureType(
+  result: { success: boolean; effective: boolean; error?: string; description?: string },
+  validation: { elementStillExists: boolean; errorAppeared: boolean },
+  elInteractable?: boolean,
+): FailureType {
+  if (!result.success && !validation.elementStillExists) return 'ELEMENT_NOT_FOUND';
+  if (result.success && !result.effective) {
+    if (elInteractable === false) return 'NO_EFFECT_NOT_INTERACTABLE';
+    const hint = ((result.error || '') + (result.description || '')).toLowerCase();
+    if (hint.includes('intercept') || hint.includes('blocked') || hint.includes('overlay') || hint.includes('pointer')) return 'NO_EFFECT_CLICK_BLOCKED';
+    return 'NO_EFFECT_WRONG_TARGET';
+  }
+  if (validation.errorAppeared) return 'VALIDATION_ERROR';
+  if (!result.success) return 'ACTION_FAILED';
+  return 'UNKNOWN';
+}
 
 // ── Config ──────────────────────────────────────────────────────
 const MODEL = 'gpt-5.4';
@@ -94,7 +153,7 @@ function extractResponseText(response: any): string {
   return '';
 }
 
-function formatStateForModel(state: BrowserState): string {
+function formatStateForModel(state: BrowserState, discouragedIds?: Set<string>): string {
   const lines: string[] = [];
   lines.push(`URL: ${state.url}`);
   lines.push(`Title: ${state.title || '(none)'}`);
@@ -112,6 +171,7 @@ function formatStateForModel(state: BrowserState): string {
     if (el.attributes['href']) desc += ` href="${el.attributes['href'].slice(0, 50)}"`;
     if (!el.isInteractable) desc += ' [disabled]';
     desc += ` [${el.boundingBox.x},${el.boundingBox.y}]`;
+    if (discouragedIds?.has(el.elementId)) desc += ' [DISCOURAGED]';
     lines.push(desc);
   }
   if (state.keyText.length > 0) {
@@ -148,9 +208,8 @@ export async function runCUALoop(
   callbacks: CUALoopCallbacks,
   testAccount?: TestAccountConfig,
   abortSignal?: AbortSignal,
-  maxTurns: number,
-  tokenBudget: number,
-  
+  maxTurns = 500,
+  tokenBudget = 500000,
   testUrl?: string,
   mode: 'dom' | 'vision' = 'dom',
 ): Promise<CUALoopResult> {
@@ -172,27 +231,43 @@ async function runCUALoopDOM(
   callbacks: CUALoopCallbacks,
   testAccount?: TestAccountConfig,
   abortSignal?: AbortSignal,
-  maxTurns: number,
-  tokenBudget: number,
+  maxTurns = 500,
+  tokenBudget = 500000,
   testUrl?: string,
 ): Promise<CUALoopResult> {
   // ── Create adapter (CUA never touches Playwright directly) ─────
   const adapter = new PlaywrightAdapter(page);
   const totalTokens = { input: 0, output: 0, reasoning: 0 };
 
-  // Vision budget — higher cap to allow vision bursts when DOM is stuck
-  const VISION_BUDGET = Math.min(20, Math.ceil(maxTurns * 0.4));
-  let visionTurnsUsed = 0;
-  let useVisionNextTurn = false;
+  // ── State machine ───────────────────────────────────────────────
+  let mode: Mode = 'DOM_NORMAL';
+  let consecutiveFailures = 0;
+  let consecutiveNonMeaningful = 0;  // catches scroll/wait loops
+  let consecutiveScrolls = 0;        // scroll-specific: 3 in a row without DOM change = stuck
+  let stuckContext: StuckContext | null = null;
+  let visionBurstsUsed = 0;
+  const MAX_VISION_BURSTS = 3;
 
-  // Stuck detection (OLD — kept for parallel comparison)
-  let lastDOMFingerprint = '';
-  let consecutiveSameDOM = 0;
+  // Actions where no-effect counts as a real failure
+  const MEANINGFUL_ACTIONS = new Set(['click', 'type', 'select', 'navigate', 'keypress']);
+
+  // Action repeat detection (safety — kept separate from stuck detection)
   let lastActionSig = '';
   let consecutiveSameAction = 0;
-  let consecutiveFailures = 0;
-  const STUCK_THRESHOLD = 4;
-  const LOW_CONFIDENCE = 0.4;
+
+  // Confidence tracking
+  let consecutiveLowConfidence = 0;
+
+  // Strategy engine
+  let forceStrategySwitch: ExecutionStrategy | null = null;
+  let lastSuccessfulStrategy: ExecutionStrategy | null = null;
+
+  // URL-based stuck detection — catches cases where DOM changes but page doesn't progress
+  let lastUrlPath = '';
+  let sameUrlTurns = 0;
+  const MAX_SAME_URL_TURNS = 25; // abort after 25 turns on same URL path
+  let lastProgressTurn = 0; // track last turn with real progress
+  const MAX_NO_PROGRESS_TURNS = 30; // abort after 30 turns without progress
 
   // ── NEW: Vision Decision Engine (parallel — log only, don't act) ──
   const visionEngine = new VisionDecisionEngine();
@@ -252,7 +327,8 @@ async function runCUALoopDOM(
 
   if (state.elements.length < 3) {
     console.log(`[cua] Few DOM elements (${state.elements.length}), starting with vision`);
-    useVisionNextTurn = true;
+    mode = 'DOM_WITH_VISION';
+    stuckContext = { goal: 'Begin test instructions', url: state.url, trigger: 'few DOM elements on start', failedActions: [] };
   }
 
   for (let turn = 1; turn <= maxTurns; turn++) {
@@ -307,7 +383,12 @@ async function runCUALoopDOM(
     promptParts.push(`Turn: ${turn}/${maxTurns}`);
     promptParts.push('');
     promptParts.push('CURRENT PAGE STATE:');
-    promptParts.push(formatStateForModel(state));
+    // Mark recently-failed targets as [DISCOURAGED] instead of removing them —
+    // keeps options visible but deprioritized so model can use them if truly necessary
+    const discouragedIds = stuckContext && stuckContext.failedActions.length > 0
+      ? new Set(stuckContext.failedActions.slice(-3).map(f => f.target).filter(Boolean))
+      : undefined;
+    promptParts.push(formatStateForModel(state, discouragedIds));
     promptParts.push('');
 
     // ── Action history — gives model full awareness of what it tried ──
@@ -357,27 +438,46 @@ async function runCUALoopDOM(
     // Build input
     const content: any[] = [{ type: 'input_text', text: promptParts.join('\n') }];
 
-    // Vision fallback — predictive triggers (not just reactive)
-    if (!useVisionNextTurn && visionTurnsUsed < VISION_BUDGET) {
+    // Predictive vision trigger — canvas or heavily duplicated DOM
+    if (mode === 'DOM_NORMAL') {
       if (state.hasCanvas) {
-        useVisionNextTurn = true;
-        console.log('[cua] Canvas detected — predictive vision trigger');
-      } else if (state.duplicateTextCount > 3) {
-        useVisionNextTurn = true;
-        console.log(`[cua] ${state.duplicateTextCount} duplicate text elements — predictive vision trigger`);
+        mode = 'DOM_WITH_VISION';
+        if (!stuckContext) stuckContext = { goal: nextGoal, url: state.url, trigger: 'canvas detected', failedActions: [] };
+        console.log('[cua] Canvas detected — switching to DOM_WITH_VISION');
+      } else if (state.duplicateTextCount > 20) {
+        mode = 'DOM_WITH_VISION';
+        if (!stuckContext) stuckContext = { goal: nextGoal, url: state.url, trigger: `${state.duplicateTextCount} duplicate text elements`, failedActions: [] };
+        console.log(`[cua] ${state.duplicateTextCount} duplicate text elements — switching to DOM_WITH_VISION`);
       }
     }
 
-    // Vision fallback
-    if (useVisionNextTurn && visionTurnsUsed < VISION_BUDGET) {
+    // Attach screenshot when in vision-assist or burst mode
+    if (mode !== 'DOM_NORMAL') {
       try {
         const jpegData = await adapter.screenshotJPEG();
         content.push({ type: 'input_image', image_url: jpegData });
-        content.push({ type: 'input_text', text: '\nScreenshot attached — previous actions had no effect. Use BOTH DOM listing AND screenshot.' });
-        visionTurnsUsed++;
-        console.log(`[cua] Vision fallback (${visionTurnsUsed}/${VISION_BUDGET})`);
+        const recentFailures = stuckContext?.failedActions.slice(-3) ?? [];
+        const failureSummary = recentFailures
+          .map(f => `- ${f.action} on ${f.target} → ${f.type} (${f.error || 'no error'})`)
+          .join('\n') || '(none yet)';
+        const forbiddenList = recentFailures
+          .map(f => `- DO NOT ${f.action} on ${f.target} (already tried, type=${f.type})`)
+          .join('\n');
+        const hasStrategyFailure = recentFailures.some(f => f.type === 'STRATEGY_FAILURE');
+        const typeHints = [
+          recentFailures.some(f => f.type === 'NO_EFFECT_WRONG_TARGET') && '- NO_EFFECT_WRONG_TARGET: element exists but is the wrong one — look for a sibling, parent, or label element',
+          recentFailures.some(f => f.type === 'NO_EFFECT_CLICK_BLOCKED') && '- NO_EFFECT_CLICK_BLOCKED: an overlay or modal is blocking — dismiss it first or use coordinates',
+          recentFailures.some(f => f.type === 'NO_EFFECT_NOT_INTERACTABLE') && '- NO_EFFECT_NOT_INTERACTABLE: element is disabled — find the enabled version or a triggering button',
+          recentFailures.some(f => f.type === 'ELEMENT_NOT_FOUND') && '- ELEMENT_NOT_FOUND: scroll down or check collapsed panels/tabs for the missing element',
+          recentFailures.some(f => f.type === 'VALIDATION_ERROR') && '- VALIDATION_ERROR: a form field has bad input — check error messages and correct the value',
+          hasStrategyFailure && '- STRATEGY_FAILURE: your entire approach is wrong — try a completely different interaction (e.g. keyboard nav, different section, alternate flow)',
+        ].filter(Boolean).join('\n');
+        const visionNote = stuckContext
+          ? `\n=== STUCK CONTEXT ===\nGoal: ${stuckContext.goal}\nURL: ${stuckContext.url}\nTrigger: ${stuckContext.trigger}\n\n=== FAILED ATTEMPTS ===\n${failureSummary}\n\n=== FORBIDDEN STRATEGIES ===\n${forbiddenList}\n\n=== TYPE-SPECIFIC HINTS ===\n${typeHints || '(none)'}\n\nSTRICT: Use the screenshot to identify a COMPLETELY DIFFERENT element or approach.`
+          : '\nScreenshot attached. Use BOTH DOM listing AND screenshot.';
+        content.push({ type: 'input_text', text: visionNote });
+        console.log(`[cua] Vision attached (mode=${mode})`);
       } catch {}
-      useVisionNextTurn = false;
     }
 
     // ── Call model ──────────────────────────────────────────────
@@ -488,6 +588,25 @@ async function runCUALoopDOM(
       continue;
     }
 
+    // ── Confidence-based escalation ─────────────────────────────
+    if (typeof action.confidence === 'number') {
+      if (action.confidence < 0.5) {
+        consecutiveLowConfidence++;
+        if (mode === 'DOM_NORMAL') {
+          // Single low-confidence turn → vision assist
+          console.log(`[cua] Low confidence (${action.confidence}, streak=${consecutiveLowConfidence}) → DOM_WITH_VISION`);
+          mode = 'DOM_WITH_VISION';
+          if (!stuckContext) stuckContext = { goal: action.next_goal || nextGoal, url: state.url, trigger: `low confidence (${action.confidence})`, failedActions: [] };
+        } else if (consecutiveLowConfidence >= 3 && mode === 'DOM_WITH_VISION') {
+          // 3+ consecutive low-confidence turns even with vision assist → burst
+          console.log(`[cua] Low confidence streak ${consecutiveLowConfidence} turns → VISION_BURST`);
+          mode = 'VISION_BURST';
+        }
+      } else {
+        consecutiveLowConfidence = 0;
+      }
+    }
+
     // ── Handle "done" ───────────────────────────────────────────
     if (action.action === 'done') {
       const saved = await saveScreenshotToDisk(adapter, screenshotDir, turn, runId);
@@ -516,7 +635,7 @@ async function runCUALoopDOM(
       const existingVal = state.formValues[action.target] || '';
       if (existingVal && existingVal.includes(action.value.slice(0, 15))) {
         console.log(`[cua] Memory enforcement: field ${action.target} already contains "${action.value.slice(0, 15)}". Skipping.`);
-        const skipResult: ValidatedResult = { success: true, effective: false, action: 'type', description: `skipped: field ${action.target} already contains "${action.value.slice(0, 15)}"`, retryStrategy: 'change_target' as any, validation: { urlChanged: false, domChanged: false, valueChanged: false, errorAppeared: false, elementStillExists: true, intentMatch: true }, durationMs: 0 };
+        const skipResult: ValidatedResult = { success: true, effective: false, action: 'type', description: `skipped: field ${action.target} already contains "${action.value.slice(0, 15)}"`, strategyUsed: 'selector', retryStrategy: 'change_target' as any, validation: { urlChanged: false, domChanged: false, valueChanged: false, errorAppeared: false, elementStillExists: true, intentMatch: true }, durationMs: 0 };
         lastResult = skipResult;
         // Record in history so model knows and stops retrying
         actionHistory.push({
@@ -563,22 +682,81 @@ async function runCUALoopDOM(
       consecutiveSameAction = 0;
     }
 
+    // ── Failed target guard ─────────────────────────────────────
+    // Hard enforcement: if the model returns a target that's in the last 3
+    // stuckContext.failedActions, block execution and advance state machine.
+    if (
+      stuckContext &&
+      action.target &&
+      stuckContext.failedActions.slice(-3).some(f => f.target === action.target && f.action === action.action)
+    ) {
+      console.warn(`[cua] Blocked: model retried failed action-target ${action.action}:${action.target} — forcing replan`);
+      consecutiveFailures++;
+      stuckContext.failedActions.push({
+        action: action.action,
+        target: action.target,
+        error: 'Blocked: repeated failed action-target',
+        type: 'BLOCKED_REPEAT' as FailureType,
+        strategy: 'selector' as ExecutionStrategy, // unknown at guard time — default
+      });
+      if (consecutiveFailures === 1) {
+        mode = 'DOM_WITH_VISION';
+      } else if (consecutiveFailures >= 2) {
+        mode = 'VISION_BURST';
+      }
+      actionHistory.push({
+        turn,
+        action: action.action,
+        target: action.target,
+        value: action.value,
+        effective: false,
+        description: `BLOCKED: repeated failed target ${action.target}`,
+      });
+      if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
+      const saved = await saveScreenshotToDisk(adapter, screenshotDir, turn, runId);
+      callbacks.onScreenshot(turn, saved);
+      callbacks.onActionsExecuted(turn, [{ type: action.action }]);
+      continue;
+    }
+
     // ── Check abort before executing browser action ────────────
     if (abortSignal?.aborted) {
       return { verdict: 'FAIL', modelMessage: 'Test was aborted by user.', turns: turn, totalTokens };
     }
 
     // ── Execute through Action Engine (with validation) ─────────
-    let result = await executeValidatedAction(adapter, action, state);
+    // Coordinates are only appropriate when click-blocked (overlay) or explicitly forced
+    const lastFailureType = stuckContext?.failedActions.slice(-1)[0]?.type;
+    const allowCoordinates = !stuckContext || forceStrategySwitch === 'coordinates' || lastFailureType === 'NO_EFFECT_CLICK_BLOCKED';
+    let result = await executeValidatedAction(adapter, action, state, {
+      forcedStrategy: forceStrategySwitch ?? undefined,
+      preferredStrategy: lastSuccessfulStrategy ?? undefined,
+      allowCoordinates,
+    });
 
-    // Smart event selection: if model clicks an event name (trigger/action event), use selectAppyPieEvent
-    if (action.action === 'click' && !result.effective) {
-      const clickText = action.value || action.reason || '';
-      // Common trigger/action event patterns
-      const eventPatterns = ['new spreadsheet', 'new opportunity', 'new form', 'new contact', 'create draft', 'create sale', 'new row', 'updated', 'new email', 'send email', 'create user'];
+    // Smart "Continue & Run Test" detection: always route through waitForEnabled method
+    // The button stays disabled until dropdowns validate server-side (can take 2-5s after select)
+    if (action.action === 'click') {
+      const clickText = (action.value || '').toLowerCase();
+      if (clickText.includes('continue & run test') || clickText.includes('skip run test') ||
+          clickText.includes('continue and run') || clickText === 'continue & run test') {
+        console.log(`[cua] Detected "Continue & Run Test" click — using clickContinueRunTest (waits for enabled)`);
+        const crtResult = await adapter.clickContinueRunTest();
+        if (crtResult.success) {
+          result = { ...result, success: true, effective: true, description: 'clicked Continue & Run Test (waited for enabled)', error: undefined };
+        }
+      }
+    }
+
+    // Smart event selection: if model clicks on a trigger/action event page,
+    // ALWAYS use selectAppyPieEvent to ensure the CORRECT event is selected by text match
+    // This prevents the model from clicking the wrong checkbox (e.g. first one instead of target)
+    if (action.action === 'click') {
+      const clickText = action.value || '';
+      const eventPatterns = ['new spreadsheet', 'new opportunity', 'new form', 'new contact', 'create draft', 'create sale', 'new row', 'updated', 'new email', 'send email', 'create user', 'add opportunity'];
       const matchedEvent = eventPatterns.find(p => clickText.toLowerCase().includes(p));
       if (matchedEvent) {
-        console.log(`[cua] Detected event selection: "${clickText}" → using selectAppyPieEvent`);
+        console.log(`[cua] Detected event selection: "${clickText}" → using selectAppyPieEvent to ensure correct event`);
         const eventResult = await adapter.selectAppyPieEvent(clickText);
         if (eventResult.success) {
           result = { ...result, success: true, effective: true, description: `selected event "${clickText}" + clicked Continue`, error: undefined };
@@ -617,6 +795,56 @@ async function runCUALoopDOM(
       }
     }
 
+    // Smart variable token insertion — broadened triggers:
+    // 1. type action fails + variable hints in reason/value
+    // 2. click on "+ Add or Select" text (model trying to open variable picker)
+    // 3. click fails on a field that needs dynamic mapping
+    if (!result.effective && action.action === 'type' && action.value && action.target) {
+      const isVariableHint =
+        /variable|token|map|data field|from trigger|add or select|dynamic/i.test(action.reason || '') ||
+        /\{\{|from\s+\w+\s+trigger/i.test(action.value);
+      if (isVariableHint) {
+        const el = state.elements.find(e => e.elementId === action.target);
+        const fieldLabel = el?.placeholder || el?.text || el?.attributes['aria-label'] || '';
+        if (fieldLabel) {
+          console.log(`[cua] Detected variable mapping: "${fieldLabel}" → "${action.value}" — trying insertVariableToken`);
+          const tokenResult = await adapter.insertVariableToken(fieldLabel, action.value);
+          if (tokenResult.success) {
+            result = { ...result, success: true, effective: true, description: `inserted variable token "${action.value}" into "${fieldLabel}"`, error: undefined };
+          }
+        }
+      }
+    }
+
+    // Smart variable token: model clicks "+ Add or Select" → use autoFillActionFields to fill ALL empty fields at once
+    if (action.action === 'click') {
+      const clickVal = (action.value || '').toLowerCase();
+      const clickReason = (action.reason || '').toLowerCase();
+      if (clickVal.includes('add or select') || clickVal.includes('+ add') ||
+          (clickReason.includes('add or select') && clickReason.includes('variable'))) {
+        const currentUrl = await adapter.getUrl();
+        if (currentUrl.includes('/customeditor/')) {
+          console.log(`[cua] Detected "+ Add or Select" click → using autoFillActionFields for all empty fields`);
+          const fillResult = await adapter.autoFillActionFields();
+          if (fillResult.filled > 0) {
+            result = { ...result, success: true, effective: true, description: `auto-filled ${fillResult.filled} fields: ${fillResult.fields.join(', ')}`, error: undefined };
+          }
+        }
+      }
+    }
+
+    // If click failed and reason/value mentions "continue & run test", try the dedicated handler
+    if (!result.success && action.action === 'click') {
+      const failText = ((action.value || '') + ' ' + (action.reason || '')).toLowerCase();
+      if (failText.includes('continue & run test') || failText.includes('continue and run test') || failText.includes('skip run test')) {
+        console.log(`[cua] Click failed → trying clickContinueRunTest`);
+        const crtResult = await adapter.clickContinueRunTest();
+        if (crtResult.success) {
+          result = { ...result, success: true, effective: true, description: 'clicked Continue & Run Test (waited for enabled)', error: undefined };
+        }
+      }
+    }
+
     // If click failed and model provided explicit text in value, try panel text search
     // IMPORTANT: Only use action.value (explicit text the model wants to click), NOT action.reason
     // Reason contains natural language that causes false matches (e.g. matching "trigger application"
@@ -642,6 +870,21 @@ async function runCUALoopDOM(
     }
 
     lastResult = result;
+
+    // ── Canvas title-edit guard ───────────────────────────────────
+    // After any click on the customeditor canvas: check if a title input became focused.
+    // If so, blur + Escape to dismiss it and restore the "Add Action App" toolbar.
+    if (action.action === 'click' && result.success) {
+      try {
+        const currentUrl = await adapter.getUrl();
+        if (currentUrl.includes('/customeditor/')) {
+          const dismissed = await (adapter as any).dismissTitleEdit?.();
+          if (dismissed) {
+            console.log('[cua] Connect title inline-edit detected after click — dismissed');
+          }
+        }
+      } catch {}
+    }
 
     // ── Record in action history ─────────────────────────────────
     actionHistory.push({
@@ -696,24 +939,154 @@ async function runCUALoopDOM(
       visionEngine.startCooldown();
     }
 
-    // OLD stuck detection (kept for now — parallel comparison)
-    if (result.success && result.effective) {
+    // ── State machine failure detection ────────────────────────────
+    const isMeaningful = MEANINGFUL_ACTIONS.has(action.action);
+    const isFailure = isMeaningful && (!result.success || !!result.error || !result.effective);
+
+    if (!isFailure) {
+      // Real progress — full reset
       consecutiveFailures = 0;
-    } else if (!result.success) {
+      stuckContext = null;
+      mode = 'DOM_NORMAL';
+      forceStrategySwitch = null;
+      lastSuccessfulStrategy = result.strategyUsed;
+      // Reset vision burst counter on URL change (real navigation = real progress)
+      if (result.validation.urlChanged) visionBurstsUsed = 0;
+    } else {
       consecutiveFailures++;
-      console.warn(`[cua] Action failed: ${result.error}`);
-      // Auto-switch to vision when DOM mode can't interact
-      if (consecutiveFailures >= 2 && visionTurnsUsed < VISION_BUDGET) {
-        useVisionNextTurn = true;
-        console.log(`[cua] ${consecutiveFailures} consecutive failures — auto-switching to vision for next turn`);
+      if (result.success && !result.effective) {
+        console.warn(`[cua] No-effect: ${action.action} ${action.target} — "${result.description}"`);
+      } else {
+        console.warn(`[cua] Action failed: ${result.error}`);
       }
-    } else if (result.success && !result.effective) {
-      // Success but no effect — might be interacting with wrong elements
-      consecutiveFailures++;
-      if (consecutiveFailures >= 3 && visionTurnsUsed < VISION_BUDGET) {
-        useVisionNextTurn = true;
-        console.log(`[cua] ${consecutiveFailures} ineffective actions — auto-switching to vision`);
+
+      // Build StuckContext on first failure
+      if (!stuckContext) {
+        stuckContext = {
+          goal: action.next_goal || nextGoal,
+          url: await adapter.getUrl(),
+          trigger: `${action.action} ${action.target || ''}`.trim(),
+          failedActions: [],
+        };
+        console.log(`[cua] StuckContext created (turn ${turn}): goal="${stuckContext.goal}"`);
       }
+      const resolvedEl = state.elements.find(e => e.elementId === (action.target || ''));
+      const failureType = classifyFailureType(result, result.validation, resolvedEl?.isInteractable);
+
+      stuckContext.failedActions.push({
+        action: action.action,
+        target: action.target || '',
+        error: result.error || result.description,
+        type: failureType,
+        strategy: result.strategyUsed,
+      });
+
+      // Decay preferred strategy if the strategy that just failed WAS the preferred one
+      if (lastSuccessfulStrategy && result.strategyUsed === lastSuccessfulStrategy) {
+        console.log(`[cua] Cleared preferredStrategy: ${lastSuccessfulStrategy} just failed — removing bias`);
+        lastSuccessfulStrategy = null;
+      }
+
+      // Cross-turn strategy failure: same NO_EFFECT type across 3+ different targets
+      const recent4 = stuckContext.failedActions.slice(-4);
+      const noEffectCount = recent4.filter(f => f.type.startsWith('NO_EFFECT')).length;
+      const uniqueTargets = new Set(recent4.map(f => f.target)).size;
+      if (noEffectCount >= 3 && uniqueTargets >= 2) {
+        stuckContext.failedActions[stuckContext.failedActions.length - 1].type = 'STRATEGY_FAILURE';
+        console.warn(`[cua] STRATEGY_FAILURE: ${noEffectCount} NO_EFFECT across ${uniqueTargets} targets — escalating`);
+      }
+
+      // Type-driven state transitions
+      const lastType = stuckContext.failedActions[stuckContext.failedActions.length - 1].type;
+      const isHighConfidenceFailure = typeof action.confidence === 'number' && action.confidence > 0.8;
+
+      if (consecutiveFailures === 1) {
+        if (isHighConfidenceFailure || lastType === 'STRATEGY_FAILURE') {
+          // Model is confidently wrong OR strategy itself is failing — skip vision assist, burst immediately
+          mode = 'VISION_BURST';
+          console.log(`[cua] FAIL_1 (${isHighConfidenceFailure ? `high confidence=${action.confidence}` : 'strategy failure'}) → VISION_BURST immediately (turn ${turn})`);
+        } else {
+          mode = 'DOM_WITH_VISION';
+          console.log(`[cua] FAIL_1 → DOM_WITH_VISION (turn ${turn})`);
+        }
+      } else if (consecutiveFailures >= 2) {
+        if (lastType === 'VALIDATION_ERROR') {
+          // Validation errors need input fix — vision can't help, stay in assist mode
+          mode = 'DOM_WITH_VISION';
+          console.log(`[cua] FAIL_${consecutiveFailures} VALIDATION_ERROR → stay DOM_WITH_VISION (turn ${turn})`);
+        } else {
+          mode = 'VISION_BURST';
+          console.log(`[cua] FAIL_${consecutiveFailures} → VISION_BURST (turn ${turn})`);
+        }
+      }
+
+      // Derive forced strategy for next execution attempt
+      // suggestStrategy takes precedence; fall back to same-strategy rotation only if needed
+      const suggested = suggestStrategy(lastType);
+      if (suggested) {
+        forceStrategySwitch = suggested;
+        console.log(`[cua] Strategy switch: ${lastType} → force ${forceStrategySwitch}`);
+      } else {
+        // Same-strategy rotation: if last 2 failures used the same strategy, rotate to next
+        const last2 = stuckContext.failedActions.slice(-2);
+        if (last2.length === 2 && last2[0].strategy === last2[1].strategy) {
+          const rotation: Record<ExecutionStrategy, ExecutionStrategy> = {
+            selector: 'text', text: 'coordinates', role: 'coordinates', coordinates: 'selector',
+          };
+          forceStrategySwitch = rotation[last2[1].strategy];
+          console.log(`[cua] Same-strategy rotation: ${last2[1].strategy} → ${forceStrategySwitch}`);
+        }
+      }
+
+      // Strategy exhaustion: all 3 strategies tried on failures of the same type → force VISION_BURST
+      // Only escalate when failures are coherent (same type), not unrelated noise
+      const last4Exhaustion = stuckContext.failedActions.slice(-4);
+      const triedStrategies = new Set(last4Exhaustion.map(f => f.strategy));
+      const coherentFailures = last4Exhaustion.length >= 3 && last4Exhaustion.every(f => f.type === last4Exhaustion[0].type);
+      if (coherentFailures && triedStrategies.size >= 3 && mode !== 'VISION_BURST') {
+        console.warn(`[cua] All strategies exhausted on ${last4Exhaustion[0].type} (${[...triedStrategies].join(', ')}) → force VISION_BURST`);
+        mode = 'VISION_BURST';
+      }
+    }
+
+    // Non-meaningful loop trap (scroll/wait repeated 5+ times = invisible stuck)
+    if (!isMeaningful) {
+      consecutiveNonMeaningful++;
+      if (consecutiveNonMeaningful >= 5) {
+        mode = 'DOM_WITH_VISION';
+        consecutiveNonMeaningful = 0;
+        consecutiveScrolls = 0;
+        if (!stuckContext) {
+          stuckContext = {
+            goal: nextGoal,
+            url: await adapter.getUrl(),
+            trigger: `non-meaningful loop (${action.action} repeated 5+ times)`,
+            failedActions: [],
+          };
+        }
+        console.log(`[cua] Non-meaningful loop detected → DOM_WITH_VISION`);
+      }
+    } else {
+      consecutiveNonMeaningful = 0;
+    }
+
+    // Scroll-specific loop trap: 3 scrolls in a row without DOM fingerprint change
+    if (action.action === 'scroll') {
+      consecutiveScrolls++;
+      if (consecutiveScrolls >= 3) {
+        consecutiveScrolls = 0;
+        if (mode === 'DOM_NORMAL') {
+          mode = 'DOM_WITH_VISION';
+          if (!stuckContext) stuckContext = { goal: nextGoal, url: await adapter.getUrl(), trigger: '3 consecutive scrolls without progress', failedActions: [] };
+          console.log(`[cua] Scroll loop (3x) → DOM_WITH_VISION`);
+        } else if (mode === 'DOM_WITH_VISION') {
+          mode = 'VISION_BURST';
+          if (!stuckContext) stuckContext = { goal: nextGoal, url: await adapter.getUrl(), trigger: '3 consecutive scrolls in DOM_WITH_VISION', failedActions: [] };
+          console.log(`[cua] Scroll loop (3x in DOM_WITH_VISION) → VISION_BURST`);
+        }
+      }
+    } else {
+      consecutiveScrolls = 0;
     }
 
     // ── URL watchdog ────────────────────────────────────────────
@@ -738,7 +1111,7 @@ async function runCUALoopDOM(
       nextGoal: action.next_goal || nextGoal,
       domFingerprint: state.domFingerprint,
       confidence: action.confidence,
-      visionUsed: visionTurnsUsed > 0 && useVisionNextTurn,
+      visionUsed: mode !== 'DOM_NORMAL',
     });
 
     // ── Re-index DOM (fresh indices every turn) ─────────────────
@@ -838,28 +1211,7 @@ async function runCUALoopDOM(
       }
     }
 
-    // ── Stuck detection ─────────────────────────────────────────
-    if (state.domFingerprint === lastDOMFingerprint) {
-      consecutiveSameDOM++;
-    } else {
-      lastDOMFingerprint = state.domFingerprint;
-      consecutiveSameDOM = 0;
-    }
-
-    const isStuck =
-      consecutiveSameDOM >= STUCK_THRESHOLD ||
-      consecutiveSameAction >= 2 ||
-      consecutiveFailures >= 2 ||
-      (action.confidence !== undefined && action.confidence < LOW_CONFIDENCE);
-
-    const fewElements = state.elements.length < 3;
-
-    if ((isStuck || fewElements) && visionTurnsUsed < VISION_BUDGET) {
-      useVisionNextTurn = true;
-      if (isStuck) console.log(`[cua] Stuck (sameDom=${consecutiveSameDOM}, sameAction=${consecutiveSameAction}, failures=${consecutiveFailures}). Vision next.`);
-    }
-
-    // ── NEW: Vision Decision Engine (parallel — log only) ────────
+    // ── Vision Decision Engine (logging only) ───────────────────
     const visionState: VisionBrowserState = {
       elementCount: state.elements.length,
       previousElementCount: previousElementCount,
@@ -870,36 +1222,39 @@ async function runCUALoopDOM(
     };
     previousElementCount = state.elements.length;
 
-    lastVisionDecision = visionEngine.decide(
-      visionState,
-      action.confidence,
-      allowedDomains,
-      EXTERNAL_TRAPS,
-    );
+    lastVisionDecision = visionEngine.decide(visionState, action.confidence, allowedDomains, EXTERNAL_TRAPS);
+    console.log(`[vision-engine] T${turn} | score=${lastVisionDecision.visionScore.toFixed(2)} mode=${lastVisionDecision.mode} fsm=${mode} | path=[${lastVisionDecision.decisionPath.join(' → ')}] | signals: failure=${lastVisionDecision.signals.failureScore.toFixed(2)} stuck=${lastVisionDecision.signals.stuckDuration.toFixed(2)} | feedback: adj=${lastVisionDecision.feedback.adjustment.toFixed(2)} rate=${lastVisionDecision.feedback.visionSuccessRate}`);
 
-    // Log both old and new decisions for comparison
-    const oldDecision = useVisionNextTurn ? (consecutiveSameDOM >= (STUCK_THRESHOLD + 2) ? 'full-vision' : 'vision-fallback') : 'dom';
-    console.log(`[vision-engine] T${turn} | score=${lastVisionDecision.visionScore.toFixed(2)} mode=${lastVisionDecision.mode} old=${oldDecision} | path=[${lastVisionDecision.decisionPath.join(' → ')}] | signals: sameDOM=${lastVisionDecision.signals.sameDOM.toFixed(2)} failure=${lastVisionDecision.signals.failureScore.toFixed(2)} intent=${lastVisionDecision.signals.intentMismatch.toFixed(2)} lowEl=${lastVisionDecision.signals.lowElements.toFixed(2)} stuck=${lastVisionDecision.signals.stuckDuration.toFixed(2)} | feedback: adj=${lastVisionDecision.feedback.adjustment.toFixed(2)} rate=${lastVisionDecision.feedback.visionSuccessRate}`);
-
-    // ── Vision burst: delegate to vision CUA loop when truly stuck ──
-    // Instead of just adding a screenshot to the DOM prompt, actually run
-    // the vision model for several turns to break through stuck states
-    const VISION_BURST_THRESHOLD = STUCK_THRESHOLD + 2; // trigger after 6 same-DOM turns
+    // ── Vision Burst execution ────────────────────────────────────
     const VISION_BURST_TURNS = 10;
 
-    if (consecutiveSameDOM >= VISION_BURST_THRESHOLD && visionTurnsUsed < VISION_BUDGET) {
-      console.log(`[cua] ═══ VISION BURST: DOM stuck for ${consecutiveSameDOM} turns — delegating ${VISION_BURST_TURNS} turns to vision CUA loop ═══`);
+    if (mode === 'VISION_BURST') {
+      // Circuit breaker
+      if (visionBurstsUsed >= MAX_VISION_BURSTS) {
+        return {
+          verdict: 'FAIL',
+          modelMessage: `VERDICT: FAIL\nSUMMARY: Exhausted ${MAX_VISION_BURSTS} vision bursts without resolving stuck state.\nISSUES: Could not complete: ${stuckContext?.goal || nextGoal} at ${await adapter.getUrl()}`,
+          turns: turn, totalTokens,
+        };
+      }
 
-      // Build context for vision: tell it what DOM loop was trying to do
+      visionBurstsUsed++;
+      const failSummary = stuckContext?.failedActions.slice(-6)
+        .map(f => `${f.action} ${f.target}: ${f.error}`).join('; ') || 'none';
+
+      console.log(`[cua] ═══ VISION BURST ${visionBurstsUsed}/${MAX_VISION_BURSTS}: goal="${stuckContext?.goal}" — delegating ${VISION_BURST_TURNS} turns ═══`);
+
       const visionInstructions = [
-        `CONTEXT: The DOM-based automation got stuck and could not make progress. You are taking over for ${VISION_BURST_TURNS} turns to UNBLOCK the stuck step only.`,
-        `IMPORTANT: Do NOT try to complete the entire test. Just perform the NEXT GOAL below and then stop. Do NOT output a final VERDICT — you are only here to unstick one step.`,
-        `CURRENT STATE: ${agentMemory}`,
-        `NEXT GOAL (do ONLY this): ${nextGoal}`,
+        `CONTEXT: DOM automation failed. You are taking over to unblock ONE step only.`,
+        `GOAL: ${stuckContext?.goal || nextGoal}`,
+        `STATE: ${agentMemory}`,
+        `URL: ${stuckContext?.url || await adapter.getUrl()}`,
+        `FAILED APPROACHES (${stuckContext?.failedActions.length || 0} attempts — do NOT repeat these):`,
+        `  ${failSummary}`,
         `COMPLETED SO FAR: ${stepsCompleted.length > 0 ? stepsCompleted.join(', ') : 'None'}`,
-        `RECENT FAILURES (these approaches did NOT work — try something different): ${actionHistory.filter(h => !h.effective).slice(-5).map(h => `${h.action} ${h.target} → ${h.description}`).join('; ')}`,
-        '',
-        'FULL TEST INSTRUCTIONS (for context only — focus on NEXT GOAL):',
+        `INSTRUCTION: Achieve ONLY the goal above using a completely different approach. Stop as soon as done.`,
+        ``,
+        `FULL TEST INSTRUCTIONS (context only):`,
         testInstructions,
       ].join('\n');
 
@@ -909,57 +1264,88 @@ async function runCUALoopDOM(
           openai, page, visionInstructions, expectedOutcome,
           screenshotDir, runId, callbacks,
           testAccount, abortSignal,
-          VISION_BURST_TURNS,  // only run for a few turns
-          tokenBudget - (totalTokens.input + totalTokens.output), // remaining budget
+          VISION_BURST_TURNS,
+          tokenBudget - (totalTokens.input + totalTokens.output),
           testUrl,
         );
 
-        // Accumulate tokens from vision burst
         totalTokens.input += visionResult.totalTokens.input;
         totalTokens.output += visionResult.totalTokens.output;
         totalTokens.reasoning += visionResult.totalTokens.reasoning;
-        visionTurnsUsed += VISION_BURST_TURNS;
         turn += visionResult.turns;
 
-        // NEVER accept PASS/FAIL from vision burst — it's only meant to break through
-        // stuck states, not to judge the entire test. The DOM loop handles final verdict.
         if (visionResult.verdict === 'PASS') {
-          console.log(`[cua] Vision burst reported PASS — ignoring (only DOM loop can judge final result). Resuming DOM.`);
+          console.log(`[cua] Vision burst reported PASS — ignoring (DOM loop judges final result). Resuming DOM.`);
         } else if (visionResult.verdict === 'FAIL') {
-          console.log(`[cua] Vision burst reported FAIL — ignoring (vision was only unsticking). Resuming DOM.`);
+          console.log(`[cua] Vision burst reported FAIL — ignoring (was only unsticking). Resuming DOM.`);
         }
 
-        console.log(`[cua] ═══ Vision burst done (${visionResult.turns} turns used). Resuming DOM mode. ═══`);
+        console.log(`[cua] ═══ Vision burst done (${visionResult.turns} turns). Resuming DOM_NORMAL. ═══`);
 
-        // Reset stuck counters — vision may have changed the page
-        consecutiveSameDOM = 0;
-        consecutiveSameAction = 0;
+        // Hard reset after burst
+        mode = 'DOM_NORMAL';
         consecutiveFailures = 0;
-        lastDOMFingerprint = '';
-        useVisionNextTurn = false;
+        consecutiveNonMeaningful = 0;
+        consecutiveScrolls = 0;
+        stuckContext = null;
 
-        // Re-index DOM after vision changes
         try { state = await adapter.getState(); } catch {}
 
-        // Record vision burst in action history
         actionHistory.push({
           turn, action: 'vision-burst', target: '',
           effective: true,
-          description: `Vision CUA took over for ${visionResult.turns} turns`,
+          description: `Vision burst ${visionBurstsUsed} — ${visionResult.turns} turns used`,
         });
         if (actionHistory.length > ACTION_HISTORY_SIZE) actionHistory.shift();
 
-        continue; // Go to next DOM turn with fresh state
+        continue;
       } catch (err: any) {
-        console.warn(`[cua] Vision burst failed: ${err.message}. Continuing in DOM mode.`);
+        console.warn(`[cua] Vision burst failed: ${err.message}. Resetting to DOM_NORMAL.`);
+        mode = 'DOM_NORMAL';
+        consecutiveFailures = 0;
+        stuckContext = null;
       }
     }
 
-    // Hard stuck abort — only after vision bursts are exhausted
-    if (consecutiveSameDOM >= STUCK_THRESHOLD + VISION_BUDGET + VISION_BURST_TURNS + 4) {
+    // Few elements — force vision next turn
+    if (state.elements.length < 3 && mode === 'DOM_NORMAL') {
+      mode = 'DOM_WITH_VISION';
+      if (!stuckContext) stuckContext = { goal: nextGoal, url: state.url, trigger: 'few DOM elements', failedActions: [] };
+    }
+
+    // ── URL-based stuck detection ─────────────────────────────────
+    // Catches cases where DOM fingerprint changes (dropdown opens/closes)
+    // but the model isn't making real progress toward the goal
+    const currentUrlPath = (await adapter.getUrl()).replace(/https?:\/\/[^/]+/, '').split('?')[0];
+    if (currentUrlPath === lastUrlPath) {
+      sameUrlTurns++;
+    } else {
+      lastUrlPath = currentUrlPath;
+      sameUrlTurns = 0;
+      lastProgressTurn = turn; // URL changed = progress
+    }
+
+    // Track progress: URL change or effective action = real progress
+    if (result.success && result.effective && (result.validation.urlChanged || result.validation.domChanged)) {
+      lastProgressTurn = turn;
+    }
+
+    // Abort if stuck on same URL too long
+    if (sameUrlTurns >= MAX_SAME_URL_TURNS) {
+      console.warn(`[cua] URL stuck abort: ${sameUrlTurns} turns on ${currentUrlPath}`);
       return {
         verdict: 'FAIL',
-        modelMessage: `VERDICT: FAIL\nSUMMARY: Stuck on same page for ${consecutiveSameDOM} turns (including vision bursts).\nISSUES: No progress at ${await adapter.getUrl()}`,
+        modelMessage: `VERDICT: FAIL\nSUMMARY: Stuck on same URL for ${sameUrlTurns} turns without making progress.\nISSUES: Could not complete required actions at ${await adapter.getUrl()}`,
+        turns: turn, totalTokens,
+      };
+    }
+
+    // Abort if no real progress for too long
+    if (turn - lastProgressTurn >= MAX_NO_PROGRESS_TURNS) {
+      console.warn(`[cua] No progress abort: ${turn - lastProgressTurn} turns since last progress (T${lastProgressTurn})`);
+      return {
+        verdict: 'FAIL',
+        modelMessage: `VERDICT: FAIL\nSUMMARY: No meaningful progress for ${turn - lastProgressTurn} turns. Last progress was at turn ${lastProgressTurn}.\nISSUES: Model could not advance the test flow.`,
         turns: turn, totalTokens,
       };
     }

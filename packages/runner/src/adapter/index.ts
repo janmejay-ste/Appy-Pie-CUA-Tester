@@ -8,4 +8,4 @@ export type {
   ActionType,
   IndexedElement,
 } from './types.js';
-export type { ValidatedResult } from './action-engine.js';
+export type { ValidatedResult, ExecutionStrategy } from './action-engine.js';

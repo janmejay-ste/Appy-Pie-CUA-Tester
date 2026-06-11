@@ -1,6 +1,6 @@
-# AppyPie CUA Tester — System Design Document v7
+# AppyPie CUA Tester — System Design Document v9
 
-> Production-grade AI-powered QA testing platform with position-independent element identity, adaptive fallback strategy, memory-enforced action engine with intent tracking, predictive vision triggers, adapter-based execution, MongoDB, BullMQ, session-based execution, test CRUD, system settings, resume/retry, and network sharing via ngrok.
+> Production-grade AI-powered QA testing platform with position-independent element identity, adaptive fallback strategy, memory-enforced action engine with intent tracking, fail-fast 3-state vision FSM with FailureType classification, confidence escalation, DISCOURAGED DOM filtering, action-target guard, adapter-based execution, MongoDB, BullMQ, session-based execution, test CRUD, system settings, resume/retry, and network sharing via ngrok.
 
 ---
 
@@ -83,7 +83,7 @@
 
 ---
 
-## 3. CUA Execution Architecture (v5)
+## 3. CUA Execution Architecture (v6)
 
 ### 3.0 Execution Stack
 
@@ -133,21 +133,74 @@
 3. Action Engine owns ALL fallback logic and validation
 4. Element IDs are stable hashes — survive DOM re-ordering across turns
 
-### 3.1 Dual-Mode Engine
+### 3.1 Fail-Fast Vision State Machine (FSM)
 
-The CUA loop supports two execution modes, switchable via Settings:
+The CUA loop runs a single DOM-first loop. Vision is injected automatically as the loop encounters failures — no separate "vision mode" run. The FSM has 3 states:
 
-| Mode | Primary Input | Tokens/Turn | Best For |
-|------|--------------|-------------|----------|
-| **DOM** (default) | Structured DOM text | 1,800–3,500 | Most tests — 65-85% cheaper |
-| **Vision** (fallback) | Base64 PNG screenshot | 12,000–15,000 | Canvas/WebGL, complex visual layouts |
+| State | Input to model | Trigger |
+|-------|---------------|---------|
+| `DOM_NORMAL` | Structured DOM text only (~2K tokens/turn) | Default |
+| `DOM_WITH_VISION` | DOM text + compressed JPEG + StuckContext note | First meaningful failure |
+| `VISION_BURST` | Delegates N turns to `cua-loop-vision.ts` with full StuckContext | Second consecutive failure |
 
-### Mode Selection
+**Meaningful actions** (failures count): `click`, `type`, `select`, `navigate`, `keypress`
+**Non-meaningful** (exempt from failure count): `scroll`, `wait`
+
+```
+DOM_NORMAL
+    │
+    │  1st meaningful failure (success=false OR effective=false)
+    ▼
+DOM_WITH_VISION  ──── screenshot + StuckContext attached ────►  success? → DOM_NORMAL (reset)
+    │
+    │  2nd consecutive failure
+    ▼
+VISION_BURST  ──── delegates to cua-loop-vision.ts (10 turns) ──►  always → DOM_NORMAL (hard reset)
+    │
+    │  visionBurstsUsed >= MAX_VISION_BURSTS (3)
+    ▼
+  FAIL (circuit breaker)
+```
+
+**StuckContext** — built on first failure, passed to VISION_BURST:
+```typescript
+type FailureType =
+  | 'ELEMENT_NOT_FOUND'   // element missing from DOM
+  | 'NO_EFFECT'           // action succeeded but nothing changed
+  | 'ACTION_FAILED'       // action returned success=false
+  | 'VALIDATION_ERROR'    // form/page error appeared after action
+  | 'BLOCKED_REPEAT'      // hard-blocked by guard
+  | 'UNKNOWN';
+
+interface FailedAction { action: string; target: string; error: string; type: FailureType; }
+
+interface StuckContext {
+  goal: string;           // current step goal
+  url: string;            // URL at time of first failure
+  trigger: string;        // action that first failed
+  failedActions: FailedAction[];  // growing list, classified by type
+}
+```
+
+**DOM filter** — when StuckContext exists, the last 3 failed `elementId`s are marked `[DISCOURAGED]` in the DOM listing. Elements stay visible (model retains full context) but are deprioritized. The model can still use them if truly necessary.
+
+**Failed action-target guard** — hard enforcement before `executeValidatedAction`. If the model returns an `action+target` pair matching any entry in `stuckContext.failedActions.slice(-3)`, execution is blocked, `consecutiveFailures` is incremented, FSM advances — no browser action wasted. Blocks by `action+target` pair (not target alone) so a `click` failure does not block a `type` on the same element.
+
+**Confidence escalation** — after parsing model response, if `confidence < 0.5` and mode is `DOM_NORMAL`, immediately force `DOM_WITH_VISION` even without a recorded failure.
+
+**Non-meaningful loop trap** — if `scroll` or `wait` repeats 5+ consecutive turns with no real progress, mode is forced to `DOM_WITH_VISION`.
+
+**Reset conditions:**
+- Any successful + effective meaningful action → full reset to `DOM_NORMAL`, `stuckContext = null`
+- URL change → also resets `visionBurstsUsed = 0`
+- After any VISION_BURST completes → hard reset (`mode = DOM_NORMAL`, `consecutiveFailures = 0`, `stuckContext = null`)
+
+### Settings-Level Mode Override
 ```
 Settings.cuaMode = 'dom' | 'vision'    (global default)
-Per-test override: testDef.mode         (overrides global)
-Instant rollback: change setting        (no code changes)
+Per-test override: testDef.mode         (forces pure vision loop for entire test)
 ```
+The FSM above only applies in DOM mode. Setting `cuaMode = 'vision'` routes the entire test through `cua-loop-vision.ts` directly.
 
 ### 3a. DOM-First Mode (Default)
 
@@ -355,33 +408,71 @@ Prompt-level enforcement:
   • WARNING on ineffective actions: "You MUST try a different element"
 ```
 
-#### Stuck Detection & Vision Fallback
+#### Fail-Fast State Machine (cua-loop.ts)
 ```
-REACTIVE triggers (isStuck) — fires when ANY of:
-  • Same domFingerprint ≥ 2 consecutive turns
-  • Same action signature repeated ≥ 2 times
-  • Last 2 actions both failed (consecutiveFailures ≥ 2)
-  • Model confidence < 0.4
-  • DOM has < 3 interactive elements
+Per-turn failure detection:
+  isMeaningful = action ∈ { click, type, select, navigate, keypress }
+  isFailure    = isMeaningful && (!success || !!error || !effective)
 
-PREDICTIVE triggers (early detection) — fires before stuck:
-  • Canvas/WebGL element detected (hasCanvas = true)
-  • >3 duplicate text elements (ambiguous for DOM-only mode)
-  • These trigger vision BEFORE the model wastes turns
+  isFailure=false  → reset consecutiveFailures=0, stuckContext=null, mode=DOM_NORMAL
+  isFailure=true   → consecutiveFailures++
+                     build/update StuckContext (classify failure type)
+                     if consecutiveFailures === 1 → mode = DOM_WITH_VISION
+                     if consecutiveFailures >= 2  → mode = VISION_BURST
 
-Vision fallback:
-  • Budget: min(3, ceil(maxTurns × 0.2)) turns — adaptive
-  • Sends compressed JPEG (quality 50, ~5K tokens) + DOM text
-  • Returns to DOM-only when: domFingerprint changes or action succeeds
-  • Hard abort: stuck for (STUCK_THRESHOLD + VISION_BUDGET + 2) turns
+Confidence escalation (pre-execution):
+  action.confidence < 0.5 && mode === DOM_NORMAL → mode = DOM_WITH_VISION
+  (screenshot attached next turn even without a recorded failure)
+
+Non-meaningful loop trap:
+  scroll/wait repeated 5+ times → mode = DOM_WITH_VISION
+
+DOM filter (soft — [DISCOURAGED]):
+  when stuckContext exists → last-3 failed elementIds marked [DISCOURAGED] in DOM listing
+  elements are NOT removed — model retains full context but is deprioritized
+
+Failed action-target guard (hard enforcement):
+  if model returns (action+target) pair ∈ stuckContext.failedActions.slice(-3):
+    → block execution, increment consecutiveFailures, advance FSM, continue
+  (action+target pair, NOT target alone — click failure ≠ type failure on same element)
+
+Failure classification (classifyFailureType):
+  stored on every FailedAction.type for vision prompt context:
+  ELEMENT_NOT_FOUND → element missing after action
+  NO_EFFECT         → success=true but effective=false
+  ACTION_FAILED     → success=false, element exists
+  VALIDATION_ERROR  → form/page error appeared
+  BLOCKED_REPEAT    → hard-blocked by guard
+
+Vision prompt (DOM_WITH_VISION / VISION_BURST):
+  Structured failure summary injected:
+    "- click on e1a2b3c4 → NO_EFFECT (no error)"
+  Type-specific recovery hints:
+    NO_EFFECT → try coordinates or wrapper element
+    ELEMENT_NOT_FOUND → scroll or check different section
+
+Vision burst (VISION_BURST state):
+  Circuit breaker: visionBurstsUsed >= MAX_VISION_BURSTS(3) → return FAIL
+  Otherwise: delegate 10 turns to cua-loop-vision.ts with StuckContext instructions
+  After burst: hard reset mode=DOM_NORMAL, consecutiveFailures=0, stuckContext=null,
+               consecutiveNonMeaningful=0
+
+VisionDecisionEngine:
+  Runs in parallel for LOGGING ONLY — does NOT control any state transitions.
+  Score/mode output written to console for observability.
 ```
 
 #### Loop Intervention (Escalating)
 ```
-Action repeats:
+Action repeats (same action:target:value signature):
   1-2 repeats → normal
   3-4 repeats → inject: "This approach is NOT working. Try different strategy."
   5+ repeats  → hard abort → FAIL verdict
+
+Failed action-target guard (pre-execution):
+  Model returns already-failed (action+target) pair → blocked before browser action
+  State machine advanced directly (counts as failure, triggers vision faster)
+  Logged as FailureType=BLOCKED_REPEAT in StuckContext
 ```
 
 ### 3b. Vision Mode (Legacy/Fallback)
@@ -513,7 +604,7 @@ Action repeats:
   nextGoal: "Verify success message",
   domFingerprint: "a3f8b2c1d4e5",  // MD5 hash of DOM structure
   confidence: 0.9,             // model's confidence in action
-  visionUsed: false,           // was JPEG screenshot sent this turn?
+  visionUsed: false,           // true when FSM state != DOM_NORMAL (screenshot was sent)
 
   // Token data (unchanged)
   inputTokens: 2800,
@@ -531,7 +622,7 @@ Action repeats:
 - "Why did it fail?" → `result.error` + `validation.errorMessage`
 - "Did the click actually work?" → `validation.domChanged` + `validation.urlChanged`
 - "What was the agent thinking?" → `memory` + `nextGoal`
-- "Is it stuck?" → consecutive same `domFingerprint`
+- "Is it stuck?" → `visionUsed: true` turns + consecutive `effective: false` results
 - "Which turns were expensive?" → `visionUsed: true` turns
 
 ### `events`
